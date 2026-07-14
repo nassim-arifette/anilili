@@ -59,15 +59,33 @@ class HomeViewModel : ViewModel() {
             DiagnosticsLog.event("Home load start force=$force")
             if (force && _state.value is UiState.Success) _isRefreshing.value = true else _state.value = UiState.Loading
             try {
+                // Sections load independently: one failed AniList query must not cancel the
+                // other four, so a flaky network degrades to missing rows instead of an error.
                 val data = coroutineScope {
-                    val spotlight = async { repo.trending(force = force).items }
-                    val newest = async { repo.recentlyReleased(force = force).items }
-                    val popular = async { repo.popular(force = force).items }
+                    val spotlight = async { runCatching { repo.trending(force = force).items } }
+                    val newest = async { runCatching { repo.recentlyReleased(force = force).items } }
+                    val popular = async { runCatching { repo.popular(force = force).items } }
                     val movies = async {
-                        repo.discover(DiscoverFilters(format = "MOVIE", sort = "POPULARITY_DESC"), force = force).items
+                        runCatching {
+                            repo.discover(DiscoverFilters(format = "MOVIE", sort = "POPULARITY_DESC"), force = force).items
+                        }
                     }
-                    val topRated = async { repo.topRated(force = force).items }
-                    HomeData(spotlight.await(), newest.await(), popular.await(), movies.await(), topRated.await())
+                    val topRated = async { runCatching { repo.topRated(force = force).items } }
+                    val sections = listOf(spotlight, newest, popular, movies, topRated).map { it.await() }
+                    sections.forEach { section ->
+                        section.exceptionOrNull()?.let {
+                            it.rethrowIfCancellation()
+                            DiagnosticsLog.throwable("Home section failed", it)
+                        }
+                    }
+                    if (sections.all { it.isFailure }) throw sections.first().exceptionOrNull()!!
+                    HomeData(
+                        spotlight = sections[0].getOrDefault(emptyList()),
+                        newest = sections[1].getOrDefault(emptyList()),
+                        popular = sections[2].getOrDefault(emptyList()),
+                        movies = sections[3].getOrDefault(emptyList()),
+                        topRated = sections[4].getOrDefault(emptyList()),
+                    )
                 }
                 DiagnosticsLog.event(
                     "Home load success spotlight=${data.spotlight.size} newest=${data.newest.size} " +

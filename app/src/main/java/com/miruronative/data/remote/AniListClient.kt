@@ -469,7 +469,24 @@ class AniListClient(
                 .header("User-Agent", USER_AGENT)
             AuthManager.current()?.let { builder.header("Authorization", "Bearer $it") }
             var retryAfterMs = -1L
-            client.newCall(builder.build()).execute().use { resp ->
+            val response = try {
+                client.newCall(builder.build()).execute()
+            } catch (e: java.io.InterruptedIOException) {
+                // ISP-level blocks of anilist.co (common in some regions) surface as timeouts
+                // while the rest of the app's hosts work fine. Name the fix for the user.
+                throw java.io.IOException(
+                    "AniList is unreachable (timeout). Your network may be blocking anilist.co — " +
+                        "try private DNS (dns.google) or a VPN.",
+                    e,
+                )
+            } catch (e: java.net.UnknownHostException) {
+                throw java.io.IOException(
+                    "AniList is unreachable (DNS). Your network may be blocking anilist.co — " +
+                        "try private DNS (dns.google) or a VPN.",
+                    e,
+                )
+            }
+            response.use { resp ->
                 if (resp.code == 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
                     val seconds = resp.header("Retry-After")?.toLongOrNull() ?: 10L
                     retryAfterMs = seconds.coerceIn(1, 60) * 1_000
