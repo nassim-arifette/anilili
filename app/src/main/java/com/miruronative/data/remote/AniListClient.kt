@@ -15,6 +15,7 @@ import com.miruronative.data.model.MediaListCollection
 import com.miruronative.data.model.MediaPage
 import com.miruronative.data.model.Viewer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -435,7 +436,7 @@ class AniListClient(
         }
     }
 
-    private fun mediaListEntry(mediaId: Int): Pair<Int, String>? {
+    private suspend fun mediaListEntry(mediaId: Int): Pair<Int, String>? {
         val query = """
             query (${'$'}mediaId: Int) {
               Media(id: ${'$'}mediaId, type: ANIME) { mediaListEntry { id status } }
@@ -450,22 +451,50 @@ class AniListClient(
         return id to status
     }
 
-    private fun post(query: String, variables: JsonObject): String {
+    /**
+     * AniList rate-limits the whole API per user/IP (degraded to ~30 req/min). On 429 we honor
+     * the Retry-After header and retry instead of surfacing the error, so bursts (list sync,
+     * fast browsing) and interactive saves recover on their own.
+     */
+    private suspend fun post(query: String, variables: JsonObject): String {
         val payload = json.encodeToString(GraphQLRequest.serializer(), GraphQLRequest(query, variables))
-        val builder = Request.Builder()
-            .url(ANILIST_URL)
-            .post(payload.toRequestBody(jsonMedia))
-            .header("Accept", "application/json")
-        AuthManager.current()?.let { builder.header("Authorization", "Bearer $it") }
-        val request = builder.build()
-        client.newCall(request).execute().use { resp ->
-            val body = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) error("AniList HTTP ${resp.code}")
-            return body
+        var attempt = 0
+        while (true) {
+            val builder = Request.Builder()
+                .url(ANILIST_URL)
+                .post(payload.toRequestBody(jsonMedia))
+                .header("Accept", "application/json")
+                // Browser-consistent UA: Cloudflare in front of AniList treats bare okhttp
+                // clients harshly on flagged networks, returning 403 for the whole API.
+                .header("User-Agent", USER_AGENT)
+            AuthManager.current()?.let { builder.header("Authorization", "Bearer $it") }
+            var retryAfterMs = -1L
+            client.newCall(builder.build()).execute().use { resp ->
+                if (resp.code == 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
+                    val seconds = resp.header("Retry-After")?.toLongOrNull() ?: 10L
+                    retryAfterMs = seconds.coerceIn(1, 60) * 1_000
+                } else {
+                    val body = resp.body?.string().orEmpty()
+                    if (resp.code == 403) {
+                        error(
+                            "AniList is blocking this network (HTTP 403, Cloudflare). " +
+                                "Switching networks or DNS usually fixes it.",
+                        )
+                    }
+                    if (!resp.isSuccessful) error("AniList HTTP ${resp.code}")
+                    return body
+                }
+            }
+            attempt++
+            delay(retryAfterMs)
         }
     }
 
     companion object {
         const val ANILIST_URL = "https://graphql.anilist.co"
+        private const val MAX_RATE_LIMIT_RETRIES = 2
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
     }
 }

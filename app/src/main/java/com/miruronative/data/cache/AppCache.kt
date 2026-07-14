@@ -114,7 +114,14 @@ class AppCache(
             }
             return decoded
         }
-        return refresh(key, serializer, ttlMs, forceRefresh, fetch)
+        return try {
+            refresh(key, serializer, ttlMs, forceRefresh, fetch)
+        } catch (e: Exception) {
+            // Last-known-good fallback: an expired entry beats an error screen when the
+            // network or an upstream (e.g. Cloudflare in front of AniList) is refusing us.
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            decoded ?: throw e
+        }
     }
 
     private suspend fun <T> refresh(
