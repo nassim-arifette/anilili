@@ -160,7 +160,7 @@ class MiruroRepository(
 
     /** Extra sources — Anivexa-API (can be slower; loaded in the background by the detail screen). */
     suspend fun anivexaEpisodes(anilistId: Int, force: Boolean = false): EpisodesResult = cache.getOrFetch(
-        key = "episodes:v3:anivexa:$anilistId",
+        key = "episodes:v4:anivexa:$anilistId",
         serializer = EpisodesResult.serializer(),
         ttlMs = EPISODES_TTL,
         forceRefresh = force,

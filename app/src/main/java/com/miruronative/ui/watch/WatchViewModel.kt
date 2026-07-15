@@ -83,8 +83,10 @@ class WatchViewModel : ViewModel() {
         anilistId = id
         category = Category.from(categoryApi)
         preferred = providerName
+        failedProviders.clear()
 
-        viewModelScope.launch {
+        resolveJob?.cancel()
+        resolveJob = viewModelScope.launch {
             _state.value = UiState.Loading
             try {
                 DiagnosticsLog.event("Watch episodes load start id=$id")
@@ -123,9 +125,7 @@ class WatchViewModel : ViewModel() {
      * resolution still tries the preferred provider first and falls back per episode.
      */
     private fun pickSpine(merged: EpisodesResult): List<EpisodeItem> {
-        val preferredList = merged.provider(preferred)?.episodes(category).orEmpty()
-        val longest = merged.providers.map { it.episodes(category) }.maxByOrNull { it.size }.orEmpty()
-        return if (preferredList.size >= longest.size) preferredList else longest
+        return pickNavigationSpine(merged, preferred, category)
     }
 
     private suspend fun resolveAndPlay(number: Double) {
@@ -181,12 +181,18 @@ class WatchViewModel : ViewModel() {
         }
         val index = spine.indexOfFirst { it.number == number }.coerceAtLeast(0)
         val resume = LibraryStore.historyFor(anilistId)?.takeIf { it.episodeNumber == number }?.positionMs ?: 0L
-        val chosen = pickStream(resolved.sources)
+        val chosen = pickProviderStream(resolved.provider, resolved.sources)
         DiagnosticsLog.event(
             "Watch resolve success provider=${resolved.provider} episode=${fmt(number)} index=$index " +
-                "hls=${resolved.sources.hlsStreams.size} direct=${resolved.sources.streams.size} " +
+                "hls=${resolved.sources.hlsStreams.size} total=${resolved.sources.streams.size} " +
                 "embed=${resolved.sources.embedStreams.size} subtitles=${resolved.sources.subtitles.size} " +
                 "chosen=${chosen?.diagnosticLabel() ?: "none"} resumeMs=$resume",
+        )
+        DiagnosticsLog.event(
+            "Watch source inventory provider=${resolved.provider} " +
+                resolved.sources.streams.joinToString(separator = ",", limit = 16, truncated = "...") {
+                    "${it.diagnosticLabel()}${if (it.isActive) "*" else ""}"
+                },
         )
         _state.value = UiState.Success(
             WatchData(
@@ -314,13 +320,6 @@ class WatchViewModel : ViewModel() {
         }
     }
 
-    private fun pickStream(sources: SourcesResult): StreamItem? =
-        sources.hlsStreams.maxByOrNull { (it.height ?: 0) + if (it.isActive) 100_000 else 0 }
-            // Any other direct stream (progressive MP4) still beats a WebView embed.
-            ?: sources.streams.firstOrNull { !it.isEmbed }
-            ?: sources.embedStreams.firstOrNull()
-            ?: sources.streams.firstOrNull()
-
     private fun sourceOptions(number: Double): List<WatchSourceOption> =
         mergedEpisodes.providers
             .flatMap { provider ->
@@ -345,6 +344,58 @@ class WatchViewModel : ViewModel() {
             isHls -> "hls"
             else -> "direct"
         }
-        return "$type height=${height ?: "auto"} host=${runCatching { Uri.parse(url).host }.getOrNull() ?: "unknown"}"
+        return "$type label=${label.take(48)} audio=${audio ?: "unknown"} " +
+            "height=${height ?: "auto"} host=${runCatching { Uri.parse(url).host }.getOrNull() ?: "unknown"}"
     }
+}
+
+/** Provider-specific first-player policy, applied only after that provider has resolved sources. */
+internal fun pickProviderStream(provider: String, sources: SourcesResult): StreamItem? {
+    val direct = sources.streams.filterNot(StreamItem::isEmbed)
+    val embeds = sources.embedStreams
+
+    return when (provider) {
+        // Kwik's fixed-quality CDN URLs currently return 403 outside its page. The embed carries
+        // the cookies/player flow those URLs require, so do not leave Media3 buffering forever.
+        "kiwi" -> embeds.firstOrNull(StreamItem::isActive)
+            ?: embeds.firstOrNull()
+            ?: bestHls(direct)
+            ?: direct.firstOrNull()
+
+        // Ally mixes AllAnime progressive files with an unreliable HLS mirror. Its direct files
+        // are independently playable and retain the selected SUB/DUB category.
+        "ally" -> direct.firstOrNull { !it.isHls }
+            ?: bestHls(direct)
+            ?: embeds.firstOrNull()
+
+        else -> bestHls(direct)
+            ?: direct.firstOrNull()
+            ?: embeds.firstOrNull(StreamItem::isActive)
+            ?: embeds.firstOrNull()
+            ?: sources.streams.firstOrNull()
+    }
+}
+
+private fun bestHls(streams: List<StreamItem>): StreamItem? = streams
+    .filter(StreamItem::isHls)
+    .maxByOrNull { (it.height ?: 0) + if (it.isActive) 100_000 else 0 }
+
+internal fun pickNavigationSpine(
+    episodes: EpisodesResult,
+    preferred: String,
+    category: Category,
+): List<EpisodeItem> {
+    fun normalized(provider: String): List<EpisodeItem> = episodes.provider(provider)
+        ?.episodes(category)
+        .orEmpty()
+        .distinctBy(EpisodeItem::number)
+        .sortedBy(EpisodeItem::number)
+
+    val preferredList = normalized(preferred)
+    val longest = episodes.providerNames
+        .asSequence()
+        .map(::normalized)
+        .maxByOrNull(List<EpisodeItem>::size)
+        .orEmpty()
+    return if (preferredList.size >= longest.size) preferredList else longest
 }

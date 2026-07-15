@@ -60,6 +60,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.miruronative.data.ProviderCatalog
 import com.miruronative.data.model.EpisodeItem
+import com.miruronative.data.model.StreamItem
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.PlaybackService
 import com.miruronative.ui.UiState
@@ -321,6 +322,8 @@ private fun WatchContent(
                             url = stream.url,
                             referer = stream.referer,
                             modifier = Modifier.fillMaxSize(),
+                            qualityStreams = data.sources.embedStreams,
+                            startPositionMs = data.startPositionMs,
                             skip = data.sources.skip,
                             onPreviousEpisode = onPrev,
                             onNextEpisode = onNext,
@@ -347,6 +350,7 @@ private fun WatchContent(
                     }
                 else -> PlayerSurface(
                     stream = stream,
+                    qualityStreams = data.sources.streams.filterNot(StreamItem::isEmbed),
                     subtitles = data.sources.subtitles,
                     skip = data.sources.skip,
                     seriesTitle = data.seriesTitle,

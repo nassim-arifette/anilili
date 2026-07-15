@@ -3,6 +3,7 @@ package com.miruronative.ui.watch
 import android.content.ComponentName
 import android.net.Uri
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.View
 import androidx.annotation.OptIn
 import androidx.compose.foundation.BorderStroke
@@ -197,6 +198,7 @@ private class EpisodeControlPlayer(
 @Composable
 fun PlayerSurface(
     stream: StreamItem,
+    qualityStreams: List<StreamItem> = listOf(stream),
     subtitles: List<SubtitleItem>,
     skip: SkipTimes?,
     seriesTitle: String,
@@ -226,6 +228,13 @@ fun PlayerSurface(
     var controller by remember { mutableStateOf<MediaController?>(null) }
     val currentProvider by rememberUpdatedState(provider)
     val currentCategory by rememberUpdatedState(category)
+    var activeStream by remember(stream.url) { mutableStateOf(stream) }
+    var nextStartPositionMs by remember(stream.url) { mutableLongStateOf(startPositionMs) }
+    val nativeQualityStreams = remember(stream.url, qualityStreams) {
+        (listOf(stream) + qualityStreams)
+            .filterNot(StreamItem::isEmbed)
+            .distinctBy(StreamItem::url)
+    }
 
     DisposableEffect(controllerFuture) {
         controllerFuture.addListener(
@@ -249,6 +258,10 @@ fun PlayerSurface(
                 DiagnosticsLog.event("PlayerSurface controller still null after 5000ms")
             }
         }
+    }
+
+    LaunchedEffect(controller, stream.url) {
+        controller?.let(::clearVideoSelection)
     }
 
     DisposableEffect(controller) {
@@ -277,6 +290,7 @@ fun PlayerSurface(
                 }
 
                 override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+                    DiagnosticsLog.event("PlayerSurface tracks ${tracks.diagnosticSummary()}")
                     val mediaId = activeController.currentMediaItem?.mediaId ?: return
                     if (currentProvider != "reanime" || audioPreferenceAppliedFor == mediaId) return
                     if (applyReanimeAudioPreference(activeController, currentCategory)) {
@@ -297,18 +311,22 @@ fun PlayerSurface(
         }
     }
 
-    LaunchedEffect(controller, stream.url, subtitles) {
+    LaunchedEffect(controller, activeStream.url, subtitles) {
         val activeController = controller ?: return@LaunchedEffect
-        if (activeController.currentMediaItem?.mediaId == stream.url) {
-            DiagnosticsLog.event("PlayerSurface media item already active host=${stream.host()} type=${stream.typeLabel()}")
+        if (activeController.currentMediaItem?.mediaId == activeStream.url) {
+            DiagnosticsLog.event(
+                "PlayerSurface media item already active " +
+                    "host=${activeStream.host()} type=${activeStream.typeLabel()}",
+            )
             return@LaunchedEffect
         }
 
         DiagnosticsLog.event(
-            "PlayerSurface prepare stream type=${stream.typeLabel()} host=${stream.host()} " +
-                "height=${stream.height ?: "auto"} subtitles=${subtitles.size} startMs=$startPositionMs",
+            "PlayerSurface prepare stream type=${activeStream.typeLabel()} host=${activeStream.host()} " +
+                "height=${activeStream.declaredVideoHeight() ?: "auto"} subtitles=${subtitles.size} " +
+                "startMs=$nextStartPositionMs",
         )
-        PlaybackService.configureRequestHeaders(stream.referer, stream.playlistKey)
+        PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
         val watchRoute = Routes.watch(animeId, provider, category, episode)
         val metadata = MediaMetadata.Builder()
             .setTitle(episodeTitle)
@@ -319,10 +337,10 @@ fun PlayerSurface(
             })
             .build()
         val item = MediaItem.Builder()
-            .setMediaId(stream.url)
-            .setUri(stream.url)
+            .setMediaId(activeStream.url)
+            .setUri(activeStream.url)
             .setMediaMetadata(metadata)
-            .apply { if (stream.isHls) setMimeType(MimeTypes.APPLICATION_M3U8) }
+            .apply { if (activeStream.isHls) setMimeType(MimeTypes.APPLICATION_M3U8) }
             .setSubtitleConfigurations(
                 subtitles.mapIndexed { index, subtitle ->
                     MediaItem.SubtitleConfiguration.Builder(Uri.parse(subtitle.url))
@@ -341,7 +359,7 @@ fun PlayerSurface(
                 },
             )
             .build()
-        activeController.setMediaItem(item, startPositionMs.coerceAtLeast(0))
+        activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
         activeController.prepare()
         activeController.playWhenReady = true
         DiagnosticsLog.event("PlayerSurface prepare called playWhenReady=true")
@@ -362,6 +380,12 @@ fun PlayerSurface(
     var playerView by remember { mutableStateOf<PlayerView?>(null) }
     val mediaRouteButtonViewProvider = remember { ThemedMediaRouteButtonViewProvider() }
     var controllerVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(activeStream.url, playerView, device.isTv) {
+        if (device.isTv && playerView != null) {
+            delay(32)
+            playerView?.requestFocus()
+        }
+    }
     val currentOnNextEpisode by rememberUpdatedState(onNextEpisode)
     val currentOnPreviousEpisode by rememberUpdatedState(onPreviousEpisode)
     val currentHasNext by rememberUpdatedState(hasNextEpisode)
@@ -398,6 +422,7 @@ fun PlayerSurface(
         }
     }
     var settingsExpanded by remember { mutableStateOf(false) }
+    var pinnedVideoHeight by remember(controller, stream.url) { mutableStateOf<Int?>(null) }
     var seekFlash by remember { mutableIntStateOf(0) } // -10 / +10, 0 = hidden
     var seekFlashTick by remember { mutableIntStateOf(0) }
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
@@ -406,8 +431,8 @@ fun PlayerSurface(
     val introEndMs = skip?.introEnd?.times(1000)?.toLong()
     val outroStartMs = skip?.outroStart?.times(1000)?.toLong()
     val outroEndMs = skip?.outroEnd?.times(1000)?.toLong()
-    var introAutoSkipped by remember(stream.url, introStartMs, introEndMs) { mutableStateOf(false) }
-    var outroAutoHandled by remember(stream.url, outroStartMs, outroEndMs) { mutableStateOf(false) }
+    var introAutoSkipped by remember(activeStream.url, introStartMs, introEndMs) { mutableStateOf(false) }
+    var outroAutoHandled by remember(activeStream.url, outroStartMs, outroEndMs) { mutableStateOf(false) }
 
     LaunchedEffect(seekFlashTick) {
         if (seekFlash != 0) {
@@ -483,6 +508,23 @@ fun PlayerSurface(
                             }
                         },
                     )
+                    if (device.isTv) {
+                        setOnKeyListener { _, keyCode, event ->
+                            val isConfirm = keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                                keyCode == KeyEvent.KEYCODE_ENTER ||
+                                keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+                            if (isConfirm && event.action == KeyEvent.ACTION_DOWN && !isControllerFullyVisible) {
+                                showController()
+                                post {
+                                    findViewById<View>(androidx.media3.ui.R.id.exo_play_pause)
+                                        ?.requestFocus()
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    }
                     if (onToggleFullscreen != null) {
                         setFullscreenButtonClickListener { onToggleFullscreen() }
                     }
@@ -552,6 +594,46 @@ fun PlayerSurface(
             controller = controller,
             expanded = settingsExpanded,
             onDismiss = { settingsExpanded = false },
+            pinnedVideoHeight = pinnedVideoHeight,
+            sourceVideoHeights = nativeQualityStreams.mapNotNull(StreamItem::declaredVideoHeight),
+            onVideoHeightChange = { height ->
+                val activeController = controller ?: return@PlaybackSettingsMenu false
+                val applied = when {
+                    height == null -> {
+                        clearVideoSelection(activeController)
+                        if (activeStream.url != stream.url) {
+                            nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0)
+                            activeStream = stream
+                        }
+                        DiagnosticsLog.event("PlayerSurface quality selection mode=auto")
+                        true
+                    }
+                    activeController.hasVideoHeight(height) -> applyVideoHeight(activeController, height)
+                    else -> {
+                        val source = nativeQualityStreams.firstOrNull {
+                            it.declaredVideoHeight() == height
+                        }
+                        if (source == null) {
+                            DiagnosticsLog.event(
+                                "PlayerSurface quality selection rejected height=$height unavailable",
+                            )
+                            false
+                        } else {
+                            clearVideoSelection(activeController)
+                            nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0)
+                            activeStream = source
+                            DiagnosticsLog.event(
+                                "PlayerSurface quality selection mode=manual height=$height " +
+                                    "source=${source.typeLabel()} host=${source.host()}",
+                            )
+                            true
+                        }
+                    }
+                }
+                applied.also {
+                    if (applied) pinnedVideoHeight = height
+                }
+            },
             autoSkipIntroOutro = autoSkipIntroOutro,
             onAutoSkipIntroOutroChange = SettingsStore::setAutoSkipIntroOutro,
         )
@@ -609,11 +691,13 @@ private fun PlaybackSettingsMenu(
     controller: MediaController?,
     expanded: Boolean,
     onDismiss: () -> Unit,
+    pinnedVideoHeight: Int?,
+    sourceVideoHeights: List<Int>,
+    onVideoHeightChange: (Int?) -> Boolean,
     autoSkipIntroOutro: Boolean,
     onAutoSkipIntroOutroChange: (Boolean) -> Unit,
 ) {
     if (controller == null || !expanded) return
-    var pinnedHeight by remember(controller) { mutableStateOf<Int?>(null) }
     val context = LocalContext.current
     val trackNameProvider = remember(context) { DefaultTrackNameProvider(context.resources) }
 
@@ -632,28 +716,28 @@ private fun PlaybackSettingsMenu(
                     .heightIn(max = 420.dp)
                     .verticalScroll(rememberScrollState()),
             ) {
-            val heights = controller.currentTracks.groups
-                .filter { it.type == C.TRACK_TYPE_VIDEO }
-                .flatMap { group -> (0 until group.length).map { group.getTrackFormat(it).height } }
-                .filter { it > 0 }
+            val heights = (controller.currentTracks.groups
+                .filter { it.type == C.TRACK_TYPE_VIDEO && it.isSupported }
+                .flatMap { group ->
+                    (0 until group.length)
+                        .filter(group::isTrackSupported)
+                        .map { group.getTrackFormat(it).height }
+                }
+                .filter { it > 0 } + sourceVideoHeights)
                 .distinct()
                 .sortedDescending()
             SectionLabel("Quality")
             DropdownMenuItem(
-                text = { Text(if (pinnedHeight == null) "Auto ✓" else "Auto") },
+                text = { Text(if (pinnedVideoHeight == null) "Auto ✓" else "Auto") },
                 onClick = {
-                    applyVideoHeight(controller, null)
-                    pinnedHeight = null
-                    onDismiss()
+                    if (onVideoHeightChange(null)) onDismiss()
                 },
             )
             heights.forEach { height ->
                 DropdownMenuItem(
-                    text = { Text(if (pinnedHeight == height) "${height}p ✓" else "${height}p") },
+                    text = { Text(if (pinnedVideoHeight == height) "${height}p ✓" else "${height}p") },
                     onClick = {
-                        applyVideoHeight(controller, height)
-                        pinnedHeight = height
-                        onDismiss()
+                        if (onVideoHeightChange(height)) onDismiss()
                     },
                 )
             }
@@ -676,7 +760,7 @@ private fun PlaybackSettingsMenu(
             PlaybackSpeeds.forEach { speed ->
                 val selected = abs(controller.playbackParameters.speed - speed) < 0.01f
                 DropdownMenuItem(
-                    text = { Text("${speed.formatSpeed()}${if (selected) " ✓" else ""}") },
+                    text = { Text("${speed.formatPlaybackSpeed()}${if (selected) " ✓" else ""}") },
                     onClick = {
                         controller.setPlaybackSpeed(speed)
                         onDismiss()
@@ -709,10 +793,20 @@ private fun PlaybackSettingsMenu(
 
             val audioTracks = trackOptions(controller, trackNameProvider, C.TRACK_TYPE_AUDIO)
             if (audioTracks.isNotEmpty()) {
+                val hasAudioOverride = controller.hasTrackOverride(C.TRACK_TYPE_AUDIO)
+                val automaticTrack = audioTracks.firstOrNull(TrackOption::selected)?.name
                 HorizontalDivider()
                 SectionLabel("Audio")
                 DropdownMenuItem(
-                    text = { Text("Auto") },
+                    text = {
+                        Text(
+                            if (hasAudioOverride) {
+                                "Auto"
+                            } else {
+                                "Auto${automaticTrack?.let { " ($it)" }.orEmpty()} ✓"
+                            },
+                        )
+                    },
                     onClick = {
                         applyAudioTrack(controller, null)
                         onDismiss()
@@ -720,7 +814,9 @@ private fun PlaybackSettingsMenu(
                 )
                 audioTracks.forEach { option ->
                     DropdownMenuItem(
-                        text = { Text("${option.name}${if (option.selected) " ✓" else ""}") },
+                        text = {
+                            Text("${option.name}${if (hasAudioOverride && option.selected) " ✓" else ""}")
+                        },
                         onClick = {
                             applyAudioTrack(controller, option)
                             onDismiss()
@@ -743,16 +839,57 @@ private fun SectionLabel(text: String) {
     )
 }
 
-private fun applyVideoHeight(controller: MediaController, height: Int?) {
-    val builder: TrackSelectionParameters.Builder = controller.trackSelectionParameters.buildUpon()
+private fun applyVideoHeight(controller: MediaController, height: Int?): Boolean {
+    val builder = controller.videoSelectionBuilder()
     if (height == null) {
-        builder.clearVideoSizeConstraints()
-    } else {
-        builder.setMaxVideoSize(Int.MAX_VALUE, height).setMinVideoSize(0, height)
+        controller.trackSelectionParameters = builder.build()
+        DiagnosticsLog.event("PlayerSurface quality selection mode=auto")
+        return true
     }
+
+    val option = controller.currentTracks.groups.asSequence()
+        .filter { it.type == C.TRACK_TYPE_VIDEO && it.isSupported }
+        .flatMap { group ->
+            (0 until group.length).asSequence()
+                .filter(group::isTrackSupported)
+                .map { index -> group to index }
+        }
+        .firstOrNull { (group, index) -> group.getTrackFormat(index).height == height }
+    if (option == null) {
+        DiagnosticsLog.event("PlayerSurface quality selection rejected height=$height unavailable")
+        return false
+    }
+
+    val (group, index) = option
+    builder.setOverrideForType(TrackSelectionOverride(group.getMediaTrackGroup(), listOf(index)))
     controller.trackSelectionParameters = builder.build()
+    DiagnosticsLog.event(
+        "PlayerSurface quality selection mode=manual height=$height index=$index tracks=${group.length}",
+    )
+    return true
 }
 
+private fun clearVideoSelection(controller: MediaController) {
+    controller.trackSelectionParameters = controller.videoSelectionBuilder().build()
+}
+
+private fun MediaController.videoSelectionBuilder(): TrackSelectionParameters.Builder =
+    trackSelectionParameters.buildUpon()
+        .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+        .clearVideoSizeConstraints()
+        .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, false)
+
+private fun MediaController.hasVideoHeight(height: Int): Boolean = currentTracks.groups.any { group ->
+    group.type == C.TRACK_TYPE_VIDEO && group.isSupported &&
+        (0 until group.length).any { index ->
+            group.isTrackSupported(index) && group.getTrackFormat(index).height == height
+        }
+}
+
+private fun MediaController.hasTrackOverride(trackType: Int): Boolean =
+    trackSelectionParameters.overrides.values.any { it.type == trackType }
+
+@OptIn(UnstableApi::class)
 private fun trackOptions(
     controller: MediaController,
     trackNameProvider: DefaultTrackNameProvider,
@@ -780,6 +917,13 @@ private fun applyAudioTrack(controller: MediaController, option: TrackOption?) {
         builder.setOverrideForType(TrackSelectionOverride(option.trackGroup, listOf(option.trackIndex)))
     }
     controller.trackSelectionParameters = builder.build()
+    DiagnosticsLog.event(
+        if (option == null) {
+            "PlayerSurface audio selection mode=auto"
+        } else {
+            "PlayerSurface audio selection mode=manual name=${option.name.take(80)}"
+        },
+    )
 }
 
 private fun applyReanimeAudioPreference(controller: MediaController, category: String): Boolean {
@@ -835,8 +979,16 @@ private fun applyTextTrack(controller: MediaController, option: TrackOption?) {
         builder.setOverrideForType(TrackSelectionOverride(option.trackGroup, listOf(option.trackIndex)))
     }
     controller.trackSelectionParameters = builder.build()
+    DiagnosticsLog.event(
+        if (option == null) {
+            "PlayerSurface subtitle selection mode=off"
+        } else {
+            "PlayerSurface subtitle selection mode=manual name=${option.name.take(80)}"
+        },
+    )
 }
 
+@OptIn(UnstableApi::class)
 private fun PlayerView.bindUnifiedSettingsButton(onClick: () -> Unit) {
     findViewById<View>(androidx.media3.ui.R.id.exo_settings)?.setOnClickListener {
         showController()
@@ -850,7 +1002,7 @@ private fun isInSkipWindow(positionMs: Long, startMs: Long?, endMs: Long?): Bool
     return end > start && positionMs in start until end
 }
 
-private fun Float.formatSpeed(): String = if (this % 1f == 0f) {
+internal fun Float.formatPlaybackSpeed(): String = if (this % 1f == 0f) {
     "${toInt()}x"
 } else {
     "${this}x"
@@ -863,7 +1015,23 @@ private data class TrackOption(
     val selected: Boolean,
 )
 
-private val PlaybackSpeeds = listOf(0.25f, 0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
+internal val PlaybackSpeeds = listOf(
+    0.25f,
+    0.5f,
+    0.75f,
+    0.9f,
+    0.95f,
+    1f,
+    1.05f,
+    1.1f,
+    1.15f,
+    1.2f,
+    1.25f,
+    1.3f,
+    1.5f,
+    1.75f,
+    2f,
+)
 
 private fun Int.stateName(): String = when (this) {
     Player.STATE_IDLE -> "IDLE"
@@ -881,6 +1049,35 @@ private fun StreamItem.typeLabel(): String = when {
 
 private fun StreamItem.host(): String =
     runCatching { Uri.parse(url).host }.getOrNull() ?: "unknown"
+
+private fun StreamItem.declaredVideoHeight(): Int? = height ?: declaredVideoHeight(quality)
+
+internal fun declaredVideoHeight(label: String?): Int? = label
+    ?.let { Regex("""(?<!\d)(\d{3,4})p\b""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1) }
+    ?.toIntOrNull()
+    ?.takeIf { it in 144..4320 }
+
+private fun androidx.media3.common.Tracks.diagnosticSummary(): String = groups
+    .filter { it.isSupported }
+    .joinToString(separator = ";", limit = 12, truncated = "…") { group ->
+        val type = when (group.type) {
+            C.TRACK_TYPE_VIDEO -> "video"
+            C.TRACK_TYPE_AUDIO -> "audio"
+            C.TRACK_TYPE_TEXT -> "text"
+            else -> "type${group.type}"
+        }
+        val options = (0 until group.length)
+            .filter(group::isTrackSupported)
+            .joinToString(separator = ",", limit = 12, truncated = "…") { index ->
+                val format = group.getTrackFormat(index)
+                val label = when (group.type) {
+                    C.TRACK_TYPE_VIDEO -> format.height.takeIf { it > 0 }?.let { "${it}p" } ?: "unknown"
+                    else -> listOfNotNull(format.label, format.language).joinToString("/").ifBlank { "unknown" }
+                }
+                label + if (group.isTrackSelected(index)) "*" else ""
+            }
+        "$type=$options"
+    }
 
 private fun mimeFor(url: String): String = when {
     url.contains(".vtt", ignoreCase = true) -> MimeTypes.TEXT_VTT

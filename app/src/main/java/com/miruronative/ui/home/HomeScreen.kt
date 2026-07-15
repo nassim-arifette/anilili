@@ -45,9 +45,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,6 +62,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -69,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.miruronative.R
 import com.miruronative.data.library.HistoryEntry
 import com.miruronative.data.library.LibraryStore
@@ -82,7 +84,6 @@ import com.miruronative.ui.adaptive.LocalAppDeviceProfile
 import com.miruronative.ui.adaptive.focusHighlight
 import com.miruronative.ui.components.PullRefreshContainer
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -327,7 +328,13 @@ private fun HeroPager(
     if (items.isEmpty()) return
     val device = LocalAppDeviceProfile.current
     val pagerState = rememberPagerState(pageCount = { items.size })
-    val scope = rememberCoroutineScope()
+    val heroIds = items.map(Media::id)
+    var tvPage by remember(heroIds) { mutableIntStateOf(0) }
+    val safeTvPage = tvPage.coerceIn(0, items.lastIndex)
+    val focusRequesters = remember(heroIds) {
+        List(items.size) { HeroFocusRequesters(FocusRequester(), FocusRequester()) }
+    }
+    val tvFocusRequesters = remember { HeroFocusRequesters(FocusRequester(), FocusRequester()) }
     val heroHeight = when {
         device.isTv -> 420.dp
         device.isExpanded -> 360.dp
@@ -341,25 +348,42 @@ private fun HeroPager(
             .height(heroHeight)
             .clip(if (device.isTv) RoundedCornerShape(18.dp) else RoundedCornerShape(0.dp)),
     ) {
-        HorizontalPager(
-            state = pagerState,
-            modifier = Modifier.fillMaxSize(),
-            userScrollEnabled = !device.isTv,
-        ) { page ->
+        if (device.isTv) {
+            val page = safeTvPage
             HeroCard(
                 media = items[page],
                 onAnimeClick = onAnimeClick,
                 onWatchNow = onWatchNow,
                 canGoPrevious = page > 0,
                 canGoNext = page < items.lastIndex,
-                onPrevious = {
-                    scope.launch { pagerState.animateScrollToPage(page - 1) }
-                },
-                onNext = {
-                    scope.launch { pagerState.animateScrollToPage(page + 1) }
-                },
+                navigationInProgress = false,
+                playFocusRequester = tvFocusRequesters.play,
+                detailsFocusRequester = tvFocusRequesters.details,
+                onPrevious = { tvPage = (page - 1).coerceAtLeast(0) },
+                onNext = { tvPage = (page + 1).coerceAtMost(items.lastIndex) },
                 onMoveDown = onMoveDown,
             )
+        } else {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize(),
+                beyondViewportPageCount = 1,
+                key = { page -> items[page].id },
+            ) { page ->
+                HeroCard(
+                    media = items[page],
+                    onAnimeClick = onAnimeClick,
+                    onWatchNow = onWatchNow,
+                    canGoPrevious = page > 0,
+                    canGoNext = page < items.lastIndex,
+                    navigationInProgress = false,
+                    playFocusRequester = focusRequesters[page].play,
+                    detailsFocusRequester = focusRequesters[page].details,
+                    onPrevious = {},
+                    onNext = {},
+                    onMoveDown = onMoveDown,
+                )
+            }
         }
         Row(
             Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp),
@@ -369,9 +393,15 @@ private fun HeroPager(
                 Box(
                     Modifier
                         .height(5.dp)
-                        .width(if (i == pagerState.currentPage) 18.dp else 5.dp)
+                        .width(if (i == if (device.isTv) safeTvPage else pagerState.currentPage) 18.dp else 5.dp)
                         .clip(CircleShape)
-                        .background(if (i == pagerState.currentPage) MaterialTheme.colorScheme.primary else Color.White.copy(.4f)),
+                        .background(
+                            if (i == if (device.isTv) safeTvPage else pagerState.currentPage) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                Color.White.copy(.4f)
+                            },
+                        ),
                 )
             }
         }
@@ -385,14 +415,25 @@ private fun HeroCard(
     onWatchNow: (Int) -> Unit,
     canGoPrevious: Boolean,
     canGoNext: Boolean,
+    navigationInProgress: Boolean,
+    playFocusRequester: FocusRequester,
+    detailsFocusRequester: FocusRequester,
     onPrevious: () -> Unit,
     onNext: () -> Unit,
     onMoveDown: (() -> Unit)?,
 ) {
     val device = LocalAppDeviceProfile.current
+    val context = LocalContext.current
+    val heroImage = media.bannerImage ?: media.coverImage.best
+    val heroImageRequest = remember(heroImage) {
+        ImageRequest.Builder(context)
+            .data(heroImage)
+            .crossfade(false)
+            .build()
+    }
     Box(Modifier.fillMaxSize()) {
         AsyncImage(
-            model = media.bannerImage ?: media.coverImage.best,
+            model = heroImageRequest,
             contentDescription = null,
             modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Crop,
@@ -428,11 +469,14 @@ private fun HeroCard(
                     onClick = { onWatchNow(media.id) },
                     colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
                     modifier = Modifier
+                        .focusRequester(playFocusRequester)
                         .onPreviewKeyEvent { event ->
                             if (device.isTv && event.type == KeyEventType.KeyDown) {
                                 when (event.key) {
                                     Key.DirectionLeft -> {
-                                        if (canGoPrevious) {
+                                        if (event.nativeKeyEvent.repeatCount > 0 || navigationInProgress) {
+                                            true
+                                        } else if (canGoPrevious) {
                                             onPrevious()
                                             true
                                         } else {
@@ -457,11 +501,14 @@ private fun HeroCard(
                 OutlinedButton(
                     onClick = { onAnimeClick(media.id) },
                     modifier = Modifier
+                        .focusRequester(detailsFocusRequester)
                         .onPreviewKeyEvent { event ->
                             if (device.isTv && event.type == KeyEventType.KeyDown) {
                                 when (event.key) {
                                     Key.DirectionRight -> {
-                                        if (canGoNext) {
+                                        if (event.nativeKeyEvent.repeatCount > 0 || navigationInProgress) {
+                                            true
+                                        } else if (canGoNext) {
                                             onNext()
                                             true
                                         } else {
@@ -487,6 +534,11 @@ private fun HeroCard(
         }
     }
 }
+
+private data class HeroFocusRequesters(
+    val play: FocusRequester,
+    val details: FocusRequester,
+)
 
 @Composable
 private fun MediaRail(title: String, media: List<Media>, onAnimeClick: (Int) -> Unit) {
