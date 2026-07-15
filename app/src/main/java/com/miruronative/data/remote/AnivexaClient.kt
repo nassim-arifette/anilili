@@ -57,7 +57,10 @@ class AnivexaClient(
     private val allAnime = AllAnimeProvider(client, json)
     private val animeKai = AnimeKaiProvider(client)
 
-    suspend fun getEpisodes(anilistId: Int): EpisodesResult = withContext(Dispatchers.IO) {
+    suspend fun getEpisodes(anilistId: Int, seedMedia: Media? = null): EpisodesResult = withContext(Dispatchers.IO) {
+        // The caller (repository) has usually already fetched this AniList Media through the shared
+        // 24h cache; reuse it so a cold catalog doesn't fire a second, rate-limit-exposed request.
+        seedMedia?.let { mediaCache[anilistId] = it }
         val media = media(anilistId)
         val aired = media.nextAiringEpisode?.episode?.minus(1)?.takeIf { it > 0 }
         val count = when {
@@ -91,9 +94,10 @@ class AnivexaClient(
         }
     }
 
-    suspend fun getSources(episodeId: String): SourcesResult = withContext(Dispatchers.IO) {
+    suspend fun getSources(episodeId: String, seedMedia: Media? = null): SourcesResult = withContext(Dispatchers.IO) {
         val request = NativeProviderParsers.episodeRequest(episodeId)
             ?: error("Invalid native provider episode id: $episodeId")
+        seedMedia?.let { mediaCache[request.anilistId] = it }
         val media = media(request.anilistId)
         when (request.provider) {
             "anikoto" -> anikoto(media, request.audio, request.episode)
@@ -123,7 +127,7 @@ class AnivexaClient(
             )
         }
 
-    private fun providerAvailability(provider: String, media: Media, count: Int): EpisodeAvailability = when (provider) {
+    private suspend fun providerAvailability(provider: String, media: Media, count: Int): EpisodeAvailability = when (provider) {
         "anikoto" -> anikotoAvailability(media, count)
         "allanime" -> allAnime.episodeAvailability(media)
         "animekai" -> animeKai.episodeAvailability(media)
@@ -135,7 +139,7 @@ class AnivexaClient(
         else -> error("Unsupported native provider catalog: $provider")
     }
 
-    private fun anikotoAvailability(media: Media, count: Int): EpisodeAvailability {
+    private suspend fun anikotoAvailability(media: Media, count: Int): EpisodeAvailability = coroutineScope {
         fun available(audio: String, episode: Int): Boolean {
             val ids = listOfNotNull(media.id, media.idMal).distinct()
             return ids.any { id ->
@@ -145,9 +149,10 @@ class AnivexaClient(
                 megaPlayPageAvailable(page)
             }
         }
-        val sub = highestAvailable(count) { available("sub", it) }
-        val dub = highestAvailable(count) { available("dub", it) }
-        return EpisodeAvailability.counts(sub, dub)
+        // Sub and dub availability are independent binary searches; probe them concurrently.
+        val sub = async(Dispatchers.IO) { highestAvailable(count) { available("sub", it) } }
+        val dub = async(Dispatchers.IO) { highestAvailable(count) { available("dub", it) } }
+        EpisodeAvailability.counts(sub.await(), dub.await())
     }
 
     private fun reanimeAvailability(media: Media): EpisodeAvailability {
@@ -197,7 +202,7 @@ class AnivexaClient(
         }
     }
 
-    private fun twoDhiveAvailability(media: Media, fallbackCount: Int): EpisodeAvailability {
+    private suspend fun twoDhiveAvailability(media: Media, fallbackCount: Int): EpisodeAvailability = coroutineScope {
         val malId = media.idMal ?: error("2Dhive needs a MyAnimeList id")
         fun props(episode: Int): JsonObject? = runCatching {
             extractAstroProps(getText("https://2dhive.com/episode?anime=$malId&ep_num=$episode"))
@@ -221,10 +226,13 @@ class AnivexaClient(
                 megaPlayPageAvailable(page)
             }
         }
-        val sub = highestAvailable(total) { episode -> available("sub", episode) }
-        val dub = highestAvailable(total) { episode -> available("dub", episode) }
+        // Sub and dub availability are independent binary searches; probe them concurrently.
+        val subDeferred = async(Dispatchers.IO) { highestAvailable(total) { episode -> available("sub", episode) } }
+        val dubDeferred = async(Dispatchers.IO) { highestAvailable(total) { episode -> available("dub", episode) } }
+        val sub = subDeferred.await()
+        val dub = dubDeferred.await()
         if (sub == 0 && dub == 0) error("2Dhive returned no playable episode catalog")
-        return EpisodeAvailability.counts(sub, dub)
+        EpisodeAvailability.counts(sub, dub)
     }
 
     private fun highestAvailable(limit: Int, available: (Int) -> Boolean): Int {

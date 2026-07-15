@@ -22,6 +22,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.SetSerializer
@@ -61,6 +63,10 @@ class MiruroRepository(
 ) {
     /** User preference: keep hentai out of every browsing surface. */
     private val hideAdult: Boolean get() = SettingsStore.hideAdultContent.value
+
+    // Bounds the related-seasons walk's AniList fan-out so it can't monopolise the shared,
+    // rate-limited connection pool (5/host) and stall playback-critical metadata/catalog lookups.
+    private val seriesFetchGate = Semaphore(SERIES_FETCH_CONCURRENCY)
 
     // ---- discovery (AniList) ----
     suspend fun trending(page: Int = 1, force: Boolean = false): MediaPage = mediaPage("trending:$page", COLLECTION_TTL, force) {
@@ -164,7 +170,7 @@ class MiruroRepository(
                     if (media.id == root.id && media.relations.edges.isNotEmpty()) {
                         media
                     } else {
-                        runCatching { animeInfo(media.id) }.getOrNull() ?: media
+                        seriesFetchGate.withPermit { runCatching { animeInfo(media.id) }.getOrNull() } ?: media
                     }
                 }
             }.awaitAll()
@@ -208,16 +214,21 @@ class MiruroRepository(
     }.withFillerMarks(anilistId)
 
     /** Extra sources — Anivexa-API (can be slower; loaded in the background by the detail screen). */
-    suspend fun anivexaEpisodes(anilistId: Int, force: Boolean = false): EpisodesResult = cache.getOrFetch(
-        key = "episodes:v4:anivexa:$anilistId",
-        serializer = EpisodesResult.serializer(),
-        ttlMs = EPISODES_TTL,
-        forceRefresh = force,
-    ) {
-        anivexa.getEpisodes(anilistId).also {
-            check(!it.isEmpty) { "Anivexa returned no episode providers" }
-        }
-    }.withFillerMarks(anilistId)
+    suspend fun anivexaEpisodes(anilistId: Int, force: Boolean = false): EpisodesResult {
+        // Fetched here (outside the episodes cache lock — the striped mutexes are not reentrant) so
+        // the Anivexa catalog reuses the shared AniList Media instead of re-requesting it itself.
+        val seed = runCatching { animeInfo(anilistId) }.getOrNull()
+        return cache.getOrFetch(
+            key = "episodes:v4:anivexa:$anilistId",
+            serializer = EpisodesResult.serializer(),
+            ttlMs = EPISODES_TTL,
+            forceRefresh = force,
+        ) {
+            anivexa.getEpisodes(anilistId, seed).also {
+                check(!it.isEmpty) { "Anivexa returned no episode providers" }
+            }
+        }.withFillerMarks(anilistId)
+    }
 
     /**
      * Applies MAL filler flags to every provider's episode list. Providers rarely carry filler
@@ -261,33 +272,35 @@ class MiruroRepository(
         category: Category,
         anilistId: Int,
     ): SourcesResult = when (ProviderCatalog.sourceOf(provider)) {
-        ProviderCatalog.Source.ANIVEXA -> anivexa.getSources(pipeId)
+        ProviderCatalog.Source.ANIVEXA -> anivexa.getSources(pipeId, animeInfo(anilistId))
         ProviderCatalog.Source.MIRURO -> pipe.getSources(pipeId, provider, category, anilistId)
     }
 
     data class ResolvedSources(val sources: SourcesResult, val provider: String)
 
     /**
-     * Resolve a playable stream for [number], trying [preferred] first and then other providers
-     * (fast Miruro ones before slower Anivexa scrapers) until one actually returns a stream.
-     * This is the multi-source fallback: picking a server that has no copy silently rolls over.
+     * Resolve a playable stream for [number] within the supplied [episodes] catalog, trying
+     * [preferred] first and then other providers (fast Miruro ones before slower Anivexa
+     * scrapers) until one actually returns a stream. This is the multi-source fallback: picking
+     * a server that has no copy silently rolls over. The caller owns the catalog so playback can
+     * start on the fast Miruro set before the Anivexa providers have finished loading.
      */
     suspend fun resolveSources(
         anilistId: Int,
         number: Double,
         preferred: String,
         category: Category,
+        episodes: EpisodesResult,
         excludedProviders: Set<String> = emptySet(),
         maxAttempts: Int = 5,
     ): ResolvedSources? {
-        val merged = episodes(anilistId)
-        val ordered = providerAttemptOrder(preferred, merged.providerNames)
+        val ordered = providerAttemptOrder(preferred, episodes.providerNames)
 
         var attempts = 0
         for (name in ordered) {
             if (attempts >= maxAttempts) break
             if (name in excludedProviders) continue
-            val provider = merged.provider(name) ?: continue
+            val provider = episodes.provider(name) ?: continue
             val ep = provider.episodes(category).firstOrNull { it.number == number } ?: continue
             attempts++
             val result = runCatching { sources(ep.pipeId, name, category, anilistId) }
@@ -345,6 +358,7 @@ class MiruroRepository(
     private companion object {
         const val MAX_SERIES_ENTRIES = 16
         const val MAX_SERIES_DEPTH = 8
+        const val SERIES_FETCH_CONCURRENCY = 2
         const val SCHEDULE_TTL = 15L * 60 * 1000
         const val SEARCH_TTL = 30L * 60 * 1000
         const val AIRING_TTL = 30L * 60 * 1000

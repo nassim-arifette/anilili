@@ -40,6 +40,8 @@ data class WatchData(
     val artworkUrl: String?,
     val startPositionMs: Long = 0,
     val isResolving: Boolean = false,
+    /** The fast Miruro sources are shown; the slower Anivexa servers are still loading in. */
+    val isLoadingMoreSources: Boolean = false,
     val notice: String? = null,
 ) {
     val current: EpisodeItem get() = episodes[currentIndex]
@@ -70,6 +72,8 @@ class WatchViewModel : ViewModel() {
     private var lastRequestedNumber = 1.0
     private var failedProviders = mutableSetOf<String>()
     private var resolveJob: Job? = null
+    private var anivexaMergeJob: Job? = null
+    private var mergedIncludesAnivexa = false
     private var mergedEpisodes = EpisodesResult(emptyList())
 
     fun start(id: Int, providerName: String, categoryApi: String, episodeNumber: String) {
@@ -84,13 +88,28 @@ class WatchViewModel : ViewModel() {
         category = Category.from(categoryApi)
         preferred = providerName
         failedProviders.clear()
+        mergedIncludesAnivexa = false
 
         resolveJob?.cancel()
+        anivexaMergeJob?.cancel()
         resolveJob = viewModelScope.launch {
             _state.value = UiState.Loading
             try {
                 DiagnosticsLog.event("Watch episodes load start id=$id")
-                val merged = repo.episodes(id)
+                // Fast path: start from the Miruro pipe alone so playback isn't held behind the
+                // slower multi-provider Anivexa catalog. The Anivexa providers fold in afterwards
+                // via launchAnivexaMerge. Only wait on the full catalog when Miruro yields nothing,
+                // or the requested provider is an Anivexa one (e.g. resuming on such a server).
+                val miruro = runCatching { repo.miruroEpisodes(id) }
+                    .onFailure { DiagnosticsLog.throwable("Watch miruro episodes failed id=$id", it) }
+                    .getOrDefault(EpisodesResult(emptyList()))
+                val preferredIsAnivexa =
+                    ProviderCatalog.sourceOf(preferred) == ProviderCatalog.Source.ANIVEXA
+                val merged = if (!miruro.isEmpty && !preferredIsAnivexa) {
+                    miruro
+                } else {
+                    repo.episodes(id).also { mergedIncludesAnivexa = true }
+                }
                 DiagnosticsLog.event(
                     "Watch episodes load success id=$id providers=" +
                         merged.providers.joinToString { provider ->
@@ -111,11 +130,47 @@ class WatchViewModel : ViewModel() {
                 if (spine.isEmpty()) error("No episodes for this title")
                 val startNumber = episodeNumber.toDoubleOrNull() ?: spine.first().number
                 resolveAndPlay(startNumber)
+                if (!mergedIncludesAnivexa) launchAnivexaMerge(id)
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
                 DiagnosticsLog.throwable("Watch start failed key=$key", e)
                 _state.value = UiState.Error(e.message ?: "Failed to load episode")
             }
+        }
+    }
+
+    /**
+     * Fold the slower Anivexa providers in once they arrive, without disturbing playback that
+     * already started on a Miruro source. Refreshes the navigation spine and the source list so
+     * the extra servers become selectable; the active stream and resolving flag are left as-is.
+     */
+    private fun launchAnivexaMerge(id: Int) {
+        anivexaMergeJob?.cancel()
+        anivexaMergeJob = viewModelScope.launch {
+            val anivexa = runCatching { repo.anivexaEpisodes(id) }
+                .onFailure { DiagnosticsLog.throwable("Watch anivexa merge failed id=$id", it) }
+                .getOrNull()
+            if (anivexa != null && !anivexa.isEmpty) {
+                mergedEpisodes = repo.mergeProviders(mergedEpisodes, anivexa)
+                spine = pickSpine(mergedEpisodes)
+                DiagnosticsLog.event(
+                    "Watch anivexa merge applied id=$id providers=" + mergedEpisodes.providerNames.joinToString(),
+                )
+            }
+            mergedIncludesAnivexa = true
+            // Reflect completion whether or not Anivexa added anything: the extra servers become
+            // selectable and the "loading more servers" hint clears.
+            val data = (_state.value as? UiState.Success)?.data ?: return@launch
+            val number = data.current.number
+            val index = spine.indexOfFirst { it.number == number }.coerceAtLeast(0)
+            _state.value = UiState.Success(
+                data.copy(
+                    episodes = spine,
+                    currentIndex = index,
+                    sourceOptions = sourceOptions(number),
+                    isLoadingMoreSources = false,
+                ),
+            )
         }
     }
 
@@ -148,6 +203,7 @@ class WatchViewModel : ViewModel() {
             number = number,
             preferred = requestedProvider,
             category = category,
+            episodes = mergedEpisodes,
             excludedProviders = failedProviders,
         )
         if (resolved == null) {
@@ -208,6 +264,7 @@ class WatchViewModel : ViewModel() {
                 artworkUrl = artworkUrl,
                 startPositionMs = resume,
                 isResolving = false,
+                isLoadingMoreSources = !mergedIncludesAnivexa,
                 notice = fallbackNotice,
             ),
         )
