@@ -22,14 +22,28 @@ import androidx.compose.ui.unit.dp
 import com.miruronative.ui.adaptive.focusHighlight
 
 @Composable
-fun LoadingBox(modifier: Modifier = Modifier) {
+fun LoadingBox(modifier: Modifier = Modifier, message: String? = null) {
     Box(
         modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
         contentAlignment = Alignment.Center,
     ) {
-        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+            if (message != null) {
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 40.dp),
+                )
+            }
+        }
     }
 }
 

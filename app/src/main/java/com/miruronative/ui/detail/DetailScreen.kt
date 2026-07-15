@@ -57,6 +57,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.runtime.LaunchedEffect
@@ -167,28 +168,63 @@ private fun DetailContent(
     resume: HistoryEntry?,
     modifier: Modifier = Modifier,
 ) {
+    val device = LocalAppDeviceProfile.current
     val info = data.info
     val provider = selectedProvider?.let { data.episodes.provider(it) }
     val episodes = provider?.episodes(selectedCategory).orEmpty()
     val canWatch = selectedProvider != null && episodes.isNotEmpty()
+    val pad = device.pagePadding
+
+    val onWatch: () -> Unit = {
+        when {
+            resume != null -> onPlay(resume.provider, resume.category, resume.episodeLabel)
+            canWatch -> onPlay(selectedProvider!!, selectedCategory.api, episodes.first().displayNumber)
+        }
+    }
+    val resolving = !canWatch && resume == null && data.episodesError == null
 
     LazyColumn(modifier = modifier.fillMaxSize()) {
-        item { Header(info) }
-        item { GenreRow(info.genres) }
-        item {
-            WatchButton(
-                resume = resume,
-                canWatch = canWatch,
-                resolving = !canWatch && resume == null && data.episodesError == null,
-                onWatch = {
-                    when {
-                        resume != null -> onPlay(resume.provider, resume.category, resume.episodeLabel)
-                        canWatch -> onPlay(selectedProvider!!, selectedCategory.api, episodes.first().displayNumber)
+        if (device.isExpanded) {
+            // Wide screens & TV: poster on the left, everything else in a column that fills the
+            // horizontal space — so the title, genres and Watch button fit without scrolling.
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = pad, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(if (device.isTv) 28.dp else 20.dp),
+                ) {
+                    PosterImage(
+                        model = info.coverImage.best,
+                        contentDescription = info.title.preferred,
+                        width = if (device.isTv) 220.dp else 176.dp,
+                    )
+                    Column(Modifier.weight(1f)) {
+                        TitleMetadata(info)
+                        GenreRow(info.genres, Modifier.padding(top = 10.dp))
+                        WatchButton(resume, canWatch, resolving, onWatch, Modifier.padding(top = 12.dp))
+                        if (data.loadingMore && canWatch) {
+                            InlineLoadingRow("Loading more servers…", Modifier.padding(top = 6.dp))
+                        }
+                        Description(info.description, Modifier.padding(top = 12.dp))
                     }
-                },
-            )
+                }
+            }
+        } else {
+            item { Header(info) }
+            item { GenreRow(info.genres, Modifier.padding(horizontal = pad, vertical = 4.dp)) }
+            item {
+                Column {
+                    WatchButton(resume, canWatch, resolving, onWatch, Modifier.padding(horizontal = pad, vertical = 8.dp))
+                    // Miruro's fast sources are already playable; the rest are still loading in.
+                    if (data.loadingMore && canWatch) {
+                        InlineLoadingRow(
+                            "Loading more servers…",
+                            Modifier.fillMaxWidth().padding(horizontal = pad, vertical = 4.dp),
+                        )
+                    }
+                }
+            }
+            item { Description(info.description, Modifier.padding(horizontal = pad, vertical = 8.dp)) }
         }
-        item { Description(info.description) }
         if (data.seriesLoading || data.series.size > 1) {
             item {
                 SeriesSection(
@@ -214,15 +250,14 @@ private fun WatchButton(
     canWatch: Boolean,
     resolving: Boolean,
     onWatch: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
-    val device = LocalAppDeviceProfile.current
     val enabled = resume != null || canWatch
     Button(
         onClick = onWatch,
         enabled = enabled,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = device.pagePadding, vertical = 8.dp)
             .focusHighlight(RoundedCornerShape(24.dp)),
     ) {
         if (resolving) {
@@ -271,7 +306,32 @@ private fun SeriesSection(
         // Still walking the prequel/sequel chain and nothing groupable yet.
         if (loading && seasons.size <= 1 && related.isEmpty()) {
             SectionHeader("Seasons", loading = true)
+            Text(
+                "Finding other seasons and related titles…",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = LocalAppDeviceProfile.current.pagePadding, vertical = 2.dp),
+            )
         }
+    }
+}
+
+/** Small spinner + explanatory text row, used to advise that data is still loading in. */
+@Composable
+private fun InlineLoadingRow(text: String, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+        Text(
+            text,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -433,55 +493,64 @@ private fun Header(info: Media) {
         else -> 110.dp
     }
     Row(Modifier.padding(device.pagePadding)) {
-        AsyncImage(
-            model = info.coverImage.best,
-            contentDescription = info.title.preferred,
-            modifier = Modifier
-                .width(coverWidth)
-                .aspectRatio(2f / 3f)
-                .clip(RoundedCornerShape(10.dp))
-                .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(10.dp)),
-            contentScale = ContentScale.Crop,
-        )
-        Column(Modifier.padding(start = 12.dp)) {
-            Text(info.title.preferred, style = MaterialTheme.typography.titleLarge, maxLines = 3, overflow = TextOverflow.Ellipsis)
-            info.title.romaji?.takeIf { it != info.title.preferred }?.let { romaji ->
-                Text(
-                    romaji,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontStyle = FontStyle.Italic,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
-            }
+        PosterImage(info.coverImage.best, info.title.preferred, coverWidth)
+        TitleMetadata(info, Modifier.padding(start = 12.dp))
+    }
+}
+
+@Composable
+private fun PosterImage(model: Any?, contentDescription: String?, width: Dp) {
+    AsyncImage(
+        model = model,
+        contentDescription = contentDescription,
+        modifier = Modifier
+            .width(width)
+            .aspectRatio(2f / 3f)
+            .clip(RoundedCornerShape(10.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(10.dp)),
+        contentScale = ContentScale.Crop,
+    )
+}
+
+@Composable
+private fun TitleMetadata(info: Media, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(info.title.preferred, style = MaterialTheme.typography.titleLarge, maxLines = 3, overflow = TextOverflow.Ellipsis)
+        info.title.romaji?.takeIf { it != info.title.preferred }?.let { romaji ->
             Text(
-                listOfNotNull(info.format, info.seasonYear?.toString()).joinToString(" • "),
-                style = MaterialTheme.typography.bodyMedium,
+                romaji,
+                style = MaterialTheme.typography.bodySmall,
+                fontStyle = FontStyle.Italic,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp),
             )
-            info.episodes?.let {
-                Text("$it episodes", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            info.averageScore?.let {
-                Text("★ $it%", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-            }
-            info.status?.let {
-                Text(it.replace('_', ' '), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
-            }
+        }
+        Text(
+            listOfNotNull(info.format, info.seasonYear?.toString()).joinToString(" • "),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+        info.episodes?.let {
+            Text("$it episodes", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        info.averageScore?.let {
+            Text("★ $it%", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+        }
+        info.status?.let {
+            Text(it.replace('_', ' '), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
         }
     }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun GenreRow(genres: List<String>) {
+private fun GenreRow(genres: List<String>, modifier: Modifier = Modifier) {
     if (genres.isEmpty()) return
-    val device = LocalAppDeviceProfile.current
     FlowRow(
-        modifier = Modifier.padding(horizontal = device.pagePadding, vertical = 4.dp),
+        modifier = modifier,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         genres.forEach { genre ->
@@ -503,9 +572,8 @@ private fun GenreRow(genres: List<String>) {
 }
 
 @Composable
-private fun Description(description: String?) {
+private fun Description(description: String?, modifier: Modifier = Modifier) {
     if (description.isNullOrBlank()) return
-    val device = LocalAppDeviceProfile.current
     var expanded by remember { mutableStateOf(false) }
     val clean = remember(description) { description.replace(Regex("<[^>]*>"), "").trim() }
     Text(
@@ -514,8 +582,7 @@ private fun Description(description: String?) {
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         maxLines = if (expanded) Int.MAX_VALUE else 4,
         overflow = TextOverflow.Ellipsis,
-        modifier = Modifier
-            .padding(horizontal = device.pagePadding, vertical = 8.dp)
+        modifier = modifier
             .fillMaxWidth()
             .focusHighlight(RoundedCornerShape(8.dp))
             .clip(RoundedCornerShape(8.dp))

@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -185,7 +186,21 @@ fun WatchScreen(
 
         when (val s = state) {
             is UiState.Loading -> {
-                LoadingBox()
+                // Only surface the "this can take a moment" note once loading is genuinely slow,
+                // so it doesn't flash by on the common fast (Miruro-first) path.
+                var showSlowNote by remember { mutableStateOf(false) }
+                LaunchedEffect(Unit) {
+                    delay(1_500)
+                    showSlowNote = true
+                }
+                LoadingBox(
+                    message = if (showSlowNote) {
+                        "Finding a source for this episode.\n" +
+                            "The first time you open a title we check every server, so it can take a few seconds."
+                    } else {
+                        null
+                    },
+                )
                 BackButton(pauseAndBack, Modifier.align(Alignment.TopStart))
             }
             is UiState.Error -> Column(Modifier.fillMaxSize()) {
@@ -427,6 +442,11 @@ private fun SourceSelectors(
     val audioForServer = remember(data.sourceOptions, data.provider) {
         data.sourceOptions.filter { it.provider == data.provider }.map { it.category }.distinct()
     }
+    // While the Anivexa catalog is still loading, list the servers we're still checking so their
+    // absence reads as "loading", not "unavailable".
+    val pendingServers = remember(servers, data.isLoadingMoreSources) {
+        if (data.isLoadingMoreSources) ProviderCatalog.anivexaProviders.filterNot { it in servers } else emptyList()
+    }
     var showServerDialog by remember { mutableStateOf(false) }
 
     Row(
@@ -468,6 +488,23 @@ private fun SourceSelectors(
                 )
             }
         }
+        if (data.isLoadingMoreSources) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    text = "More servers…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 
     if (showServerDialog) {
@@ -499,7 +536,8 @@ private fun SourceSelectors(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = "${servers.size} available",
+                            text = if (pendingServers.isEmpty()) "${servers.size} available"
+                                else "${servers.size} ready · checking more…",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.primary
                         )
@@ -513,21 +551,27 @@ private fun SourceSelectors(
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         val columns = if (device.isTv) 4 else 3
-                        val rows = servers.chunked(columns)
-                        rows.forEach { rowServers ->
+                        // Ready servers first, then the ones we're still checking (spinner cells).
+                        val cells = servers.map { it to true } + pendingServers.map { it to false }
+                        val rows = cells.chunked(columns)
+                        rows.forEach { rowCells ->
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                rowServers.forEach { server ->
-                                    val selected = server == data.provider
-                                    val bg = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+                                rowCells.forEach { (server, ready) ->
+                                    val selected = ready && server == data.provider
+                                    val bg = when {
+                                        selected -> MaterialTheme.colorScheme.primary
+                                        ready -> MaterialTheme.colorScheme.surfaceVariant
+                                        else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                                    }
                                     val textColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
                                     Box(
                                         modifier = Modifier
                                             .weight(1f)
                                             .height(44.dp)
-                                            .focusHighlight(RoundedCornerShape(8.dp))
+                                            .then(if (ready) Modifier.focusHighlight(RoundedCornerShape(8.dp)) else Modifier)
                                             .clip(RoundedCornerShape(8.dp))
                                             .background(bg)
                                             .border(
@@ -536,30 +580,57 @@ private fun SourceSelectors(
                                                 else MaterialTheme.colorScheme.outline,
                                                 RoundedCornerShape(8.dp)
                                             )
-                                            .clickable {
-                                                showServerDialog = false
-                                                if (device.isTv) runCatching { focusRequester.requestFocus() }
-                                                if (!selected) {
-                                                    val options = data.sourceOptions.filter { it.provider == server }
-                                                    val category = options.firstOrNull { it.category == data.category }?.category
-                                                        ?: options.first().category
-                                                    onChangeSource(server, category.api)
+                                            .then(
+                                                if (ready) {
+                                                    Modifier.clickable {
+                                                        showServerDialog = false
+                                                        if (device.isTv) runCatching { focusRequester.requestFocus() }
+                                                        if (!selected) {
+                                                            val options = data.sourceOptions.filter { it.provider == server }
+                                                            val category = options.firstOrNull { it.category == data.category }?.category
+                                                                ?: options.first().category
+                                                            onChangeSource(server, category.api)
+                                                        }
+                                                    }
+                                                } else {
+                                                    Modifier
                                                 }
-                                            },
+                                            ),
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Text(
-                                            text = ProviderCatalog.label(server),
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                            color = textColor,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            modifier = Modifier.padding(horizontal = 4.dp)
-                                        )
+                                        if (ready) {
+                                            Text(
+                                                text = ProviderCatalog.label(server),
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                                color = textColor,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.padding(horizontal = 4.dp)
+                                            )
+                                        } else {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                modifier = Modifier.padding(horizontal = 4.dp),
+                                            ) {
+                                                CircularProgressIndicator(
+                                                    modifier = Modifier.size(12.dp),
+                                                    strokeWidth = 2.dp,
+                                                    color = MaterialTheme.colorScheme.primary,
+                                                )
+                                                Text(
+                                                    text = ProviderCatalog.label(server),
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            }
+                                        }
                                     }
                                 }
-                                repeat(columns - rowServers.size) {
+                                repeat(columns - rowCells.size) {
                                     Spacer(modifier = Modifier.weight(1f))
                                 }
                             }
