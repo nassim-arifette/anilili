@@ -295,7 +295,9 @@ private fun MiruroRoot(
     LaunchedEffect(pendingRoute) {
         pendingRoute?.takeIf { it.isNotBlank() }?.let { route ->
             DiagnosticsLog.event("Consuming pending route=$route")
-            nav.navigate(route) { launchSingleTop = true }
+            // Tabs must go through navigateTab: a plain navigate pushes the tab on top of the
+            // start destination, and the next Home tap then restores that entry as Home's state.
+            if (route in Routes.tabRoutes) nav.navigateTab(route) else nav.navigate(route) { launchSingleTop = true }
             onRouteConsumed()
         }
     }
