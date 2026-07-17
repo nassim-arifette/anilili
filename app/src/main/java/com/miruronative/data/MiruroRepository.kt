@@ -22,6 +22,7 @@ import com.miruronative.data.remote.AniListClient
 import com.miruronative.data.remote.AniSkipClient
 import com.miruronative.data.remote.AnivexaClient
 import com.miruronative.data.remote.JikanClient
+import com.miruronative.data.remote.KonohaClient
 import com.miruronative.data.remote.MalClient
 import com.miruronative.data.remote.MediaListProgressSnapshot
 import com.miruronative.data.remote.PipeClient
@@ -70,6 +71,7 @@ class MiruroRepository(
     private val jikan: JikanClient,
     private val aniSkip: AniSkipClient,
     private val mal: MalClient,
+    private val konoha: KonohaClient,
     private val cache: AppCache,
 ) {
     /** User preference: keep hentai out of every browsing surface. */
@@ -188,18 +190,61 @@ class MiruroRepository(
      * The MAL anime list as AniList-shaped [MediaListEntry]s. MAL ids are joined back to
      * AniList media in day-cached batches of 50; the odd title AniList doesn't know is dropped.
      */
-    suspend fun malAnimeList(): List<MediaListEntry> {
+    suspend fun malAnimeList(): List<MediaListEntry> = coroutineScope {
         val entries = mal.animeList()
-        val byMalId = mutableMapOf<Int, Media>()
-        entries.map { it.malId }.distinct().sorted().chunked(50).forEach { chunk ->
-            cache.getOrFetch(
-                key = "malmap:v1:${chunk.hashCode()}",
-                serializer = ListSerializer(Media.serializer()),
-                ttlMs = MAL_MAP_TTL,
-            ) { aniList.mediaByMalIds(chunk) }
-                .forEach { media -> media.idMal?.let { byMalId[it] = media } }
+        val malIds = entries.map { it.malId }.distinct()
+        val mapGate = Semaphore(10)
+
+        // 1. Resolve MAL IDs to AniList IDs via Konoha sharded CDN mappings in parallel
+        val deferredMappings = malIds.map { malId ->
+            async {
+                mapGate.withPermit {
+                    val anilistId = runCatching { konoha.resolveAnilistIdFromMal(malId) }.getOrNull()
+                    malId to anilistId
+                }
+            }
         }
-        return entries.mapNotNull { entry ->
+        val resolvedMap = deferredMappings.awaitAll().toMap()
+        
+        val mappedAnilistIds = resolvedMap.values.filterNotNull().distinct()
+        val unmappedMalIds = resolvedMap.filter { it.value == null }.keys.toList()
+
+        val byMalId = mutableMapOf<Int, Media>()
+
+        // 2. Fetch Media details for resolved AniList IDs in chunks
+        if (mappedAnilistIds.isNotEmpty()) {
+            mappedAnilistIds.sorted().chunked(50).forEach { chunk ->
+                cache.getOrFetch(
+                    key = "anilist_batch:v1:${chunk.hashCode()}",
+                    serializer = ListSerializer(Media.serializer()),
+                    ttlMs = MAL_MAP_TTL,
+                ) { aniList.mediaByIds(chunk) }
+                    .forEach { media ->
+                        media.idMal?.let { byMalId[it] = media }
+                        
+                        // Fallback mapping matching in case Media's internal idMal is incorrect/missing
+                        val malId = resolvedMap.filter { it.value == media.id }.keys.firstOrNull()
+                        if (malId != null) {
+                            byMalId[malId] = media
+                        }
+                    }
+            }
+        }
+
+        // 3. Fallback: Query AniList directly for any IDs that failed to map in Konoha
+        if (unmappedMalIds.isNotEmpty()) {
+            unmappedMalIds.sorted().chunked(50).forEach { chunk ->
+                cache.getOrFetch(
+                    key = "malmap:v1:${chunk.hashCode()}",
+                    serializer = ListSerializer(Media.serializer()),
+                    ttlMs = MAL_MAP_TTL,
+                ) { aniList.mediaByMalIds(chunk) }
+                    .forEach { media -> media.idMal?.let { byMalId[it] = media } }
+            }
+        }
+
+        // 4. Return reconstructed entries
+        entries.mapNotNull { entry ->
             val media = byMalId[entry.malId] ?: return@mapNotNull null
             MediaListEntry(
                 id = entry.malId,

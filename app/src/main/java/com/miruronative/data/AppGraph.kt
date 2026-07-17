@@ -6,6 +6,7 @@ import com.miruronative.data.remote.AniListClient
 import com.miruronative.data.remote.AniSkipClient
 import com.miruronative.data.remote.AnivexaClient
 import com.miruronative.data.remote.JikanClient
+import com.miruronative.data.remote.KonohaClient
 import com.miruronative.data.remote.MalClient
 import com.miruronative.data.remote.PipeClient
 import kotlinx.serialization.json.Json
@@ -24,7 +25,7 @@ object AppGraph {
     lateinit var httpClient: OkHttpClient
         private set
 
-    fun init(@Suppress("UNUSED_PARAMETER") context: Context) {
+    fun init(context: Context) {
         if (::repository.isInitialized) return
 
         val json = Json {
@@ -43,6 +44,7 @@ object AppGraph {
             .build()
 
         val aniList = AniListClient(httpClient, json)
+        val cache = AppCache(context, json)
         repository = MiruroRepository(
             aniList = aniList,
             pipe = PipeClient(json),
@@ -50,7 +52,8 @@ object AppGraph {
             jikan = JikanClient(httpClient, json),
             aniSkip = AniSkipClient(httpClient, json),
             mal = MalClient(httpClient, json),
-            cache = AppCache(context, json),
+            konoha = KonohaClient(context, httpClient, json, cache),
+            cache = cache,
         )
     }
 }

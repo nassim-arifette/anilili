@@ -6,6 +6,8 @@ import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.res.painterResource
+import com.miruronative.R
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -332,6 +334,33 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                )
+            }
+            item { SectionDivider() }
+            item {
+                SettingsAction(
+                    title = "Join Telegram Group",
+                    icon = { Icon(painterResource(R.drawable.ic_telegram), contentDescription = null) },
+                    enabled = true,
+                    onClick = {
+                        runCatching {
+                            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/anililiapk"))
+                            context.startActivity(intent)
+                        }
+                    },
+                )
+            }
+            item {
+                SettingsAction(
+                    title = "GitHub Repository",
+                    icon = { Icon(painterResource(R.drawable.ic_github), contentDescription = null) },
+                    enabled = true,
+                    onClick = {
+                        runCatching {
+                            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/kompoti121/anilili"))
+                            context.startActivity(intent)
+                        }
+                    },
                 )
             }
         }

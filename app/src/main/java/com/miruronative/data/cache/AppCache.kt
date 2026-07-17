@@ -43,6 +43,9 @@ interface CacheDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun put(entry: CacheEntry)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun putAll(entries: List<CacheEntry>)
+
     @Query("UPDATE cache_entries SET lastAccessedAt = :now WHERE `key` = :key OR instr(`key`, :chunkPrefix) = 1")
     suspend fun touchTree(key: String, chunkPrefix: String, now: Long)
 
@@ -124,6 +127,24 @@ class AppCache(
             if (e is kotlinx.coroutines.CancellationException) throw e
             decoded ?: throw e
         }
+    }
+
+    suspend fun hasKey(key: String): Boolean {
+        return read(key) != null
+    }
+
+    suspend fun putBatch(entries: Map<String, String>, ttlMs: Long) {
+        val now = System.currentTimeMillis()
+        val cacheEntries = entries.map { (key, jsonString) ->
+            CacheEntry(
+                key = key,
+                payload = CachePayloadCodec.encode(jsonString),
+                createdAt = now,
+                expiresAt = now + ttlMs,
+                lastAccessedAt = now,
+            )
+        }
+        dao.putAll(cacheEntries)
     }
 
     private suspend fun <T> refresh(

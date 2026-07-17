@@ -366,6 +366,23 @@ class AniListClient(
         }
     }
 
+    /** AniList media for the given AniList ids (one page per 50); unknown ids are simply absent. */
+    suspend fun mediaByIds(ids: List<Int>): List<Media> = withContext(Dispatchers.IO) {
+        val gql = """
+            query (${'$'}ids: [Int]) {
+              Page(page: 1, perPage: 50) {
+                media(type: ANIME, id_in: ${'$'}ids) { $mediaListFields }
+              }
+            }
+        """.trimIndent()
+        ids.distinct().chunked(50).flatMap { chunk ->
+            val vars = buildJsonObject {
+                put("ids", kotlinx.serialization.json.JsonArray(chunk.map { kotlinx.serialization.json.JsonPrimitive(it) }))
+            }
+            json.decodeFromString(GqlPageResponse.serializer(), post(gql, vars)).data?.page?.media.orEmpty()
+        }
+    }
+
     suspend fun animeInfo(id: Int): Media? = withContext(Dispatchers.IO) {
         val gql = """
             query (${'$'}id: Int) {
