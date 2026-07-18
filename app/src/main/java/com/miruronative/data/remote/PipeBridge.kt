@@ -29,13 +29,25 @@ data class RawPipeResponse(val ok: Boolean, val status: Int, val obf: String?, v
  */
 @SuppressLint("StaticFieldLeak")
 object PipeBridge {
-    const val ORIGIN = "https://www.miruro.to"
+    /**
+     * Mirror domains, tried in order. ISPs block these piecemeal (user logs show .to timing out
+     * on one network while others resolve), so a main-frame load failure rolls to the next
+     * mirror instead of taking every pipe request down with it.
+     */
+    private val ORIGINS = listOf(
+        "https://www.miruro.to",
+        "https://www.miruro.tv",
+        "https://www.miruro.bz",
+    )
 
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var webView: WebView? = null
     @Volatile private var ready = CompletableDeferred<Boolean>()
+    @Volatile private var originIndex = 0
     private val pending = ConcurrentHashMap<String, CompletableDeferred<String>>()
     private val counter = AtomicLong(0)
+
+    private val activeOrigin: String get() = ORIGINS[originIndex]
 
     /** Called from the hosting Composable on the main thread with a freshly created WebView. */
     @SuppressLint("SetJavaScriptEnabled")
@@ -55,13 +67,15 @@ object PipeBridge {
         }
         wv.addJavascriptInterface(Bridge, "AndroidPipe")
         wv.webViewClient = object : WebViewClient() {
-            // Pin the tab to miruro.to — block ad popunders / intent: redirects that would
-            // navigate away and kill the same-origin pipe session.
+            // Pin the tab to Miruro's mirrors — block ad popunders / intent: redirects that
+            // would navigate away and kill the same-origin pipe session.
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url ?: return true
                 val host = url.host.orEmpty().lowercase()
-                val allowed = url.scheme == "https" &&
-                    (host == "miruro.to" || host.endsWith(".miruro.to"))
+                val allowed = url.scheme == "https" && ORIGINS.any { origin ->
+                    val originHost = origin.removePrefix("https://www.")
+                    host == originHost || host.endsWith(".$originHost")
+                }
                 if (!allowed) {
                     DiagnosticsLog.event("PipeBridge blocked nav: $url")
                     Log.d(TAG, "blocked nav: $url")
@@ -77,7 +91,7 @@ object PipeBridge {
                 DiagnosticsLog.event("PipeBridge page finished: ${url ?: "unknown"} title=${view?.title ?: "none"}")
                 Log.d(TAG, "onPageFinished: $url  title=${view?.title}")
                 // Give Cloudflare a moment to settle, then allow fetches.
-                if (url != null && url.startsWith(ORIGIN)) {
+                if (url != null && url.startsWith(activeOrigin)) {
                     main.postDelayed({ if (!ready.isCompleted) ready.complete(true) }, 2000)
                 }
             }
@@ -87,15 +101,20 @@ object PipeBridge {
                 request: WebResourceRequest?,
                 error: android.webkit.WebResourceError?,
             ) {
-                if (request?.isForMainFrame == true) {
-                    DiagnosticsLog.event(
-                        "PipeBridge main-frame error code=${error?.errorCode} " +
-                            "description=${error?.description}",
-                    )
+                if (request?.isForMainFrame != true) return
+                DiagnosticsLog.event(
+                    "PipeBridge main-frame error code=${error?.errorCode} " +
+                        "description=${error?.description} origin=$activeOrigin",
+                )
+                // This mirror is unreachable (ISP block, DNS, site down): roll to the next one.
+                // Only once all mirrors fail do waiters unblock into the cache/error path.
+                if (originIndex < ORIGINS.lastIndex) {
+                    originIndex++
+                    DiagnosticsLog.event("PipeBridge trying mirror $activeOrigin")
+                    main.post { webView?.loadUrl("$activeOrigin/") }
+                } else if (!ready.isCompleted) {
+                    ready.complete(false)
                 }
-                // Main-frame load failed (offline, DNS, site down): unblock waiters so pipe
-                // requests fail fast to the cache/error path instead of stalling 25 s each.
-                if (request?.isForMainFrame == true && !ready.isCompleted) ready.complete(false)
             }
 
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
@@ -107,8 +126,8 @@ object PipeBridge {
                 return true
             }
         }
-        DiagnosticsLog.event("PipeBridge load origin=$ORIGIN")
-        wv.loadUrl("$ORIGIN/")
+        DiagnosticsLog.event("PipeBridge load origin=$activeOrigin")
+        wv.loadUrl("$activeOrigin/")
     }
 
     /** Releases the attached browser and fails requests that can no longer complete. */

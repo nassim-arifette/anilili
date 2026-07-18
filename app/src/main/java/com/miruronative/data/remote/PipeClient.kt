@@ -43,6 +43,9 @@ class PipeClient(
             put("method", "GET")
             put("query", query)
             put("body", JsonNull)
+            // The web frontend stamps its protocol version on every pipe request; matching it
+            // keeps us indistinguishable from the site if the server starts enforcing it.
+            put("version", "0.1.0")
         }
         val e = base64UrlEncode(envelope.toString().toByteArray(Charsets.UTF_8))
         val rawJson = PipeBridge.fetch(e)
