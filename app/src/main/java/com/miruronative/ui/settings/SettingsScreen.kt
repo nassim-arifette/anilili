@@ -93,6 +93,7 @@ fun SettingsScreen(
     val releaseNotifications by SettingsStore.releaseNotifications.collectAsState()
     val hideAdultContent by SettingsStore.hideAdultContent.collectAsState()
     val subtitlesWithDub by SettingsStore.subtitlesWithDub.collectAsState()
+    val updateCheckOnLaunch by SettingsStore.updateCheckOnLaunch.collectAsState()
     val syncSavedToAniList by SettingsStore.syncSavedToAniList.collectAsState()
     val menuLanguage by SettingsStore.menuLanguage.collectAsState()
     val updateState by UpdateManager.state.collectAsState()
@@ -368,6 +369,14 @@ fun SettingsScreen(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                     )
                 }
+            }
+            item {
+                SettingSwitch(
+                    "Check for updates on launch",
+                    "Prompt when a new version is available each time the app opens",
+                    updateCheckOnLaunch,
+                    SettingsStore::setUpdateCheckOnLaunch,
+                )
             }
             item {
                 SettingsAction(

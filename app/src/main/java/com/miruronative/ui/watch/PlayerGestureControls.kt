@@ -44,6 +44,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.pointerInput
@@ -281,7 +286,30 @@ internal fun MediaVolumeSlider(
                 onInteract()
             },
             colors = whiteSliderColors(),
-            modifier = Modifier.weight(1f).semantics { contentDescription = "Volume" },
+            modifier = Modifier
+                .weight(1f)
+                .semantics { contentDescription = "Volume" }
+                // Material3's Slider ignores D-pad keys, so on TV the volume could never be
+                // changed here. Left/right nudge by 5%; at the ends the event is released so
+                // focus can still escape (left at 0% reaches the mute button).
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    val delta = when (event.key) {
+                        Key.DirectionLeft -> -0.05f
+                        Key.DirectionRight -> +0.05f
+                        else -> return@onPreviewKeyEvent false
+                    }
+                    val next = (volume + delta).coerceIn(0f, 1f)
+                    if (next == volume) {
+                        false
+                    } else {
+                        lastInteractMs = System.currentTimeMillis()
+                        volume = next
+                        applyVolume(audioManager, next)
+                        onInteract()
+                        true
+                    }
+                },
         )
         if (showPercentLabel) {
             Text(

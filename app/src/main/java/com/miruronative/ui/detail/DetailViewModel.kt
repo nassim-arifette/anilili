@@ -9,6 +9,7 @@ import com.miruronative.data.AppGraph
 import com.miruronative.data.model.Category
 import com.miruronative.data.model.EpisodesResult
 import com.miruronative.data.model.Media
+import com.miruronative.data.settings.SettingsStore
 import com.miruronative.ui.UiState
 import com.miruronative.ui.rethrowIfCancellation
 import kotlinx.coroutines.async
@@ -47,6 +48,9 @@ class DetailViewModel : ViewModel() {
         viewModelScope.launch {
             if (force && _state.value is UiState.Success) _isRefreshing.value = true else _state.value = UiState.Loading
             try {
+                // The prefer-dub setting seeds the default category below; make sure the
+                // persisted value has loaded before the first applyDefaults call.
+                SettingsStore.awaitLoaded()
                 // Start independent calls together. Miruro still renders first, while the
                 // slower Anivexa batch no longer waits behind metadata and pipe discovery.
                 val infoRequest = async { runCatching { repo.animeInfo(id, force = force) } }
@@ -107,9 +111,11 @@ class DetailViewModel : ViewModel() {
         if (current == null || eps.provider(current) == null) {
             selectedProvider = eps.providers.firstOrNull()?.name
         }
-        selectedCategory = selectedProvider
-            ?.let { eps.provider(it)?.categories?.firstOrNull() }
-            ?: Category.SUB
+        val categories = selectedProvider?.let { eps.provider(it)?.categories }.orEmpty()
+        selectedCategory = when {
+            SettingsStore.preferDub.value && Category.DUB in categories -> Category.DUB
+            else -> categories.firstOrNull() ?: Category.SUB
+        }
     }
 
     fun selectProvider(provider: String) {

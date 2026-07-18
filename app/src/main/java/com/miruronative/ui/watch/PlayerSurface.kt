@@ -96,7 +96,11 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.PlaybackService
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.semantics
 import com.miruronative.ui.adaptive.LocalAppDeviceProfile
+import com.miruronative.ui.adaptive.rememberScreenReaderActive
 import com.miruronative.ui.components.CaptionAppearanceDialog
 import com.miruronative.ui.nav.Routes
 import kotlinx.coroutines.delay
@@ -415,12 +419,16 @@ fun PlayerSurface(
         delay(32)
         runCatching { tvPlayPauseFocus.requestFocus() }
     }
-    LaunchedEffect(tvControlsVisible, tvControlsInteraction, focusPlayerOnStart) {
+    val screenReaderActive = rememberScreenReaderActive()
+    LaunchedEffect(tvControlsVisible, tvControlsInteraction, focusPlayerOnStart, screenReaderActive) {
         if (!focusPlayerOnStart) {
             tvControlsVisible = false
             return@LaunchedEffect
         }
         if (!tvControlsVisible) return@LaunchedEffect
+        // TalkBack users navigate slowly and can't reopen the controls with a key press
+        // (the screen reader consumes the D-pad), so never auto-hide under a screen reader.
+        if (screenReaderActive) return@LaunchedEffect
         delay(8_000)
         tvControlsVisible = false
         runCatching { tvPlayerFocus.requestFocus() }
@@ -541,6 +549,16 @@ fun PlayerSurface(
                     true
                 } else {
                     false
+                }
+            }
+            // Screen readers swallow the D-pad, so the key handler above never fires under
+            // TalkBack; this semantic action is the accessible way to reveal the controls.
+            .semantics {
+                contentDescription = "Video player"
+                onClick(label = "Show player controls") {
+                    tvControlsInteraction++
+                    tvControlsVisible = true
+                    true
                 }
             }
             .focusable()

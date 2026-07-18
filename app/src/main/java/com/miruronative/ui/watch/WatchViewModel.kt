@@ -133,6 +133,21 @@ class WatchViewModel : ViewModel() {
                         },
                 )
                 mergedEpisodes = merged
+                // Prefer dub: launches carrying category=sub (typically history saved before the
+                // setting was enabled) upgrade to dub when the catalog actually has the start
+                // episode dubbed. In-player category switches are unaffected — this only runs on
+                // screen entry — and when no dub exists the launch stays sub instead of erroring.
+                if (category == Category.SUB && SettingsStore.preferDub.value) {
+                    val startNumber = episodeNumber.toDoubleOrNull()
+                    val dubAvailable = merged.providers.any { provider ->
+                        provider.dub.isNotEmpty() &&
+                            (startNumber == null || provider.dub.any { it.number == startNumber })
+                    }
+                    if (dubAvailable) {
+                        category = Category.DUB
+                        DiagnosticsLog.event("Watch category upgraded to dub (prefer dub) id=$id")
+                    }
+                }
                 repo.animeInfo(id)?.let { info ->
                     seriesTitle = info.title.preferred
                     artworkUrl = info.coverImage.best

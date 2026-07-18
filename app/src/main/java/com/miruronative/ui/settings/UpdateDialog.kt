@@ -1,6 +1,7 @@
 package com.miruronative.ui.settings
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -18,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.miruronative.data.settings.SettingsStore
 import com.miruronative.data.update.UpdateManager
 
 /**
@@ -58,7 +60,17 @@ fun UpdatePromptHost() {
                 TextButton(onClick = { UpdateManager.download(context) }) { Text("Update") }
             },
             dismissButton = {
-                TextButton(onClick = UpdateManager::dismiss) { Text("Not now") }
+                Row {
+                    TextButton(onClick = {
+                        // Same switch as Settings > "Check for updates on launch"; manual
+                        // checks from Settings keep working.
+                        SettingsStore.setUpdateCheckOnLaunch(false)
+                        UpdateManager.dismiss()
+                    }) {
+                        Text("Don't remind me", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    TextButton(onClick = UpdateManager::dismiss) { Text("Not now") }
+                }
             },
         )
 

@@ -67,6 +67,9 @@ object SettingsStore {
     private val _subtitlesWithDub = MutableStateFlow(false)
     val subtitlesWithDub = _subtitlesWithDub.asStateFlow()
 
+    private val _updateCheckOnLaunch = MutableStateFlow(true)
+    val updateCheckOnLaunch = _updateCheckOnLaunch.asStateFlow()
+
     // Kept as one compound value rather than a flow per field: both players and the editor read
     // the whole style at once, and a partial style is never meaningful.
     private val _captionStyle = MutableStateFlow(CaptionStyle())
@@ -106,6 +109,7 @@ object SettingsStore {
     fun setAutoSkipIntroOutro(value: Boolean) = save(AUTO_SKIP_INTRO_OUTRO, value, _autoSkipIntroOutro)
     fun setHideAdultContent(value: Boolean) = save(HIDE_ADULT_CONTENT, value, _hideAdultContent)
     fun setSubtitlesWithDub(value: Boolean) = save(SUBTITLES_WITH_DUB, value, _subtitlesWithDub)
+    fun setUpdateCheckOnLaunch(value: Boolean) = save(UPDATE_CHECK_ON_LAUNCH, value, _updateCheckOnLaunch)
 
     fun setCaptionBackgroundOpacity(percent: Int) =
         editCaptionStyle { it.copy(backgroundOpacityPercent = percent.coerceIn(0, 100)) }
@@ -170,6 +174,7 @@ object SettingsStore {
         _autoSkipIntroOutro.value = prefs[AUTO_SKIP_INTRO_OUTRO] ?: false
         _hideAdultContent.value = prefs[HIDE_ADULT_CONTENT] ?: true
         _subtitlesWithDub.value = prefs[SUBTITLES_WITH_DUB] ?: false
+        _updateCheckOnLaunch.value = prefs[UPDATE_CHECK_ON_LAUNCH] ?: true
         _captionStyle.value = readCaptionStyle(prefs)
         _menuLanguage.value = MenuLanguage.fromStored(prefs[MENU_LANGUAGE])
         _preferredProvider.value =
@@ -201,6 +206,7 @@ object SettingsStore {
     private val AUTO_SKIP_INTRO_OUTRO = booleanPreferencesKey("auto_skip_intro_outro")
     private val HIDE_ADULT_CONTENT = booleanPreferencesKey("hide_adult_content")
     private val SUBTITLES_WITH_DUB = booleanPreferencesKey("subtitles_with_dub")
+    private val UPDATE_CHECK_ON_LAUNCH = booleanPreferencesKey("update_check_on_launch")
     private val CAPTION_BACKGROUND_OPACITY = intPreferencesKey("caption_background_opacity")
     private val CAPTION_BACKGROUND_COLOR = stringPreferencesKey("caption_background_color")
     private val CAPTION_TEXT_SCALE = intPreferencesKey("caption_text_scale")

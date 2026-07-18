@@ -304,6 +304,11 @@ private fun MiruroRoot(
 
     val context = LocalContext.current
     LaunchedEffect(Unit) {
+        SettingsStore.awaitLoaded()
+        if (!SettingsStore.updateCheckOnLaunch.value) {
+            DiagnosticsLog.event("UpdateManager.autoCheckIfDue skipped (disabled in settings)")
+            return@LaunchedEffect
+        }
         DiagnosticsLog.event("UpdateManager.autoCheckIfDue start")
         UpdateManager.autoCheckIfDue(context)
         DiagnosticsLog.event("UpdateManager.autoCheckIfDue complete")

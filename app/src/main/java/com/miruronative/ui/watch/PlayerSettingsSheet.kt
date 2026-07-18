@@ -36,6 +36,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlin.math.abs
@@ -169,7 +176,27 @@ private fun SpeedSlider(speed: Float, onSpeedChange: (Float) -> Unit) {
             valueRange = 0f..speeds.lastIndex.toFloat(),
             steps = (speeds.size - 2).coerceAtLeast(0),
             colors = whiteSliderColors(),
-            modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 10.dp)
+                .semantics { contentDescription = "Playback speed" }
+                // Material3's Slider ignores D-pad keys, so on TV the value could never be
+                // changed. Left/right step through the speed list; at the ends the event is
+                // released so focus can still escape.
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    val next = when (event.key) {
+                        Key.DirectionLeft -> index - 1
+                        Key.DirectionRight -> index + 1
+                        else -> return@onPreviewKeyEvent false
+                    }
+                    if (next in speeds.indices) {
+                        onSpeedChange(speeds[next])
+                        true
+                    } else {
+                        false
+                    }
+                },
         )
         Text(
             speed.formatPlaybackSpeed(),

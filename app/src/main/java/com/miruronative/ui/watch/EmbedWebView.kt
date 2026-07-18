@@ -83,8 +83,12 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.CrashReporter
 import com.miruronative.diagnostics.DiagnosticsLog
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.semantics
 import com.miruronative.ui.adaptive.LocalAppDeviceProfile
 import com.miruronative.ui.adaptive.focusHighlight
+import com.miruronative.ui.adaptive.rememberScreenReaderActive
 import com.miruronative.ui.components.CaptionAppearanceDialog
 import kotlinx.coroutines.delay
 
@@ -189,12 +193,16 @@ fun EmbedWebView(
         delay(32)
         runCatching { tvPlayPauseFocus.requestFocus() }
     }
-    LaunchedEffect(tvControlsVisible, tvControlsInteraction, webView, focusPlayerOnStart) {
+    val screenReaderActive = rememberScreenReaderActive()
+    LaunchedEffect(tvControlsVisible, tvControlsInteraction, webView, focusPlayerOnStart, screenReaderActive) {
         if (!focusPlayerOnStart) {
             tvControlsVisible = false
             return@LaunchedEffect
         }
         if (!tvControlsVisible) return@LaunchedEffect
+        // TalkBack users navigate slowly and can't reopen the controls with a key press
+        // (the screen reader consumes the D-pad), so never auto-hide under a screen reader.
+        if (screenReaderActive) return@LaunchedEffect
         delay(8_000)
         tvControlsVisible = false
         webView?.requestFocus()
@@ -398,13 +406,24 @@ fun EmbedWebView(
     }
 
     val remoteModifier = if (device.isTv && focusPlayerOnStart) {
-        Modifier.onPreviewKeyEvent { event ->
-            if (event.type != KeyEventType.KeyDown || !opensTvPlayerControls(event.key)) {
-                return@onPreviewKeyEvent false
+        Modifier
+            .onPreviewKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown || !opensTvPlayerControls(event.key)) {
+                    return@onPreviewKeyEvent false
+                }
+                tvControlsInteraction++
+                false
             }
-            tvControlsInteraction++
-            false
-        }
+            // Screen readers swallow the D-pad, so the WebView key hook never fires under
+            // TalkBack; this semantic action is the accessible way to reveal the controls.
+            .semantics {
+                contentDescription = "Video player"
+                onClick(label = "Show player controls") {
+                    tvControlsInteraction++
+                    tvControlsVisible = true
+                    true
+                }
+            }
     } else {
         Modifier
     }
