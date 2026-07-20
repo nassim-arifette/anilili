@@ -13,8 +13,8 @@ import android.webkit.WebViewClient
 import com.miruronative.diagnostics.DiagnosticsLog
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
 
 /** Raw pipe response as returned by the in-page fetch, before deobfuscation. */
 data class RawPipeResponse(val ok: Boolean, val status: Int, val obf: String?, val body: String?, val error: String?)
@@ -63,7 +63,6 @@ object PipeBridge {
     @Volatile private var ready = CompletableDeferred<Boolean>()
     @Volatile private var originIndex = 0
     private val pending = ConcurrentHashMap<String, CompletableDeferred<String>>()
-    private val counter = AtomicLong(0)
 
     private val activeOrigin: String get() = ORIGINS[originIndex]
 
@@ -171,15 +170,17 @@ object PipeBridge {
 
     object Bridge {
         @JavascriptInterface
-        fun onResult(id: String, json: String) {
-            pending.remove(id)?.complete(json)
+        fun onResult(id: String?, json: String) {
+            if (id != null) pending.remove(id)?.complete(json)
         }
     }
 
     /** Runs `fetch('/api/secure/pipe?e=…')` inside the page and returns the raw JSON bridge payload. */
     suspend fun fetch(e: String, timeoutMs: Long = 30_000): String {
         withTimeoutOrNull(25_000) { ready.await() }
-        val id = counter.incrementAndGet().toString()
+        // The request id doubles as an unguessable capability. The bridge is visible to every
+        // frame, but only the top-level injected script receives this value.
+        val id = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
         pending[id] = deferred
 
