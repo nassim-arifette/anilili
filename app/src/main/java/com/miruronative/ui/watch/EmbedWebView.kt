@@ -219,6 +219,7 @@ fun EmbedWebView(
     var outroAutoHandled by remember(navigationSession.generation, outroStartMs, outroEndMs) {
         mutableStateOf(false)
     }
+    val autoAdvanceGate = remember { EmbedAutoAdvanceGate() }
     // The concrete WebView and Java bridge live across URL changes. Updated handlers make their
     // callbacks target the current navigation's state, while the bridge token rejects old pages.
     val currentWebTickHandler by rememberUpdatedState<(String, Double, Double, Boolean, Boolean, Double) -> Unit>(
@@ -241,6 +242,36 @@ fun EmbedWebView(
     val currentWebVideoAvailableHandler by rememberUpdatedState<(String) -> Unit> { navigationToken ->
         if (navigationGuard.acceptsBridgeToken(navigationToken)) webPlaybackAvailable = true
     }
+    val currentWebEndedHandler by rememberUpdatedState<(String, Double, Double, Int) -> Unit>(
+        newValue = { navigationToken, positionSec, durationSec, observedPlayingSamples ->
+            if (!navigationGuard.acceptsBridgeToken(navigationToken)) {
+                DiagnosticsLog.event("EmbedWebView ignored stale ended token=$navigationToken")
+            } else {
+                val sample = embedEndSampleFromSeconds(positionSec, durationSec, observedPlayingSamples)
+                if (sample == null || !isLikelyEmbedContentEnd(sample)) {
+                    DiagnosticsLog.event(
+                        "EmbedWebView ignored non-content end token=$navigationToken " +
+                            "durationSec=$durationSec samples=$observedPlayingSamples",
+                    )
+                } else {
+                    webIsPlaying = false
+                    positionMs = sample.positionMs
+                    durationMs = sample.durationMs
+                    currentOnProgress?.invoke(playbackKey, sample.positionMs, sample.durationMs)
+                    if (
+                        autoAdvanceGate.tryAdvance(
+                            navigationToken = navigationToken,
+                            autoplay = autoplay,
+                            hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
+                        )
+                    ) {
+                        DiagnosticsLog.event("EmbedWebView auto advance reason=ended token=$navigationToken")
+                        currentOnNextEpisode?.invoke(playbackKey)
+                    }
+                }
+            }
+        },
+    )
     val currentRevealTvControls by rememberUpdatedState<(String) -> Unit> { navigationToken ->
         if (navigationGuard.acceptsBridgeToken(navigationToken)) {
             tvControlsVisible = true
@@ -432,6 +463,7 @@ fun EmbedWebView(
         outroStartMs,
         outroEndMs,
         navigationSession.generation,
+        hasNextEpisode,
     ) {
         if (!autoSkipIntroOutro || positionMs <= 0L) return@LaunchedEffect
 
@@ -443,10 +475,13 @@ fun EmbedWebView(
         }
 
         if (
-            autoplay &&
             !outroAutoHandled &&
-            currentOnNextEpisode != null &&
-            isInSkipWindow(positionMs, outroStartMs, outroEndMs)
+            isInSkipWindow(positionMs, outroStartMs, outroEndMs) &&
+            autoAdvanceGate.tryAdvance(
+                navigationToken = navigationSession.bridgeToken,
+                autoplay = autoplay,
+                hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
+            )
         ) {
             outroAutoHandled = true
             currentOnNextEpisode?.invoke(playbackKey)
@@ -570,6 +605,16 @@ fun EmbedWebView(
                                 },
                                 onVideoAvailableCallback = { navigationToken ->
                                     mainHandler.post { currentWebVideoAvailableHandler(navigationToken) }
+                                },
+                                onEndedCallback = { navigationToken, positionSec, durationSec, playingSamples ->
+                                    mainHandler.post {
+                                        currentWebEndedHandler(
+                                            navigationToken,
+                                            positionSec,
+                                            durationSec,
+                                            playingSamples,
+                                        )
+                                    }
                                 },
                             ),
                             "AniliProgress",
@@ -1588,6 +1633,7 @@ private class EmbedNavigationWebViewClient(
 private class WebProgressBridge(
     private val onTickCallback: (String, Double, Double, Boolean, Boolean, Double) -> Unit,
     private val onVideoAvailableCallback: (String) -> Unit,
+    private val onEndedCallback: (String, Double, Double, Int) -> Unit,
 ) {
     @JavascriptInterface
     fun onTick(
@@ -1604,5 +1650,15 @@ private class WebProgressBridge(
     @JavascriptInterface
     fun onVideoAvailable(navigationToken: String) {
         onVideoAvailableCallback(navigationToken)
+    }
+
+    @JavascriptInterface
+    fun onEnded(
+        navigationToken: String,
+        positionSec: Double,
+        durationSec: Double,
+        observedPlayingSamples: Int,
+    ) {
+        onEndedCallback(navigationToken, positionSec, durationSec, observedPlayingSamples)
     }
 }

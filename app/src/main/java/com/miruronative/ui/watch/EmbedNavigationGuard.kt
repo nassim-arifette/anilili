@@ -199,6 +199,45 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
         }
         return null;
       }
+      var observedVideo = null;
+      var observedMediaKey = null;
+      var observedPlayingSamples = 0;
+      var endedHandler = null;
+      var endedReportedMediaKey = null;
+      function mediaKey(video) {
+        var source = video.currentSrc || video.src || '';
+        var duration = isFinite(video.duration) ? video.duration : 'unknown';
+        return source + '|' + duration;
+      }
+      function reportEnded(video) {
+        var key = mediaKey(video);
+        if (video !== observedVideo || key !== observedMediaKey || endedReportedMediaKey === key) return;
+        if (!isFinite(video.duration) || video.duration <= 0 || video.currentTime < 0) return;
+        endedReportedMediaKey = key;
+        try {
+          AniliProgress.onEnded(
+            navigationToken,
+            video.currentTime,
+            video.duration,
+            observedPlayingSamples
+          );
+        } catch (e) { /* bridge detached */ }
+      }
+      function observeVideo(video) {
+        var key = mediaKey(video);
+        if (video === observedVideo && key === observedMediaKey) return;
+        if (video !== observedVideo) {
+          try {
+            if (observedVideo && endedHandler) observedVideo.removeEventListener('ended', endedHandler);
+          } catch (e) { /* replaced frame */ }
+          endedHandler = function() { reportEnded(video); };
+          video.addEventListener('ended', endedHandler);
+        }
+        observedVideo = video;
+        observedMediaKey = key;
+        observedPlayingSamples = 0;
+        endedReportedMediaKey = null;
+      }
       var timer = setInterval(function() {
         if (window.__aniliNavigationRevoked || window.__aniliNavigationToken !== navigationToken) {
           clearInterval(timer);
@@ -206,11 +245,13 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
         }
         try {
           var v = findVideo();
+          if (v) observeVideo(v);
           if (v && !window.__aniliVideoReported) {
             window.__aniliVideoReported = true;
             AniliProgress.onVideoAvailable(navigationToken);
           }
           if (v && isFinite(v.duration) && v.duration > 0 && v.currentTime >= 0) {
+            if (!v.paused) observedPlayingSamples++;
             AniliProgress.onTick(
               navigationToken,
               v.currentTime,
@@ -219,6 +260,7 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
               v.muted,
               v.volume
             );
+            if (v.ended) reportEnded(v);
           }
         } catch (e) { /* bridge detached */ }
       }, 1000);
