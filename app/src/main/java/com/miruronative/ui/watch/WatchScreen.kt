@@ -224,11 +224,20 @@ fun WatchScreen(
         }
     }
 
+    val fallbackPlaybackKey = remember(animeId, provider, category, episode) {
+        EmbedPlaybackKey(
+            animeId = animeId,
+            provider = provider,
+            category = category,
+            episodeNumber = episode,
+        )
+    }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (webFallback) {
             EmbedWebView(
                 url = "https://www.miruro.to/info/$animeId",
                 referer = "https://www.miruro.to/",
+                playbackKey = fallbackPlaybackKey,
                 modifier = Modifier.fillMaxSize(),
                 onFullscreenChanged = { fullscreen = it },
                 onProgress = vm::onProgress,
@@ -401,6 +410,21 @@ private fun WatchContent(
         }
         Box(playerModifier.then(playerFocusModifier).background(Color.Black)) {
             val stream = data.chosenStream
+            val embedPlaybackKey = remember(
+                data.anilistId,
+                data.provider,
+                data.category,
+                data.current.number,
+                data.playbackGeneration,
+            ) {
+                EmbedPlaybackKey(
+                    animeId = data.anilistId,
+                    provider = data.provider,
+                    category = data.category.api,
+                    episodeNumber = data.current.displayNumber,
+                    sourceGeneration = data.playbackGeneration,
+                )
+            }
             // Key on the KIND of player only, never per-episode/per-url: recreating PlayerSurface
             // for every Next tore down and rebuilt the PlayerView + MediaController each episode
             // (the new view was even created before the old one released). On weak TV hardware
@@ -420,7 +444,7 @@ private fun WatchContent(
                         // Keep native PlayerView/WebView focus out of the TV episode grid: the
                         // player only exists in fullscreen. Leaving fullscreen stops playback, so
                         // first bank the position it reached — every resume path reads it.
-                        LaunchedEffect(stream?.url) {
+                        LaunchedEffect(embedPlaybackKey, stream?.url) {
                             PlaybackService.stopActivePlayback()
                             onPlayerClosed()
                         }
@@ -468,7 +492,9 @@ private fun WatchContent(
                     stream == null -> NoSource(onWebFallback)
                     stream.isEmbed || ProviderCatalog.isEmbed(data.provider) ->
                         Box(Modifier.fillMaxSize()) {
-                            LaunchedEffect(stream.url) { PlaybackService.stopActivePlayback() }
+                            LaunchedEffect(embedPlaybackKey, stream.url) {
+                                PlaybackService.stopActivePlayback()
+                            }
                             EmbedEpisodeNavigationEffect(
                                 hasPrevious = data.hasPrev,
                                 hasNext = data.hasNext,
@@ -478,6 +504,7 @@ private fun WatchContent(
                             EmbedWebView(
                                 url = stream.url,
                                 referer = stream.referer,
+                                playbackKey = embedPlaybackKey,
                                 modifier = Modifier.fillMaxSize(),
                                 qualityStreams = data.sources.embedStreams,
                                 startPositionMs = data.startPositionMs,
