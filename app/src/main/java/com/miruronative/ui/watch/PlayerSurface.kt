@@ -215,6 +215,30 @@ private class EpisodeControlPlayer(
     }
 }
 
+private const val EXTRA_PLAYBACK_ANIME_ID = "anilili.playback.ANIME_ID"
+private const val EXTRA_PLAYBACK_EPISODE_NUMBER = "anilili.playback.EPISODE_NUMBER"
+private const val EXTRA_PLAYBACK_GENERATION = "anilili.playback.GENERATION"
+private const val EXTRA_PLAYBACK_MEDIA_ID = "anilili.playback.MEDIA_ID"
+
+/** Reads identity from the MediaItem actually held by Media3 and rejects inconsistent metadata. */
+private fun MediaItem.playbackIdentityOrNull(): PlaybackIdentity? {
+    val extras = mediaMetadata.extras ?: return null
+    if (!extras.containsKey(EXTRA_PLAYBACK_ANIME_ID) ||
+        !extras.containsKey(EXTRA_PLAYBACK_EPISODE_NUMBER) ||
+        !extras.containsKey(EXTRA_PLAYBACK_GENERATION)
+    ) {
+        return null
+    }
+    val storedMediaId = extras.getString(EXTRA_PLAYBACK_MEDIA_ID) ?: return null
+    if (mediaId.isBlank() || storedMediaId != mediaId) return null
+    return PlaybackIdentity(
+        animeId = extras.getInt(EXTRA_PLAYBACK_ANIME_ID),
+        episodeNumber = extras.getDouble(EXTRA_PLAYBACK_EPISODE_NUMBER),
+        generation = extras.getInt(EXTRA_PLAYBACK_GENERATION),
+        mediaId = mediaId,
+    )
+}
+
 /** Media3 player surface backed by [PlaybackService] for PiP and system media controls. */
 @OptIn(UnstableApi::class)
 @Composable
@@ -230,13 +254,14 @@ fun PlayerSurface(
     provider: String,
     category: String,
     episode: String,
+    playbackIdentity: PlaybackIdentity,
     onEnded: () -> Unit,
     onNextEpisode: () -> Unit = onEnded,
     onError: (String, String, Long) -> Unit,
     modifier: Modifier = Modifier,
     onToggleFullscreen: (() -> Unit)? = null,
     startPositionMs: Long = 0,
-    onProgress: ((Long, Long) -> Unit)? = null,
+    onProgress: ((PlaybackIdentity, Long, Long, Boolean) -> Unit)? = null,
     onPreviousEpisode: (() -> Unit)? = null,
     hasNextEpisode: Boolean = true,
     hasPreviousEpisode: Boolean = true,
@@ -261,9 +286,11 @@ fun PlayerSurface(
     val currentProvider by rememberUpdatedState(provider)
     val currentCategory by rememberUpdatedState(category)
     val currentOnError by rememberUpdatedState(onError)
+    val currentOnProgress by rememberUpdatedState(onProgress)
     var activeStream by remember(stream.url) { mutableStateOf(stream) }
     var nextStartPositionMs by remember(stream.url) { mutableLongStateOf(startPositionMs) }
     var playbackIsPlaying by remember { mutableStateOf(false) }
+    var confirmedPlaybackIdentity by remember { mutableStateOf<PlaybackIdentity?>(null) }
     var tracksRevision by remember { mutableIntStateOf(0) }
     // One same-stream retry at a capped resolution before giving the provider up: weak TV
     // decoders (Fire TV's OMX.MS.AVC) can die on 1080p with a codec error even though the
@@ -325,6 +352,11 @@ fun PlayerSurface(
 
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     playbackIsPlaying = isPlaying
+                    if (isPlaying) {
+                        activeController.currentMediaItem?.playbackIdentityOrNull()?.let {
+                            confirmedPlaybackIdentity = it
+                        }
+                    }
                     DiagnosticsLog.event("PlayerSurface isPlaying=$isPlaying")
                 }
 
@@ -366,19 +398,25 @@ fun PlayerSurface(
             DiagnosticsLog.event("PlayerSurface listener attached")
             activeController.addListener(listener)
             onDispose {
-                onProgress?.invoke(
-                    activeController.currentPosition.coerceAtLeast(0),
-                    activeController.duration.coerceAtLeast(0),
-                )
+                activeController.currentMediaItem?.playbackIdentityOrNull()?.let { identity ->
+                    currentOnProgress?.invoke(
+                        identity,
+                        activeController.currentPosition.coerceAtLeast(0),
+                        activeController.duration.coerceAtLeast(0),
+                        confirmedPlaybackIdentity?.let { isSamePlaybackSession(it, identity) } == true,
+                    )
+                }
                 activeController.removeListener(listener)
                 DiagnosticsLog.event("PlayerSurface listener removed")
             }
         }
     }
 
-    LaunchedEffect(controller, activeStream.url, subtitles) {
+    LaunchedEffect(controller, activeStream.url, subtitles, playbackIdentity) {
         val activeController = controller ?: return@LaunchedEffect
-        if (activeController.currentMediaItem?.mediaId == activeStream.url) {
+        val itemIdentity = playbackIdentity.copy(mediaId = activeStream.url)
+        val currentItem = activeController.currentMediaItem
+        if (currentItem?.mediaId == activeStream.url && currentItem?.playbackIdentityOrNull() == itemIdentity) {
             DiagnosticsLog.event(
                 "PlayerSurface media item already active " +
                     "host=${activeStream.host()} type=${activeStream.typeLabel()}",
@@ -399,6 +437,10 @@ fun PlayerSurface(
             .apply { artworkUrl?.let { setArtworkUri(Uri.parse(it)) } }
             .setExtras(Bundle().apply {
                 putString(PlaybackService.EXTRA_WATCH_ROUTE, watchRoute)
+                putInt(EXTRA_PLAYBACK_ANIME_ID, itemIdentity.animeId)
+                putDouble(EXTRA_PLAYBACK_EPISODE_NUMBER, itemIdentity.episodeNumber)
+                putInt(EXTRA_PLAYBACK_GENERATION, itemIdentity.generation)
+                putString(EXTRA_PLAYBACK_MEDIA_ID, itemIdentity.mediaId)
             })
             .build()
         val item = MediaItem.Builder()
@@ -438,7 +480,10 @@ fun PlayerSurface(
             positionMs = activeController.currentPosition.coerceAtLeast(0)
             durationMs = activeController.duration.coerceAtLeast(0)
             if (activeController.isPlaying) {
-                onProgress?.invoke(positionMs, durationMs)
+                activeController.currentMediaItem?.playbackIdentityOrNull()?.let { identity ->
+                    confirmedPlaybackIdentity = identity
+                    currentOnProgress?.invoke(identity, positionMs, durationMs, true)
+                }
             }
             delay(500)
         }
