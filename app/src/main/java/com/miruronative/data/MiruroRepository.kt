@@ -30,10 +30,13 @@ import com.miruronative.data.remote.PipeClient
 import com.miruronative.data.remote.planMediaListProgressUpdate
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -327,7 +330,13 @@ class MiruroRepository(
             key = "aniskip:$malId:${episode.toInt()}",
             serializer = SkipTimes.serializer().nullable,
             ttlMs = OPTIONS_TTL,
-        ) { withContext(Dispatchers.IO) { runCatching { aniSkip.skipTimes(malId, episode.toInt()) }.getOrNull() } }
+        ) {
+            withContext(Dispatchers.IO) {
+                runCatching { aniSkip.skipTimes(malId, episode.toInt()) }
+                    .onFailure { it.rethrowIfCancellation() }
+                    .getOrNull()
+            }
+        }
     }
 
     suspend fun animeInfo(id: Int, force: Boolean = false): Media? = cache.getOrFetch(
@@ -340,7 +349,10 @@ class MiruroRepository(
     /** Konoha CDN episode metadata (titles, thumbnails); empty when unknown or on failure. */
     suspend fun konohaEpisodes(anilistId: Int): List<KonohaEpisode> =
         runCatching { konoha.episodes(anilistId) }
-            .onFailure { DiagnosticsLog.throwable("Konoha episodes failed id=$anilistId", it) }
+            .onFailure {
+                it.rethrowIfCancellation()
+                DiagnosticsLog.throwable("Konoha episodes failed id=$anilistId", it)
+            }
             .getOrDefault(emptyList())
 
     /** Walks AniList's PREQUEL/SEQUEL chain so every season is reachable from one detail page. */
@@ -422,7 +434,9 @@ class MiruroRepository(
     suspend fun anivexaEpisodes(anilistId: Int, force: Boolean = false): EpisodesResult {
         // Fetched here (outside the episodes cache lock — the striped mutexes are not reentrant) so
         // the Anivexa catalog reuses the shared AniList Media instead of re-requesting it itself.
-        val seed = runCatching { animeInfo(anilistId) }.getOrNull()
+        val seed = runCatching { animeInfo(anilistId) }
+            .onFailure { it.rethrowIfCancellation() }
+            .getOrNull()
         return cache.getOrFetch(
             key = "episodes:v4:anivexa:$anilistId",
             serializer = EpisodesResult.serializer(),
@@ -443,7 +457,9 @@ class MiruroRepository(
     private suspend fun EpisodesResult.withFillerMarks(anilistId: Int): EpisodesResult {
         if (isEmpty) return this
         val fillers = kotlinx.coroutines.withTimeoutOrNull(FILLER_FETCH_TIMEOUT_MS) {
-            runCatching { fillerEpisodes(animeInfo(anilistId)?.idMal) }.getOrDefault(emptySet())
+            runCatching { fillerEpisodes(animeInfo(anilistId)?.idMal) }
+                .onFailure { it.rethrowIfCancellation() }
+                .getOrDefault(emptySet())
         } ?: return this
         if (fillers.isEmpty()) return this
         fun mark(episodes: List<EpisodeItem>): List<EpisodeItem> = episodes.map { episode ->
@@ -464,7 +480,9 @@ class MiruroRepository(
             ProviderCatalog.fastAnivexaProviders +
                 extraProviders.filter { it in ProviderCatalog.anivexaProviders }
             ).distinct()
-        val seed = runCatching { animeInfo(anilistId) }.getOrNull()
+        val seed = runCatching { animeInfo(anilistId) }
+            .onFailure { it.rethrowIfCancellation() }
+            .getOrNull()
         return cache.getOrFetch(
             key = "episodes:v4:anivexa-fast:${providers.sorted().joinToString(",")}:$anilistId",
             serializer = EpisodesResult.serializer(),
@@ -479,14 +497,24 @@ class MiruroRepository(
     /** Merged view of both sources — used where the full provider list is needed (watch screen). */
     suspend fun episodes(anilistId: Int): EpisodesResult = coroutineScope {
         val miruro = async {
-            runCatching { miruroEpisodes(anilistId) }
-                .onFailure { DiagnosticsLog.throwable("Miruro episodes failed id=$anilistId", it) }
+            val result = runCatching { miruroEpisodes(anilistId) }
+                .onFailure {
+                    it.rethrowIfCancellation()
+                    DiagnosticsLog.throwable("Miruro episodes failed id=$anilistId", it)
+                }
                 .getOrDefault(EpisodesResult(emptyList()))
+            currentCoroutineContext().ensureActive()
+            result
         }
         val anivexa = async {
-            runCatching { anivexaEpisodes(anilistId) }
-                .onFailure { DiagnosticsLog.throwable("Anivexa episodes failed id=$anilistId", it) }
+            val result = runCatching { anivexaEpisodes(anilistId) }
+                .onFailure {
+                    it.rethrowIfCancellation()
+                    DiagnosticsLog.throwable("Anivexa episodes failed id=$anilistId", it)
+                }
                 .getOrDefault(EpisodesResult(emptyList()))
+            currentCoroutineContext().ensureActive()
+            result
         }
         mergeProviders(miruro.await(), anivexa.await())
     }
@@ -534,6 +562,7 @@ class MiruroRepository(
         excludedProviders: Set<String> = emptySet(),
         maxAttempts: Int = 5,
     ): SourceResolution {
+        currentCoroutineContext().ensureActive()
         val ordered = providerAttemptOrder(preferred, episodes.providerNames)
         val unavailable = linkedSetOf<String>()
 
@@ -546,12 +575,14 @@ class MiruroRepository(
             attempts++
             val result = runCatching { sources(ep.pipeId, name, category, anilistId) }
                 .onFailure {
+                    it.rethrowIfCancellation()
                     DiagnosticsLog.throwable(
                         "Source resolve failed provider=$name id=$anilistId episode=$number",
                         it,
                     )
                 }
                 .getOrNull()
+            currentCoroutineContext().ensureActive()
             if (result != null && result.streams.isNotEmpty()) {
                 return SourceResolution(
                     resolved = ResolvedSources(result, name),
@@ -565,7 +596,12 @@ class MiruroRepository(
                 )
             }
         }
+        currentCoroutineContext().ensureActive()
         return SourceResolution(resolved = null, unavailableProviders = unavailable)
+    }
+
+    private fun Throwable.rethrowIfCancellation() {
+        if (this is CancellationException) throw this
     }
 
     private suspend fun mediaPage(
