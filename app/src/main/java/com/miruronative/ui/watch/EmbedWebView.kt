@@ -107,16 +107,16 @@ fun EmbedWebView(
     qualityStreams: List<StreamItem> = emptyList(),
     startPositionMs: Long = 0L,
     skip: SkipTimes? = null,
-    onPreviousEpisode: (() -> Unit)? = null,
-    onNextEpisode: (() -> Unit)? = null,
+    onPreviousEpisode: ((EmbedPlaybackKey) -> Unit)? = null,
+    onNextEpisode: ((EmbedPlaybackKey) -> Unit)? = null,
     hasPreviousEpisode: Boolean = false,
     hasNextEpisode: Boolean = false,
     focusPlayerOnStart: Boolean = true,
     isFullscreen: Boolean = false,
     onToggleFullscreen: (() -> Unit)? = null,
     onFullscreenChanged: (Boolean) -> Unit = {},
-    onProgress: ((positionMs: Long, durationMs: Long) -> Unit)? = null,
-    onPlaybackError: ((message: String, streamUrl: String, positionMs: Long) -> Unit)? = null,
+    onProgress: ((EmbedPlaybackKey, Long, Long) -> Unit)? = null,
+    onPlaybackError: ((EmbedPlaybackKey, String, String, Long) -> Unit)? = null,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
 ) {
     val device = LocalAppDeviceProfile.current
@@ -234,7 +234,7 @@ fun EmbedWebView(
                 durationMs = nextDurationMs
                 webIsPlaying = isPlaying
                 webVolume = if (muted) 0f else volume.toFloat().coerceIn(0f, 1f)
-                if (isPlaying) currentOnProgress?.invoke(nextPositionMs, nextDurationMs)
+                if (isPlaying) currentOnProgress?.invoke(playbackKey, nextPositionMs, nextDurationMs)
             }
         },
     )
@@ -449,7 +449,7 @@ fun EmbedWebView(
             isInSkipWindow(positionMs, outroStartMs, outroEndMs)
         ) {
             outroAutoHandled = true
-            currentOnNextEpisode?.invoke()
+            currentOnNextEpisode?.invoke(playbackKey)
         }
     }
 
@@ -518,11 +518,11 @@ fun EmbedWebView(
                                         return true
                                     }
                                     event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT && currentHasNextEpisode -> {
-                                        currentOnNextEpisode?.invoke()
+                                        currentOnNextEpisode?.invoke(playbackKey)
                                         return true
                                     }
                                     event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS && currentHasPreviousEpisode -> {
-                                        currentOnPreviousEpisode?.invoke()
+                                        currentOnPreviousEpisode?.invoke(playbackKey)
                                         return true
                                     }
                                 }
@@ -635,6 +635,7 @@ fun EmbedWebView(
                         onMainFrameErrorAccepted = { message ->
                             loadError = message
                             currentOnPlaybackError?.invoke(
+                                playbackKey,
                                 message,
                                 navigationSession.request.streamUrl,
                                 currentPositionMs,
@@ -646,6 +647,7 @@ fun EmbedWebView(
                                     "didCrash=${detail?.didCrash()} priority=${detail?.rendererPriorityAtExit()}",
                             )
                             currentOnPlaybackError?.invoke(
+                                playbackKey,
                                 "Video server renderer stopped",
                                 navigationSession.request.streamUrl,
                                 currentPositionMs,
@@ -785,7 +787,7 @@ fun EmbedWebView(
                 isPlaying = webIsPlaying,
                 hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
-                onPrevious = { currentOnPreviousEpisode?.invoke() },
+                onPrevious = { currentOnPreviousEpisode?.invoke(playbackKey) },
                 onRewind = {
                     seekWebVideo(
                         webView,
@@ -811,7 +813,7 @@ fun EmbedWebView(
                     )
                     touchControlsInteraction++
                 },
-                onNext = { currentOnNextEpisode?.invoke() },
+                onNext = { currentOnNextEpisode?.invoke(playbackKey) },
                 onSeek = { targetMs ->
                     if (seekWebVideo(webView, targetMs, navigationSession, navigationGuard)) {
                         // The poll confirms next tick; without this the thumb snaps back first.
@@ -878,7 +880,7 @@ fun EmbedWebView(
                     "Previous episode",
                     Icons.Default.SkipPrevious,
                     enabled = hasPreviousEpisode && currentOnPreviousEpisode != null,
-                    onClick = { currentOnPreviousEpisode?.invoke() },
+                    onClick = { currentOnPreviousEpisode?.invoke(playbackKey) },
                 )
                 PlayerControlIconButton(
                     if (fallbackIsPlaying) "Pause" else "Play",
@@ -897,7 +899,7 @@ fun EmbedWebView(
                     "Next episode",
                     Icons.Default.SkipNext,
                     enabled = hasNextEpisode && currentOnNextEpisode != null,
-                    onClick = { currentOnNextEpisode?.invoke() },
+                    onClick = { currentOnNextEpisode?.invoke(playbackKey) },
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -931,7 +933,7 @@ fun EmbedWebView(
                 hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
                 playPauseFocusRequester = tvPlayPauseFocus,
-                onPrevious = { currentOnPreviousEpisode?.invoke() },
+                onPrevious = { currentOnPreviousEpisode?.invoke(playbackKey) },
                 onRewind = {
                     seekWebVideo(
                         webView,
@@ -954,7 +956,7 @@ fun EmbedWebView(
                         navigationGuard,
                     )
                 },
-                onNext = { currentOnNextEpisode?.invoke() },
+                onNext = { currentOnNextEpisode?.invoke(playbackKey) },
                 onVolumeDown = {
                     DiagnosticsLog.event("EmbedWebView TV control volumeDown available=$webPlaybackAvailable")
                     if (webPlaybackAvailable) {
@@ -1015,7 +1017,7 @@ fun EmbedWebView(
                 outroEndMs != null &&
                 currentOnNextEpisode != null &&
                 isInSkipWindow(positionMs, outroStartMs, outroEndMs) ->
-                "Next Episode" to { currentOnNextEpisode?.invoke() }
+                "Next Episode" to { currentOnNextEpisode?.invoke(playbackKey) }
             else -> null
         }
         action?.let { (label, onClick) ->

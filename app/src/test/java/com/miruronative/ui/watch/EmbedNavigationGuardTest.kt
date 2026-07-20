@@ -14,14 +14,14 @@ class EmbedNavigationGuardTest {
                 animeId = 21,
                 provider = "provider-a",
                 category = "sub",
-                episodeNumber = "1",
+                episodeNumber = 1.0,
             ),
             streamUrl = sharedUrl,
             referer = sharedReferer,
             usesIframeShell = false,
         )
         val episodeB = episodeA.copy(
-            playbackKey = episodeA.playbackKey.copy(episodeNumber = "2"),
+            playbackKey = episodeA.playbackKey.copy(episodeNumber = 2.0),
         )
 
         assertFalse(episodeA == episodeB)
@@ -33,6 +33,15 @@ class EmbedNavigationGuardTest {
         val navigationB = guard.begin(request(sharedUrl))
         assertFalse(guard.isCurrent(navigationA))
         assertTrue(guard.isCurrent(navigationB))
+    }
+
+    @Test
+    fun callbackIdentityCannotBeRelabelledAsTheNewEpisode() {
+        val episodeA = EmbedPlaybackKey(21, "provider-a", "sub", 1.0, sourceGeneration = 3)
+        val episodeB = episodeA.copy(episodeNumber = 2.0, sourceGeneration = 4)
+
+        assertTrue(acceptsEmbedPlaybackCallback(episodeA, episodeA))
+        assertFalse(acceptsEmbedPlaybackCallback(episodeA, episodeB))
     }
 
     @Test

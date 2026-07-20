@@ -7,9 +7,15 @@ data class EmbedPlaybackKey(
     val animeId: Int,
     val provider: String,
     val category: String,
-    val episodeNumber: String,
+    val episodeNumber: Double,
     val sourceGeneration: Int = 0,
 )
+
+/** Player callbacks are accepted only for the logical playback that emitted them. */
+internal fun acceptsEmbedPlaybackCallback(
+    reported: EmbedPlaybackKey,
+    current: EmbedPlaybackKey,
+): Boolean = reported == current
 
 /** Compose remember key for one logical playback plus its selected embed document. */
 internal data class EmbedNavigationIdentity(

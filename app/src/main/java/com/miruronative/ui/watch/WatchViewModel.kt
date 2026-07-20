@@ -569,8 +569,32 @@ class WatchViewModel : ViewModel() {
     private var lastKnownDurationMs = 0L
     private var lastKnownNumber: Double? = null
 
+    private fun WatchData.embedPlaybackKey(): EmbedPlaybackKey = EmbedPlaybackKey(
+        animeId = anilistId,
+        provider = provider,
+        category = category.api,
+        episodeNumber = current.number,
+        sourceGeneration = playbackGeneration,
+    )
+
+    fun onEmbedProgress(key: EmbedPlaybackKey, positionMs: Long, durationMs: Long) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (!acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) {
+            DiagnosticsLog.event(
+                "Watch ignored stale embed progress episode=${fmt(key.episodeNumber)} " +
+                    "generation=${key.sourceGeneration}",
+            )
+            return
+        }
+        recordProgress(data, positionMs, durationMs)
+    }
+
     fun onProgress(positionMs: Long, durationMs: Long) {
         val data = (_state.value as? UiState.Success)?.data ?: return
+        recordProgress(data, positionMs, durationMs)
+    }
+
+    private fun recordProgress(data: WatchData, positionMs: Long, durationMs: Long) {
         lastKnownPositionMs = positionMs
         lastKnownDurationMs = durationMs
         lastKnownNumber = data.current.number
@@ -579,6 +603,35 @@ class WatchViewModel : ViewModel() {
         if (now - lastProgressSave < 8_000) return
         lastProgressSave = now
         LibraryStore.updateProgress(anilistId, data.current.number, positionMs, durationMs)
+    }
+
+    fun onEmbedPlaybackError(
+        key: EmbedPlaybackKey,
+        message: String,
+        streamUrl: String,
+        positionMs: Long,
+    ) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (!acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) {
+            DiagnosticsLog.event(
+                "Watch ignored stale embed error episode=${fmt(key.episodeNumber)} " +
+                    "generation=${key.sourceGeneration}",
+            )
+            return
+        }
+        onPlaybackError(message, streamUrl, positionMs)
+    }
+
+    fun nextFromEmbed(key: EmbedPlaybackKey) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) next()
+        else DiagnosticsLog.event("Watch ignored stale embed next episode=${fmt(key.episodeNumber)}")
+    }
+
+    fun prevFromEmbed(key: EmbedPlaybackKey) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) prev()
+        else DiagnosticsLog.event("Watch ignored stale embed previous episode=${fmt(key.episodeNumber)}")
     }
 
     /**
