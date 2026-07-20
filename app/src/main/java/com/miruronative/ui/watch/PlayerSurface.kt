@@ -257,6 +257,7 @@ fun PlayerSurface(
         val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
         MediaController.Builder(context, token).buildAsync()
     }
+    val playbackSurfaceLease = remember { NativePlaybackSurfaceLease() }
     var controller by remember { mutableStateOf<MediaController?>(null) }
     val currentProvider by rememberUpdatedState(provider)
     val currentCategory by rememberUpdatedState(category)
@@ -279,16 +280,28 @@ fun PlayerSurface(
     DisposableEffect(controllerFuture) {
         controllerFuture.addListener(
             {
-                runCatching { controllerFuture.get() }
-                    .onSuccess {
-                        DiagnosticsLog.event("PlayerSurface MediaController connected")
-                        controller = it
-                    }
-                    .onFailure { DiagnosticsLog.throwable("PlayerSurface MediaController connection failed", it) }
+                val accepted = playbackSurfaceLease.runIfActive {
+                    runCatching { controllerFuture.get() }
+                        .onSuccess {
+                            DiagnosticsLog.event("PlayerSurface MediaController connected")
+                            controller = it
+                        }
+                        .onFailure {
+                            DiagnosticsLog.throwable("PlayerSurface MediaController connection failed", it)
+                        }
+                }
+                if (!accepted) {
+                    DiagnosticsLog.event("PlayerSurface ignored late MediaController connection")
+                }
             },
             ContextCompat.getMainExecutor(context),
         )
-        onDispose { MediaController.releaseFuture(controllerFuture) }
+        onDispose {
+            // Invalidate callbacks before releasing the future: a completion already queued on
+            // the main executor must never publish a controller into a disposed surface.
+            playbackSurfaceLease.release()
+            MediaController.releaseFuture(controllerFuture)
+        }
     }
 
     LaunchedEffect(controller) {
@@ -391,7 +404,6 @@ fun PlayerSurface(
                 "height=${activeStream.declaredVideoHeight() ?: "auto"} subtitles=${subtitles.size} " +
                 "startMs=$nextStartPositionMs",
         )
-        PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
         val watchRoute = Routes.watch(animeId, provider, category, episode)
         val metadata = MediaMetadata.Builder()
             .setTitle(episodeTitle)
@@ -424,10 +436,16 @@ fun PlayerSurface(
                 },
             )
             .build()
-        activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
-        activeController.prepare()
-        activeController.playWhenReady = true
-        DiagnosticsLog.event("PlayerSurface prepare called playWhenReady=true")
+        val prepared = playbackSurfaceLease.runIfActive {
+            PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
+            activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
+            activeController.prepare()
+            activeController.playWhenReady = true
+            DiagnosticsLog.event("PlayerSurface prepare called playWhenReady=true")
+        }
+        if (!prepared) {
+            DiagnosticsLog.event("PlayerSurface ignored prepare after surface disposal")
+        }
     }
 
     var positionMs by remember { mutableLongStateOf(0L) }
