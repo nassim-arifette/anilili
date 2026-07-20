@@ -3,12 +3,14 @@ package com.miruronative.data.library
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import androidx.tvprovider.media.tv.TvContractCompat
 import androidx.tvprovider.media.tv.WatchNextProgram
 import com.miruronative.data.AppGraph
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.nav.Routes
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Publishes the user's in-progress episode to the Android TV launcher's "Continue Watching"
@@ -22,16 +24,38 @@ object WatchNextManager {
     private const val PREFS = "anilili_watch_next"
     private const val PUBLISH_THROTTLE_MS = 60_000L
 
-    /** Progress saves arrive every few seconds during playback; the launcher doesn't need that. */
-    private val lastPublished = ConcurrentHashMap<Int, Long>()
+    /** Progress saves arrive every few seconds; content changes must still reach the launcher. */
+    private val lastPublished = ConcurrentHashMap<Int, WatchNextPublishState>()
+    private val publishCoordinator = WatchNextPublishCoordinator()
 
-    fun publish(context: Context, entry: HistoryEntry) {
+    /**
+     * Reserve the ordering ticket synchronously with the history save. Launching the provider I/O
+     * on [kotlinx.coroutines.Dispatchers.IO] can otherwise reorder episode A and episode B before
+     * [publish] is even entered.
+     */
+    internal fun preparePublish(entry: HistoryEntry): WatchNextPublishRequest = WatchNextPublishRequest(
+        entry = entry,
+        ticket = publishCoordinator.register(entry.anilistId),
+    )
+
+    internal fun publish(context: Context, request: WatchNextPublishRequest) {
         if (!AppGraph.isTv) return
-        val now = System.currentTimeMillis()
-        val last = lastPublished[entry.anilistId] ?: 0L
-        if (now - last < PUBLISH_THROTTLE_MS) return
-        lastPublished[entry.anilistId] = now
+        publishCoordinator.runIfLatest(request.ticket) {
+            val entry = request.entry
+            val throttleNowMs = SystemClock.elapsedRealtime()
+            val content = entry.watchNextContent()
+            val previous = lastPublished[entry.anilistId]
+            if (!shouldPublishWatchNext(previous, content, throttleNowMs, PUBLISH_THROTTLE_MS)) {
+                return@runIfLatest
+            }
 
+            if (publishProgram(context, entry, System.currentTimeMillis())) {
+                lastPublished[entry.anilistId] = WatchNextPublishState(content, throttleNowMs)
+            }
+        }
+    }
+
+    private fun publishProgram(context: Context, entry: HistoryEntry, engagementAtMs: Long): Boolean =
         runCatching {
             val app = context.applicationContext
             val watchIntent = Intent(app, com.miruronative.MainActivity::class.java).apply {
@@ -45,7 +69,7 @@ object WatchNextManager {
             val program = WatchNextProgram.Builder()
                 .setType(TvContractCompat.PreviewPrograms.TYPE_TV_EPISODE)
                 .setWatchNextType(TvContractCompat.WatchNextPrograms.WATCH_NEXT_TYPE_CONTINUE)
-                .setLastEngagementTimeUtcMillis(now)
+                .setLastEngagementTimeUtcMillis(engagementAtMs)
                 .setTitle(entry.title)
                 .setEpisodeTitle(entry.episodeTitle ?: "Episode ${entry.episodeLabel}")
                 .setEpisodeNumber(entry.episodeNumber.toInt())
@@ -69,46 +93,120 @@ object WatchNextManager {
                     null,
                     null,
                 )
-                if (updated > 0) return
+                if (updated > 0) return@runCatching true
             }
             val uri = app.contentResolver.insert(
                 TvContractCompat.WatchNextPrograms.CONTENT_URI,
                 program.toContentValues(),
             )
-            uri?.lastPathSegment?.toLongOrNull()?.let { id ->
-                prefs.edit().putLong(entry.anilistId.toString(), id).apply()
-                DiagnosticsLog.event("WatchNext published id=${entry.anilistId} programId=$id")
-            }
-        }.onFailure {
-            // No TvProvider on this device (Fire TV) or the launcher rejected it: nothing to do.
-        }
-    }
+            val id = uri?.lastPathSegment?.toLongOrNull() ?: return@runCatching false
+            prefs.edit().putLong(entry.anilistId.toString(), id).apply()
+            DiagnosticsLog.event("WatchNext published id=${entry.anilistId} programId=$id")
+            true
+        }.getOrDefault(false) // Fire TV has no TvProvider; retry on the next progress save.
 
     fun remove(context: Context, anilistId: Int) {
         if (!AppGraph.isTv) return
-        runCatching {
-            val app = context.applicationContext
-            val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            val existingId = prefs.getLong(anilistId.toString(), -1L)
-            if (existingId > 0) {
-                app.contentResolver.delete(TvContractCompat.buildWatchNextProgramUri(existingId), null, null)
-                prefs.edit().remove(anilistId.toString()).apply()
+        publishCoordinator.cancelAndRun(anilistId) {
+            lastPublished.remove(anilistId)
+            runCatching {
+                val app = context.applicationContext
+                val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                val existingId = prefs.getLong(anilistId.toString(), -1L)
+                if (existingId > 0) {
+                    app.contentResolver.delete(TvContractCompat.buildWatchNextProgramUri(existingId), null, null)
+                    prefs.edit().remove(anilistId.toString()).apply()
+                }
             }
         }
     }
 
     fun removeAll(context: Context) {
         if (!AppGraph.isTv) return
-        runCatching {
-            val app = context.applicationContext
-            val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            prefs.all.keys.toList().forEach { key ->
-                val id = prefs.getLong(key, -1L)
-                if (id > 0) {
-                    app.contentResolver.delete(TvContractCompat.buildWatchNextProgramUri(id), null, null)
+        publishCoordinator.cancelAllAndRun {
+            lastPublished.clear()
+            runCatching {
+                val app = context.applicationContext
+                val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                prefs.all.keys.toList().forEach { key ->
+                    val id = prefs.getLong(key, -1L)
+                    if (id > 0) {
+                        app.contentResolver.delete(TvContractCompat.buildWatchNextProgramUri(id), null, null)
+                    }
                 }
+                prefs.edit().clear().apply()
             }
-            prefs.edit().clear().apply()
         }
     }
 }
+
+internal data class WatchNextPublishRequest(
+    val entry: HistoryEntry,
+    val ticket: WatchNextPublishTicket,
+)
+
+internal data class WatchNextPublishTicket(
+    val anilistId: Int,
+    val generation: Long,
+)
+
+/** Serializes TvProvider mutations and rejects work superseded before it gets the lock. */
+internal class WatchNextPublishCoordinator {
+    private val operationLock = Any()
+    private val generations = ConcurrentHashMap<Int, AtomicLong>()
+
+    fun register(anilistId: Int): WatchNextPublishTicket {
+        val generation = generations.computeIfAbsent(anilistId) { AtomicLong() }.incrementAndGet()
+        return WatchNextPublishTicket(anilistId, generation)
+    }
+
+    fun runIfLatest(ticket: WatchNextPublishTicket, operation: () -> Unit): Boolean =
+        synchronized(operationLock) {
+            if (generations[ticket.anilistId]?.get() != ticket.generation) {
+                false
+            } else {
+                operation()
+                true
+            }
+        }
+
+    fun cancelAndRun(anilistId: Int, operation: () -> Unit) {
+        synchronized(operationLock) {
+            generations.computeIfAbsent(anilistId) { AtomicLong() }.incrementAndGet()
+            operation()
+        }
+    }
+
+    fun cancelAllAndRun(operation: () -> Unit) {
+        synchronized(operationLock) {
+            generations.values.forEach { it.incrementAndGet() }
+            operation()
+        }
+    }
+}
+
+internal data class WatchNextContent(
+    val episodeNumber: Double,
+    val provider: String,
+    val category: String,
+)
+
+internal data class WatchNextPublishState(
+    val content: WatchNextContent,
+    val publishedAtMs: Long,
+)
+
+internal fun HistoryEntry.watchNextContent(): WatchNextContent = WatchNextContent(
+    episodeNumber = episodeNumber,
+    provider = provider,
+    category = category,
+)
+
+internal fun shouldPublishWatchNext(
+    previous: WatchNextPublishState?,
+    content: WatchNextContent,
+    nowMs: Long,
+    throttleMs: Long,
+): Boolean = previous == null ||
+    previous.content != content ||
+    nowMs - previous.publishedAtMs >= throttleMs

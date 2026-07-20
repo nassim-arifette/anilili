@@ -57,7 +57,8 @@ object LibraryStore {
         persist(KEY_HISTORY, updated, HistoryEntry.serializer())
         // TV launchers surface in-progress titles in their Continue Watching row; publishing is
         // throttled inside the manager and a no-op off Android TV.
-        scope.launch { WatchNextManager.publish(appContext, stamped) }
+        val watchNextRequest = WatchNextManager.preparePublish(stamped)
+        scope.launch { WatchNextManager.publish(appContext, watchNextRequest) }
     }
 
     fun updateProgress(anilistId: Int, episodeNumber: Double, positionMs: Long, durationMs: Long) {
