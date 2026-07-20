@@ -77,6 +77,12 @@ data class SourcesResult(
     val subtitles: List<SubtitleItem>,
     val skip: SkipTimes?,
     val download: String?,
+    /**
+     * How far these subtitles need shifting to line up with the stream, in milliseconds. Non-zero
+     * only where a provider was caught handing out a file cut for a different encode of the same
+     * episode; the player seeds its subtitle delay from it.
+     */
+    val subtitleOffsetMs: Long = 0L,
 ) {
     val hlsStreams: List<StreamItem> get() = streams.filter { it.isHls }
     val embedStreams: List<StreamItem> get() = streams.filter { it.isEmbed }

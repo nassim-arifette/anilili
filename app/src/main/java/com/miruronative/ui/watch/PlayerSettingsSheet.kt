@@ -61,8 +61,10 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import com.miruronative.playback.SubtitleDelay
 import com.miruronative.ui.adaptive.LocalAppDeviceProfile
 import com.miruronative.ui.adaptive.focusHighlight
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
@@ -103,6 +105,8 @@ internal fun PlayerSettingsSheet(
     onCaptionAppearance: (() -> Unit)? = null,
     autoSkip: Boolean? = null,
     onAutoSkipChange: (Boolean) -> Unit = {},
+    subtitleDelayMs: Long? = null,
+    onSubtitleDelayChange: (Long) -> Unit = {},
     onEnterPip: (() -> Unit)? = null,
 ) {
     val sections: @Composable () -> Unit = {
@@ -119,6 +123,8 @@ internal fun PlayerSettingsSheet(
             onCaptionAppearance = onCaptionAppearance,
             autoSkip = autoSkip,
             onAutoSkipChange = onAutoSkipChange,
+            subtitleDelayMs = subtitleDelayMs,
+            onSubtitleDelayChange = onSubtitleDelayChange,
             onEnterPip = onEnterPip,
         )
     }
@@ -169,6 +175,8 @@ private fun SheetSections(
     onCaptionAppearance: (() -> Unit)?,
     autoSkip: Boolean?,
     onAutoSkipChange: (Boolean) -> Unit,
+    subtitleDelayMs: Long?,
+    onSubtitleDelayChange: (Long) -> Unit,
     onEnterPip: (() -> Unit)?,
 ) {
     SectionLabel("Volume")
@@ -200,6 +208,11 @@ private fun SheetSections(
         subtitleOptions.forEach { option ->
             TrackRow(option.label, option.selected, option.onSelect)
         }
+    }
+
+    subtitleDelayMs?.let { current ->
+        SectionLabel("Subtitle Delay")
+        SubtitleDelayRow(current, onSubtitleDelayChange)
     }
 
     contentScale?.let { current ->
@@ -409,6 +422,40 @@ private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean
             ),
         )
     }
+}
+
+/**
+ * Nudges the subtitles against the picture in quarter-second steps. It sits under the track list
+ * because that is where someone goes when the subtitles are wrong, and it takes effect while the
+ * episode plays, so each press can be judged against the video behind the sheet.
+ */
+@Composable
+private fun SubtitleDelayRow(delayMs: Long, onChange: (Long) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ChoiceChip("−0.25s", false) { onChange(delayMs - SubtitleDelay.STEP_MS) }
+        Text(
+            if (delayMs == 0L) "0.00 s" else String.format(Locale.US, "%+.2f s", delayMs / 1000.0),
+            color = Color.White,
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        ChoiceChip("+0.25s", false) { onChange(delayMs + SubtitleDelay.STEP_MS) }
+        if (delayMs != 0L) ChoiceChip("Reset", false) { onChange(0L) }
+    }
+    Text(
+        when {
+            delayMs == 0L -> "Subtitles play as the provider timed them."
+            SubtitleDelay.isAutomatic ->
+                "Measured for this stream — its subtitles were cut for a different encode."
+            delayMs > 0L -> "Subtitles are held back."
+            else -> "Subtitles run ahead."
+        },
+        color = Color.White.copy(alpha = 0.6f),
+        style = MaterialTheme.typography.bodySmall,
+    )
 }
 
 @Composable

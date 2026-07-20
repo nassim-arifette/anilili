@@ -95,6 +95,7 @@ class PlaybackService : MediaSessionService() {
         }
         player = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(playbackDataSource))
+            .setRenderersFactory(SubtitleDelayRenderersFactory(this))
             .setLoadControl(loadControl)
             .setSeekBackIncrementMs(10_000)
             .setSeekForwardIncrementMs(10_000)

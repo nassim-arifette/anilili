@@ -31,6 +31,31 @@ import kotlinx.serialization.json.doubleOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
+/** MegaPlay paths carry the episode's hash then the encode's: `/{episode}/{encode}/master.m3u8`. */
+private val MEGAPLAY_ENCODE_TAG = Regex("""/([0-9a-f]{32})(?=/)""")
+
+/**
+ * The encode's own hash in a MegaPlay URL, or null if the path is not shaped that way. Streams and
+ * subtitle files that belong together carry the same one; a subtitle file quoting a different
+ * encode than its stream is one cut for another release of the episode.
+ */
+internal fun megaPlayEncodeTag(url: String?): String? = url
+    ?.let { MEGAPLAY_ENCODE_TAG.findAll(it).map { match -> match.groupValues[1] }.toList() }
+    ?.getOrNull(1)
+
+/**
+ * How far a borrowed subtitle file sits from the stream it was handed to, judged from where each
+ * encode's intro starts. Under a second is measurement noise in the provider's own marks; over a
+ * minute is not a difference in head footage and is more likely mismatched episode data, so both
+ * are treated as "leave the subtitles alone".
+ */
+internal fun borrowedSubtitleOffsetMs(dubIntroSeconds: Double?, subIntroSeconds: Double?): Long {
+    val dubIntro = dubIntroSeconds ?: return 0L
+    val subIntro = subIntroSeconds ?: return 0L
+    val offsetMs = ((dubIntro - subIntro) * 1000.0).toLong()
+    return if (kotlin.math.abs(offsetMs) in 1_000L..60_000L) offsetMs else 0L
+}
+
 /**
  * Native Android implementation of the additional providers that used to be reached through
  * Anivexa-API. Episode rows are built from AniList immediately; provider matching and stream
@@ -288,7 +313,41 @@ class AnivexaClient(
         if (result.embedAvailable) {
             streams += stream(result.embedUrl, "embed", "MegaPlay embed", "${result.origin}/", active = streams.isEmpty())
         }
-        return SourcesResult(streams.distinctBy { it.url }, result.subtitles.distinctBy { it.url }, result.skip, null)
+        val offsetMs = if (audio == "dub") megaPlaySubtitleOffsetMs(result, "https://hianimes.re/") else 0L
+        return SourcesResult(
+            streams.distinctBy { it.url },
+            result.subtitles.distinctBy { it.url },
+            result.skip,
+            null,
+            offsetMs,
+        )
+    }
+
+    /**
+     * MegaPlay hands its dub streams the *sub* encode's subtitle file for shows it holds no
+     * dub-timed subtitles for — verified 2026-07-20 on How a Realist Hero Rebuilt the Kingdom,
+     * whose dub encode's own subtitle folder 404s. The two encodes are not the same cut: the dub
+     * carries extra footage at the head, 7-15 s depending on the episode, so every borrowed line
+     * lands that much early. The gap between the two payloads' intro marks measures it — across
+     * the four episodes checked it matched the difference in stream duration to within a second.
+     *
+     * Returns 0 for the ordinary case where the subtitles belong to the stream they arrived with,
+     * so the extra request only costs the shows that actually borrow.
+     */
+    private fun megaPlaySubtitleOffsetMs(dub: MegaPlayResult, referer: String): Long {
+        val streamTag = megaPlayEncodeTag(dub.streams.firstOrNull(StreamItem::isHls)?.url) ?: return 0L
+        val subtitleTag = megaPlayEncodeTag(dub.subtitles.firstOrNull()?.url) ?: return 0L
+        if (streamTag == subtitleTag) return 0L
+        val subUrl = dub.embedUrl.takeIf { it.endsWith("/dub") }?.dropLast(3)?.plus("sub") ?: return 0L
+        val subResult = runCatching { megaPlaySources(MegaPlayEmbed(subUrl, referer, null)) }.getOrNull()
+            ?: return 0L
+        // Only trust the intro marks once the borrowed file is confirmed to be this encode's own.
+        if (megaPlayEncodeTag(subResult.streams.firstOrNull(StreamItem::isHls)?.url) != subtitleTag) return 0L
+        val offsetMs = borrowedSubtitleOffsetMs(dub.skip?.introStart, subResult.skip?.introStart)
+        DiagnosticsLog.event(
+            "MegaPlay borrowed subtitles stream=$streamTag subs=$subtitleTag offsetMs=$offsetMs",
+        )
+        return offsetMs
     }
 
     /** MegaPlay by MyAnimeList id — covers shows that aren't mapped to an AniList id. */
@@ -734,14 +793,17 @@ class AnivexaClient(
             }
         }
         val embed = "https://megaplay.buzz/stream/mal/$malId/$episode/${if (audio == "dub") "dub" else "sub"}"
+        var subtitleOffsetMs = 0L
         runCatching { megaPlaySources(MegaPlayEmbed(embed, referer, null)) }.getOrNull()?.let { megaPlay ->
             streams += megaPlay.streams
             subtitles += megaPlay.subtitles
             if (megaPlay.embedAvailable) {
                 streams += stream(megaPlay.embedUrl, "embed", "2Dhive MegaPlay", referer, streams.isEmpty())
             }
+            // The dub fallback here is MegaPlay's, so it borrows subtitles the same way AniKoto does.
+            if (audio == "dub") subtitleOffsetMs = megaPlaySubtitleOffsetMs(megaPlay, referer)
         }
-        return SourcesResult(streams, subtitles, null, null)
+        return SourcesResult(streams, subtitles, null, null, subtitleOffsetMs)
     }
 
     // ---- Shared ---------------------------------------------------------------------------

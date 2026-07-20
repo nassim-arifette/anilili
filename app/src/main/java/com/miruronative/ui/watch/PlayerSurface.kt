@@ -101,6 +101,7 @@ import com.miruronative.data.settings.DefaultQuality
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.PlaybackService
+import com.miruronative.playback.SubtitleDelay
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
@@ -241,10 +242,17 @@ fun PlayerSurface(
     hasPreviousEpisode: Boolean = true,
     focusPlayerOnStart: Boolean = true,
     isFullscreen: Boolean = false,
+    subtitleOffsetMs: Long = 0L,
 ) {
     val context = LocalContext.current
     val device = LocalAppDeviceProfile.current
     DisposableEffect(Unit) { onDispose { resetPlayerBrightness(context) } }
+    // Each episode starts from what the loader measured for this stream, so a shift the viewer
+    // dialled in for a broken one never follows them into the next.
+    LaunchedEffect(stream.url, subtitleOffsetMs) {
+        SubtitleDelay.set(subtitleOffsetMs, automatic = true)
+    }
+    val subtitleDelayMs by SubtitleDelay.delayMs.collectAsState()
     val controllerFuture = remember(context) {
         val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
         MediaController.Builder(context, token).buildAsync()
@@ -744,8 +752,8 @@ fun PlayerSurface(
         )
 
         // Phone controls, hidden: the gesture layer owns the surface — tap shows the controls, a
-        // vertical drag on the left half scrubs brightness / right half volume, a double tap seeks
-        // ±10 s. (TV uses TvPlayerControls instead.)
+        // vertical drag down the left edge scrubs brightness / right edge volume, a double tap
+        // seeks ±10 s. (TV uses TvPlayerControls instead.)
         if (controller != null && !device.isTv && !phoneControlsVisible) {
             PlayerGestureControls(
                 onTap = {
@@ -908,6 +916,8 @@ fun PlayerSurface(
                     settingsExpanded = false
                     captionAppearanceVisible = true
                 },
+                subtitleDelayMs = subtitleDelayMs.takeIf { subtitleOptions.size > 1 },
+                onSubtitleDelayChange = { SubtitleDelay.set(it) },
                 autoSkip = autoSkipIntroOutro,
                 onAutoSkipChange = SettingsStore::setAutoSkipIntroOutro,
             )

@@ -519,6 +519,7 @@ private fun WatchContent(
                         stream = stream,
                         qualityStreams = data.sources.streams.filterNot(StreamItem::isEmbed),
                         subtitles = data.sources.subtitles,
+                        subtitleOffsetMs = data.sources.subtitleOffsetMs,
                         skip = data.sources.skip,
                         seriesTitle = data.seriesTitle,
                         episodeTitle = "Episode ${data.current.displayNumber}" +
