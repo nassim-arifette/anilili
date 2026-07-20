@@ -571,6 +571,7 @@ class WatchViewModel : ViewModel() {
 
     fun onProgress(positionMs: Long, durationMs: Long) {
         val data = (_state.value as? UiState.Success)?.data ?: return
+        if (positionMs < 0L || durationMs <= 0L) return
         lastKnownPositionMs = positionMs
         lastKnownDurationMs = durationMs
         lastKnownNumber = data.current.number
@@ -578,7 +579,18 @@ class WatchViewModel : ViewModel() {
         val now = System.currentTimeMillis()
         if (now - lastProgressSave < 8_000) return
         lastProgressSave = now
-        LibraryStore.updateProgress(anilistId, data.current.number, positionMs, durationMs)
+        persistProgressIfChanged(data.current.number, positionMs, durationMs)
+    }
+
+    /** Persists a lifecycle/seek finalization immediately, outside the periodic-save throttle. */
+    fun commitPlaybackPosition(positionMs: Long, durationMs: Long) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (positionMs < 0L || durationMs <= 0L) return
+        lastKnownPositionMs = positionMs
+        lastKnownDurationMs = durationMs
+        lastKnownNumber = data.current.number
+        maybeSyncAniListProgress(data.current.number, positionMs, durationMs)
+        commitPlaybackPosition()
     }
 
     /**
@@ -590,13 +602,22 @@ class WatchViewModel : ViewModel() {
     fun commitPlaybackPosition() {
         val data = (_state.value as? UiState.Success)?.data ?: return
         val number = lastKnownNumber ?: return
-        if (number != data.current.number || lastKnownPositionMs <= 0) return
+        if (number != data.current.number || lastKnownPositionMs < 0L || lastKnownDurationMs <= 0L) return
         lastProgressSave = System.currentTimeMillis()
-        LibraryStore.updateProgress(anilistId, number, lastKnownPositionMs, lastKnownDurationMs)
-        DiagnosticsLog.event(
-            "Watch commit position episode=${fmt(number)} positionMs=$lastKnownPositionMs",
-        )
+        if (persistProgressIfChanged(number, lastKnownPositionMs, lastKnownDurationMs)) {
+            DiagnosticsLog.event(
+                "Watch commit position episode=${fmt(number)} positionMs=$lastKnownPositionMs",
+            )
+        }
         _state.value = UiState.Success(data.copy(startPositionMs = lastKnownPositionMs))
+    }
+
+    private fun persistProgressIfChanged(number: Double, positionMs: Long, durationMs: Long): Boolean {
+        val saved = LibraryStore.historyFor(anilistId)
+        if (saved?.episodeNumber != number) return false
+        if (saved.positionMs == positionMs && saved.durationMs == durationMs) return false
+        LibraryStore.updateProgress(anilistId, number, positionMs, durationMs)
+        return true
     }
 
     private fun maybeSyncAniListProgress(episodeNumber: Double, positionMs: Long, durationMs: Long) {

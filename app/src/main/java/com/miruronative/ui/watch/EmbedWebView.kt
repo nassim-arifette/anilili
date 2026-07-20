@@ -115,8 +115,10 @@ fun EmbedWebView(
     onToggleFullscreen: (() -> Unit)? = null,
     onFullscreenChanged: (Boolean) -> Unit = {},
     onProgress: ((positionMs: Long, durationMs: Long) -> Unit)? = null,
+    onProgressFinalized: ((positionMs: Long, durationMs: Long) -> Unit)? = null,
     onPlaybackError: ((message: String, streamUrl: String, positionMs: Long) -> Unit)? = null,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
+    onPlaybackFinalizerChanged: (((() -> Unit)?) -> Unit)? = null,
 ) {
     val device = LocalAppDeviceProfile.current
     val context = LocalContext.current
@@ -143,8 +145,10 @@ fun EmbedWebView(
     var webView by remember { mutableStateOf<WebView?>(null) }
     var finishedUrl by remember(activeUrl) { mutableStateOf<String?>(null) }
     val currentOnPlaybackStopperChanged by rememberUpdatedState(onPlaybackStopperChanged)
+    val currentOnPlaybackFinalizerChanged by rememberUpdatedState(onPlaybackFinalizerChanged)
     val currentOnFullscreenChanged by rememberUpdatedState(onFullscreenChanged)
     val currentOnProgress by rememberUpdatedState(onProgress)
+    val currentOnProgressFinalized by rememberUpdatedState(onProgressFinalized)
     val currentOnPreviousEpisode by rememberUpdatedState(onPreviousEpisode)
     val currentOnNextEpisode by rememberUpdatedState(onNextEpisode)
     val currentHasPreviousEpisode by rememberUpdatedState(hasPreviousEpisode)
@@ -157,6 +161,28 @@ fun EmbedWebView(
     var positionMs by remember(url) { mutableLongStateOf(startPositionMs) }
     var durationMs by remember(url) { mutableLongStateOf(0L) }
     var webIsPlaying by remember(url) { mutableStateOf(false) }
+    val progressFinalizationPolicy = remember(url) { EmbedProgressFinalizationPolicy() }
+    val currentProgressFinalizationPolicy by rememberUpdatedState(progressFinalizationPolicy)
+    val reportProgress: (Long, Long) -> Unit = { nextPositionMs, nextDurationMs ->
+        currentProgressFinalizationPolicy.observe(nextPositionMs, nextDurationMs)?.let { sample ->
+            currentOnProgress?.invoke(sample.positionMs, sample.durationMs)
+        }
+    }
+    val currentReportProgress by rememberUpdatedState(reportProgress)
+    val finalizeProgress: () -> Unit = {
+        val onFinalized = currentOnProgressFinalized
+        val onRegularProgress = currentOnProgress
+        if (onFinalized != null || onRegularProgress != null) {
+            currentProgressFinalizationPolicy.takePendingFinalization()?.let { sample ->
+                if (onFinalized != null) {
+                    onFinalized(sample.positionMs, sample.durationMs)
+                } else {
+                    onRegularProgress?.invoke(sample.positionMs, sample.durationMs)
+                }
+            }
+        }
+    }
+    val currentFinalizeProgress by rememberUpdatedState(finalizeProgress)
     var webVolume by remember(url) { mutableStateOf(1f) }
     var lastAudibleVolume by remember(url) { mutableStateOf(1f) }
     // Cross-origin embeds (some Kiwi mirrors) put the video out of the injected JS's reach, so
@@ -192,10 +218,33 @@ fun EmbedWebView(
     var introAutoSkipped by remember(activeUrl, introStartMs, introEndMs) { mutableStateOf(false) }
     var outroAutoHandled by remember(activeUrl, outroStartMs, outroEndMs) { mutableStateOf(false) }
 
+    val seekTo: (Long) -> Unit = { requestedPositionMs ->
+        val targetPositionMs = requestedPositionMs.coerceAtLeast(0L).let { requested ->
+            if (durationMs > 0L) requested.coerceAtMost(durationMs) else requested
+        }
+        seekWebVideo(webView, targetPositionMs)
+        positionMs = targetPositionMs
+        currentReportProgress(targetPositionMs, durationMs)
+        if (!webIsPlaying) currentFinalizeProgress()
+    }
+
     DisposableEffect(webView) {
         val web = webView
-        currentOnPlaybackStopperChanged?.invoke(web?.let { { stopWebPlayback(it) } })
-        onDispose { currentOnPlaybackStopperChanged?.invoke(null) }
+        val callbackGate = web?.tag as? WebProgressCallbackGate
+        currentOnPlaybackStopperChanged?.invoke(
+            web?.let {
+                {
+                    val shouldStop = callbackGate?.close() ?: true
+                    currentFinalizeProgress()
+                    if (shouldStop) stopWebPlayback(it)
+                }
+            },
+        )
+        currentOnPlaybackFinalizerChanged?.invoke(web?.let { { currentFinalizeProgress() } })
+        onDispose {
+            currentOnPlaybackStopperChanged?.invoke(null)
+            currentOnPlaybackFinalizerChanged?.invoke(null)
+        }
     }
 
     // Full touch controls — seek bar and all — whenever the injected JS can reach the <video>.
@@ -328,12 +377,17 @@ fun EmbedWebView(
             // Embed pages are full-bleed players already, so fullscreen is implemented by
             // denying the custom view and expanding the WebView natively instead.
             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                if (!webView.acceptsEmbedCallbacks()) {
+                    callback?.onCustomViewHidden()
+                    return
+                }
                 DiagnosticsLog.event("EmbedWebView custom fullscreen requested")
                 callback?.onCustomViewHidden()
                 currentOnFullscreenChanged(true)
             }
 
             override fun onHideCustomView() {
+                if (!webView.acceptsEmbedCallbacks()) return
                 DiagnosticsLog.event("EmbedWebView custom fullscreen hidden")
                 currentOnFullscreenChanged(false)
             }
@@ -343,6 +397,7 @@ fun EmbedWebView(
     val webClient = remember(allowedHost, navigationLock) {
         object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                if (!view.acceptsEmbedCallbacks()) return true
                 val target = request?.url ?: return true
                 if (!request.isForMainFrame) return false
                 if (navigationLock.locked) return true // page is up; any top-frame nav is an ad
@@ -354,12 +409,14 @@ fun EmbedWebView(
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                if (!view.acceptsEmbedCallbacks()) return
                 loadError = null
                 finishedUrl = null
                 DiagnosticsLog.event("EmbedWebView page started host=${url.hostOrNone()}")
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
+                if (!view.acceptsEmbedCallbacks()) return
                 navigationLock.locked = true
                 finishedUrl = url
                 DiagnosticsLog.event("EmbedWebView page finished host=${url.hostOrNone()} title=${view?.title ?: "none"}")
@@ -370,6 +427,7 @@ fun EmbedWebView(
             }
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                if (!view.acceptsEmbedCallbacks()) return
                 if (request?.isForMainFrame == true) {
                     val message = error?.description?.toString() ?: "The server did not respond"
                     loadError = message
@@ -377,6 +435,7 @@ fun EmbedWebView(
                         "EmbedWebView main-frame error code=${error?.errorCode} " +
                             "description=${error?.description} host=${request.url?.host ?: "unknown"}",
                     )
+                    currentFinalizeProgress()
                     currentOnPlaybackError?.invoke(message, currentActiveUrl, currentPositionMs)
                 }
             }
@@ -386,6 +445,7 @@ fun EmbedWebView(
                 request: WebResourceRequest?,
                 errorResponse: WebResourceResponse?,
             ) {
+                if (!view.acceptsEmbedCallbacks()) return
                 if (request?.isForMainFrame == true) {
                     val message = "HTTP ${errorResponse?.statusCode ?: "error"} from the video server"
                     loadError = message
@@ -393,15 +453,19 @@ fun EmbedWebView(
                         "EmbedWebView main-frame HTTP error status=${errorResponse?.statusCode} " +
                             "reason=${errorResponse?.reasonPhrase} host=${request.url?.host ?: "unknown"}",
                     )
+                    currentFinalizeProgress()
                     currentOnPlaybackError?.invoke(message, currentActiveUrl, currentPositionMs)
                 }
             }
 
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                if (!view.acceptsEmbedCallbacks()) return true
                 DiagnosticsLog.event(
                     "EmbedWebView render process gone didCrash=${detail?.didCrash()} " +
                         "priority=${detail?.rendererPriorityAtExit()}",
                 )
+                (view?.tag as? WebProgressCallbackGate)?.close()
+                currentFinalizeProgress()
                 currentOnPlaybackError?.invoke("Video server renderer stopped", currentActiveUrl, currentPositionMs)
                 if (webView === view) webView = null
                 return true
@@ -416,19 +480,22 @@ fun EmbedWebView(
             onDispose {}
         } else {
             val observer = LifecycleEventObserver { _, event ->
-                when (event) {
-                    Lifecycle.Event.ON_PAUSE,
-                    Lifecycle.Event.ON_STOP -> {
-                        runCatching { web.evaluateJavascript(PAUSE_VIDEO_JS, null) }
-                        web.onPause()
-                        web.pauseTimers()
+                if (web.acceptsEmbedCallbacks()) {
+                    when (event) {
+                        Lifecycle.Event.ON_PAUSE,
+                        Lifecycle.Event.ON_STOP -> {
+                            currentFinalizeProgress()
+                            runCatching { web.evaluateJavascript(PAUSE_VIDEO_JS, null) }
+                            web.onPause()
+                            web.pauseTimers()
+                        }
+                        Lifecycle.Event.ON_RESUME,
+                        Lifecycle.Event.ON_START -> {
+                            web.resumeTimers()
+                            web.onResume()
+                        }
+                        else -> Unit
                     }
-                    Lifecycle.Event.ON_RESUME,
-                    Lifecycle.Event.ON_START -> {
-                        web.resumeTimers()
-                        web.onResume()
-                    }
-                    else -> Unit
                 }
             }
             owner.lifecycle.addObserver(observer)
@@ -450,7 +517,7 @@ fun EmbedWebView(
 
         if (!introAutoSkipped && isInSkipWindow(positionMs, introStartMs, introEndMs)) {
             introAutoSkipped = true
-            seekWebVideo(webView, introEndMs)
+            seekTo(introEndMs)
             return@LaunchedEffect
         }
 
@@ -461,6 +528,7 @@ fun EmbedWebView(
             isInSkipWindow(positionMs, outroStartMs, outroEndMs)
         ) {
             outroAutoHandled = true
+            currentFinalizeProgress()
             currentOnNextEpisode?.invoke()
         }
     }
@@ -500,6 +568,7 @@ fun EmbedWebView(
                 try {
                     DiagnosticsLog.event("EmbedWebView factory create WebView")
                     DiagnosticsLog.webViewPackage("EmbedWebView factory")
+                    val progressCallbackGate = WebProgressCallbackGate()
                     object : WebView(ctx) {
                         override fun dispatchKeyEvent(event: KeyEvent): Boolean {
                             // Only claim the remote while the player is the active surface. In the
@@ -515,10 +584,11 @@ fun EmbedWebView(
                                     device.isTv && (
                                         event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
                                             event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
-                                            event.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
+                                        event.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
                                             event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN
                                         ) -> {
                                         mainHandler.post {
+                                            if (!progressCallbackGate.isOpen) return@post
                                             tvControlsVisible = true
                                             tvControlsInteraction++
                                         }
@@ -527,15 +597,20 @@ fun EmbedWebView(
                                     event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
                                         event.keyCode == KeyEvent.KEYCODE_ENTER ||
                                         event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                                        if (webIsPlaying) currentFinalizeProgress()
                                         evaluateJavascript(REMOTE_TOGGLE_PLAYBACK_JS, null)
-                                        mainHandler.post { webIsPlaying = !webIsPlaying }
+                                        mainHandler.post {
+                                            if (progressCallbackGate.isOpen) webIsPlaying = !webIsPlaying
+                                        }
                                         return true
                                     }
                                     event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT && currentHasNextEpisode -> {
+                                        currentFinalizeProgress()
                                         currentOnNextEpisode?.invoke()
                                         return true
                                     }
                                     event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS && currentHasPreviousEpisode -> {
+                                        currentFinalizeProgress()
                                         currentOnPreviousEpisode?.invoke()
                                         return true
                                     }
@@ -544,6 +619,7 @@ fun EmbedWebView(
                             return super.dispatchKeyEvent(event)
                         }
                     }.apply {
+                        tag = progressCallbackGate
                         layoutParams = ViewGroup.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -571,20 +647,24 @@ fun EmbedWebView(
                         addJavascriptInterface(
                             WebProgressBridge(
                                 onTickCallback = { positionSec, durationSec, isPlaying, muted, volume ->
-                                    if (positionSec > 0 && durationSec > 0) {
-                                        val nextPositionMs = (positionSec * 1000).toLong()
-                                        val nextDurationMs = (durationSec * 1000).toLong()
+                                    val sample = embedProgressFromSeconds(positionSec, durationSec)
+                                    if (sample != null && progressCallbackGate.isOpen) {
                                         mainHandler.post {
-                                            positionMs = nextPositionMs
-                                            durationMs = nextDurationMs
+                                            if (!progressCallbackGate.isOpen) return@post
+                                            positionMs = sample.positionMs
+                                            durationMs = sample.durationMs
                                             webIsPlaying = isPlaying
                                             webVolume = if (muted) 0f else volume.toFloat().coerceIn(0f, 1f)
-                                            if (isPlaying) currentOnProgress?.invoke(nextPositionMs, nextDurationMs)
+                                            currentReportProgress(sample.positionMs, sample.durationMs)
                                         }
                                     }
                                 },
                                 onVideoAvailableCallback = {
-                                    mainHandler.post { webPlaybackAvailable = true }
+                                    if (progressCallbackGate.isOpen) {
+                                        mainHandler.post {
+                                            if (progressCallbackGate.isOpen) webPlaybackAvailable = true
+                                        }
+                                    }
                                 },
                             ),
                             "AniliProgress",
@@ -628,14 +708,17 @@ fun EmbedWebView(
             },
             onRelease = { view ->
                 val web = view as? WebView ?: return@AndroidView
+                val shouldStop = (web.tag as? WebProgressCallbackGate)?.close() ?: true
+                currentFinalizeProgress()
                 if (webView === web) webView = null
-                DiagnosticsLog.event("EmbedWebView release url=${web.url ?: "none"} size=${web.width}x${web.height}")
-                stopWebPlayback(web)
                 web.removeJavascriptInterface("AniliProgress")
-                web.clearHistory()
-                web.removeAllViews()
                 web.webChromeClient = null
                 web.webViewClient = WebViewClient()
+                DiagnosticsLog.event("EmbedWebView release url=${web.url ?: "none"} size=${web.width}x${web.height}")
+                if (shouldStop) stopWebPlayback(web)
+                web.tag = null
+                web.clearHistory()
+                web.removeAllViews()
                 web.destroy()
             },
         )
@@ -674,12 +757,9 @@ fun EmbedWebView(
             },
             onDoubleTap = { isRightHalf ->
                 if (isRightHalf) {
-                    seekWebVideo(webView, positionMs + 10_000L)
-                    positionMs += 10_000L
+                    seekTo(positionMs + 10_000L)
                 } else {
-                    val target = (positionMs - 10_000L).coerceAtLeast(0L)
-                    seekWebVideo(webView, target)
-                    positionMs = target
+                    seekTo(positionMs - 10_000L)
                 }
             },
             onHoldSpeed = { active ->
@@ -721,25 +801,31 @@ fun EmbedWebView(
                 isPlaying = webIsPlaying,
                 hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
-                onPrevious = { currentOnPreviousEpisode?.invoke() },
+                onPrevious = {
+                    currentFinalizeProgress()
+                    currentOnPreviousEpisode?.invoke()
+                },
                 onRewind = {
-                    seekWebVideo(webView, (positionMs - 10_000L).coerceAtLeast(0L))
+                    seekTo(positionMs - 10_000L)
                     touchControlsInteraction++
                 },
                 onPlayPause = {
                     DiagnosticsLog.event("EmbedWebView touch control playPause")
+                    if (webIsPlaying) currentFinalizeProgress()
                     webView?.evaluateJavascript(REMOTE_TOGGLE_PLAYBACK_JS, null)
                     webIsPlaying = !webIsPlaying
                     touchControlsInteraction++
                 },
                 onForward = {
-                    seekWebVideo(webView, positionMs + 10_000L)
+                    seekTo(positionMs + 10_000L)
                     touchControlsInteraction++
                 },
-                onNext = { currentOnNextEpisode?.invoke() },
+                onNext = {
+                    currentFinalizeProgress()
+                    currentOnNextEpisode?.invoke()
+                },
                 onSeek = { targetMs ->
-                    seekWebVideo(webView, targetMs)
-                    positionMs = targetMs // the poll confirms next tick; without this the thumb snaps back first
+                    seekTo(targetMs)
                     touchControlsInteraction++
                 },
                 onSettings = { settingsSheetVisible = true },
@@ -762,6 +848,7 @@ fun EmbedWebView(
                         label = "${height}p",
                         selected = option.url == activeUrl,
                         onSelect = {
+                            currentFinalizeProgress()
                             pendingSeekMs = positionMs
                             activeUrl = option.url
                         },
@@ -796,7 +883,10 @@ fun EmbedWebView(
                     "Previous episode",
                     Icons.Default.SkipPrevious,
                     enabled = hasPreviousEpisode && currentOnPreviousEpisode != null,
-                    onClick = { currentOnPreviousEpisode?.invoke() },
+                    onClick = {
+                        currentFinalizeProgress()
+                        currentOnPreviousEpisode?.invoke()
+                    },
                 )
                 PlayerControlIconButton(
                     if (fallbackIsPlaying) "Pause" else "Play",
@@ -815,7 +905,10 @@ fun EmbedWebView(
                     "Next episode",
                     Icons.Default.SkipNext,
                     enabled = hasNextEpisode && currentOnNextEpisode != null,
-                    onClick = { currentOnNextEpisode?.invoke() },
+                    onClick = {
+                        currentFinalizeProgress()
+                        currentOnNextEpisode?.invoke()
+                    },
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -849,15 +942,22 @@ fun EmbedWebView(
                 hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
                 playPauseFocusRequester = tvPlayPauseFocus,
-                onPrevious = { currentOnPreviousEpisode?.invoke() },
-                onRewind = { seekWebVideo(webView, (positionMs - 10_000L).coerceAtLeast(0L)) },
+                onPrevious = {
+                    currentFinalizeProgress()
+                    currentOnPreviousEpisode?.invoke()
+                },
+                onRewind = { seekTo(positionMs - 10_000L) },
                 onPlayPause = {
                     DiagnosticsLog.event("EmbedWebView TV control playPause")
+                    if (webIsPlaying) currentFinalizeProgress()
                     webView?.evaluateJavascript(REMOTE_TOGGLE_PLAYBACK_JS, null)
                     webIsPlaying = !webIsPlaying
                 },
-                onForward = { seekWebVideo(webView, positionMs + 10_000L) },
-                onNext = { currentOnNextEpisode?.invoke() },
+                onForward = { seekTo(positionMs + 10_000L) },
+                onNext = {
+                    currentFinalizeProgress()
+                    currentOnNextEpisode?.invoke()
+                },
                 onVolumeDown = {
                     DiagnosticsLog.event("EmbedWebView TV control volumeDown available=$webPlaybackAvailable")
                     if (webPlaybackAvailable) {
@@ -911,12 +1011,15 @@ fun EmbedWebView(
 
         val action: Pair<String, () -> Unit>? = when {
             introEndMs != null && isInSkipWindow(positionMs, introStartMs, introEndMs) ->
-                "Skip Intro" to { seekWebVideo(webView, introEndMs) }
+                "Skip Intro" to { seekTo(introEndMs) }
             outroStartMs != null &&
                 outroEndMs != null &&
                 currentOnNextEpisode != null &&
                 isInSkipWindow(positionMs, outroStartMs, outroEndMs) ->
-                "Next Episode" to { currentOnNextEpisode?.invoke() }
+                "Next Episode" to {
+                    currentFinalizeProgress()
+                    currentOnNextEpisode?.invoke()
+                }
             else -> null
         }
         action?.let { (label, onClick) ->
@@ -968,7 +1071,7 @@ private fun WebSkipButton(label: String, onClick: () -> Unit, modifier: Modifier
 
 /**
  * Every web player ultimately drives an HTML5 <video>. Poll it (and any same-origin iframe's)
- * every second while playing and report position/duration to the Kotlin bridge. Cross-origin
+ * every second, including while paused so a scrub can be persisted. Cross-origin
  * iframes are unreachable by design — those hosts simply won't report progress.
  */
 private val PROGRESS_POLL_JS = """
@@ -1153,17 +1256,23 @@ private fun seekWebVideo(webView: WebView?, targetMs: Long?) {
 }
 
 private fun adjustWebVolume(webView: WebView?, delta: Float, onChanged: (Float) -> Unit) {
+    val web = webView ?: return
     runCatching {
-        webView?.evaluateJavascript(WEB_VOLUME_JS(delta = delta, absolute = null)) { result ->
-            result.toFloatOrNull()?.coerceIn(0f, 1f)?.let(onChanged)
+        web.evaluateJavascript(WEB_VOLUME_JS(delta = delta, absolute = null)) { result ->
+            if (web.acceptsEmbedCallbacks()) {
+                result.toFloatOrNull()?.coerceIn(0f, 1f)?.let(onChanged)
+            }
         }
     }
 }
 
 private fun setWebVolume(webView: WebView?, volume: Float, onChanged: (Float) -> Unit) {
+    val web = webView ?: return
     runCatching {
-        webView?.evaluateJavascript(WEB_VOLUME_JS(delta = null, absolute = volume)) { result ->
-            result.toFloatOrNull()?.coerceIn(0f, 1f)?.let(onChanged)
+        web.evaluateJavascript(WEB_VOLUME_JS(delta = null, absolute = volume)) { result ->
+            if (web.acceptsEmbedCallbacks()) {
+                result.toFloatOrNull()?.coerceIn(0f, 1f)?.let(onChanged)
+            }
         }
     }
 }
@@ -1318,6 +1427,9 @@ private fun isInSkipWindow(positionMs: Long, startMs: Long?, endMs: Long?): Bool
 
 private fun String?.hostOrNone(): String =
     this?.let { runCatching { Uri.parse(it).host }.getOrNull() } ?: "none"
+
+private fun WebView?.acceptsEmbedCallbacks(): Boolean =
+    (this?.tag as? WebProgressCallbackGate)?.isOpen == true
 
 private class WebProgressBridge(
     private val onTickCallback: (Double, Double, Boolean, Boolean, Double) -> Unit,

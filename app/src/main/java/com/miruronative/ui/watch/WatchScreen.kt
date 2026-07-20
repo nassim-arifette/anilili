@@ -140,6 +140,8 @@ fun WatchScreen(
     val currentOnBack by rememberUpdatedState(onBack)
     var embeddedPlaybackStopper by remember { mutableStateOf<(() -> Unit)?>(null) }
     val currentEmbeddedPlaybackStopper by rememberUpdatedState(embeddedPlaybackStopper)
+    var embeddedPlaybackFinalizer by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val currentEmbeddedPlaybackFinalizer by rememberUpdatedState(embeddedPlaybackFinalizer)
     // YouTube-style leave: native playback PAUSES (media stays loaded, so the notification can
     // resume it and re-entering the episode continues in place); the position is committed past
     // the periodic-save throttle so "continue watching" lands exactly where the user left off.
@@ -232,7 +234,9 @@ fun WatchScreen(
                 modifier = Modifier.fillMaxSize(),
                 onFullscreenChanged = { fullscreen = it },
                 onProgress = vm::onProgress,
+                onProgressFinalized = vm::commitPlaybackPosition,
                 onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
+                onPlaybackFinalizerChanged = { embeddedPlaybackFinalizer = it },
             )
             BackButton(pauseAndBack, Modifier.align(Alignment.TopStart))
             return@Box
@@ -287,11 +291,29 @@ fun WatchScreen(
                         )
                     },
                     onBack = pauseAndBack,
-                    onPrev = vm::prev,
-                    onNext = vm::next,
-                    onChangeSource = vm::changeSource,
-                    onChangeCategory = vm::changeCategory,
+                    onPrev = {
+                        currentEmbeddedPlaybackFinalizer?.invoke()
+                        vm.commitPlaybackPosition()
+                        vm.prev()
+                    },
+                    onNext = {
+                        currentEmbeddedPlaybackFinalizer?.invoke()
+                        vm.commitPlaybackPosition()
+                        vm.next()
+                    },
+                    onChangeSource = { nextProvider, nextCategory ->
+                        currentEmbeddedPlaybackFinalizer?.invoke()
+                        vm.commitPlaybackPosition()
+                        vm.changeSource(nextProvider, nextCategory)
+                    },
+                    onChangeCategory = { nextCategory ->
+                        currentEmbeddedPlaybackFinalizer?.invoke()
+                        vm.commitPlaybackPosition()
+                        vm.changeCategory(nextCategory)
+                    },
                     onSelectEpisode = { index ->
+                        currentEmbeddedPlaybackFinalizer?.invoke()
+                        vm.commitPlaybackPosition()
                         if (device.isTv) fullscreen = true
                         vm.playIndex(index)
                     },
@@ -299,8 +321,10 @@ fun WatchScreen(
                     onToggleFullscreen = { fullscreen = !fullscreen },
                     onFullscreenChanged = { fullscreen = it },
                     onProgress = vm::onProgress,
+                    onProgressFinalized = vm::commitPlaybackPosition,
                     onPlaybackError = vm::onPlaybackError,
                     onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
+                    onPlaybackFinalizerChanged = { embeddedPlaybackFinalizer = it },
                     onPlayerClosed = vm::commitPlaybackPosition,
                 )
             }
@@ -324,8 +348,10 @@ private fun WatchContent(
     onToggleFullscreen: () -> Unit,
     onFullscreenChanged: (Boolean) -> Unit,
     onProgress: (Long, Long) -> Unit,
+    onProgressFinalized: (Long, Long) -> Unit,
     onPlaybackError: (String, String, Long) -> Unit,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
+    onPlaybackFinalizerChanged: (((() -> Unit)?) -> Unit)? = null,
     onPlayerClosed: () -> Unit = {},
 ) {
     val device = LocalAppDeviceProfile.current
@@ -491,8 +517,10 @@ private fun WatchContent(
                                 onToggleFullscreen = onToggleFullscreen,
                                 onFullscreenChanged = onFullscreenChanged,
                                 onProgress = onProgress,
+                                onProgressFinalized = onProgressFinalized,
                                 onPlaybackError = onPlaybackError.takeIf { data.provider == "allanime" },
                                 onPlaybackStopperChanged = onPlaybackStopperChanged,
+                                onPlaybackFinalizerChanged = onPlaybackFinalizerChanged,
                             )
                             // Embed players often use CSS "web fullscreen" that never reaches the
                             // WebView fullscreen callback, so the app provides its own toggle. On
