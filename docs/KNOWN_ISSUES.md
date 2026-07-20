@@ -9,7 +9,7 @@ already been merged into `main`. Unchecked items still need to be addressed.
 The issues below have concrete execution paths in the code, but could not be validated on a real
 device because no Android SDK was installed in the audit environment.
 
-**Current status:** 5 fixes implemented, 14 code bugs still open, and 2 documentation fixes still
+**Current status:** 20 fixes implemented, 18 code bugs still open, and 2 documentation fixes still
 required.
 
 ## Fixes implemented on local branches
@@ -26,12 +26,42 @@ Each branch contains a single commit based directly on `main`.
   `fix/webview-local-lifecycle` (`e99549d`).
 - [x] Prevent the hidden Flixcloud resolver from overlapping the active player —
   `fix/flixcloud-player-overlap` (`90c97da`).
+- [x] Isolate every logical embed navigation and reject callbacks from the replaced page —
+  `fix/embed-navigation-generation` (`3de7291`).
+- [x] Reject cancelled or superseded source-resolution results —
+  `fix/playback-resolution-generation` (`e1c5f52`).
+- [x] Preserve the union of all provider episodes and never substitute episode index zero —
+  `fix/episode-spine-union` (`d89d6c1`).
+- [x] Add history only after a native or embed player is actually presented —
+  `fix/history-on-playback-start` (`3caa052`).
+- [x] Attribute native progress to the exact anime, episode, generation, and media item —
+  `fix/native-progress-playback-identity` (`5c14b2f`).
+- [x] Merge intro and outro markers independently with AniSkip fallback —
+  `fix/skip-marker-field-merge` (`015ad71`).
+- [x] Keep Skip Outro behavior independent from autoplay —
+  `fix/outro-skip-policy` (`76fb9f4`).
+- [x] Detect natural completion in same-origin embeds and auto-advance once —
+  `fix/embed-natural-end-autoplay` (`c7d83fc`).
+- [x] Publish Watch Next again when the episode, provider, or category changes —
+  `fix/watch-next-content-aware-throttle` (`c311513`).
+- [x] Scope decoder fallback retries to the current stream —
+  `fix/player-decoder-retry-per-stream` (`3a775dc`).
+- [x] Reject stale or duplicate native episode transitions, including double Next —
+  `fix/episode-transition-idempotence` (`fc9a491`).
+- [x] Flush paused, sought, stopped, failed, and disposed embed progress outside the periodic
+  throttle — `fix/embed-progress-finalization` (`a0246e0`).
+- [x] Preserve the paused state when seeking an embed —
+  `fix/embed-seek-preserves-pause` (`be7b44a`).
+- [x] Prevent a late Cast disconnect from restarting local audio after the player screen is gone —
+  `fix/cast-background-disconnect` (`5085e56`).
+- [x] Persist the exact terminal native position before autoplay and accept completion only once —
+  `fix/native-completion-finalization` (`cd2a9ef`).
 
-## Open bug TODO list
+## Audit TODO list
 
 - [ ] KI-001 — Recreate WebViews after their renderer is lost.
-- [ ] KI-002 — Isolate embed callbacks and state for each navigation.
-- [ ] KI-003 — Prevent cancelled resolutions from publishing stale playback state.
+- [x] KI-002 — Isolate embed callbacks and state for each navigation.
+- [x] KI-003 — Prevent cancelled resolutions from publishing stale playback state.
 - [ ] KI-004 — Invalidate profile requests on logout or account changes.
 - [ ] KI-005 — Protect the AniList token from concurrent writes.
 - [ ] KI-006 — Prevent an alarm from being rescheduled while it is being delivered.
@@ -43,15 +73,126 @@ Each branch contains a single commit based directly on `main`.
 - [ ] KI-012 — Serialize settings and remote watchlist writes.
 - [ ] KI-013 — Wait for preferences to load in the release worker.
 - [ ] KI-014 — Implement actual Picture-in-Picture entry.
+- [x] KI-015 — Build episode navigation from the union of every provider catalog.
+- [x] KI-016 — Record history only when playback really starts.
+- [x] KI-017 — Bind native progress callbacks to the exact playback identity.
+- [x] KI-018 — Fall back to AniSkip independently for each missing skip range.
+- [x] KI-019 — Decouple Skip Outro from autoplay and make the last-episode action valid.
+- [x] KI-020 — Handle natural completion and autoplay for observable embeds.
+- [x] KI-021 — Key the Watch Next throttle by episode and source context.
+- [x] KI-022 — Reset the decoder retry decision for each stream.
+- [x] KI-023 — Make native episode transitions stale-safe and idempotent.
+- [x] KI-024 — Persist embed progress on pause, seek, stop, failure, navigation, and teardown.
+- [x] KI-025 — Do not force a paused embed to play after a seek.
+- [x] KI-026 — Keep a late Cast disconnect from reviving background local playback.
+- [x] KI-027 — Commit native completion before autoplay and deduplicate terminal events.
+- [ ] KI-028 — Obtain progress, resume, skip, and end events from cross-origin embeds.
+- [ ] KI-029 — Give the generic web fallback a trustworthy episode and progress identity.
+- [ ] KI-030 — Preserve protected-source headers and external subtitles when casting.
+- [ ] KI-031 — Keep Cast progress, Next, and autoplay alive after the Watch UI is disposed.
+- [ ] KI-032 — Remove a completed final episode from Continue Watching.
+- [ ] KI-033 — Use a monotonic clock for process-local progress throttles.
 - [ ] DOC-001 — Correct the documented SDK version.
 - [ ] DOC-002 — Correct the documented APK name and path.
 
 ## Integration and validation TODO list
 
-- [ ] Integrate the five fix branches into the selected target branch.
-- [ ] Explicitly resolve overlaps between branches that modify the same WebView files.
+- [ ] Integrate the 20 fix branches into the selected target branch.
+- [ ] Resolve the `WatchViewModel.kt` overlap between source resolution, episode union, playback
+  identity, history, skip-marker, Watch Next, and completion branches.
+- [ ] Resolve the `EmbedWebView.kt` overlap between bridge security, lifecycle, navigation,
+  progress finalization, seek, outro policy, and natural-completion branches.
+- [ ] Resolve the `PlayerSurface.kt` / `PlaybackService.kt` overlap between playback identity,
+  transition, decoder retry, completion, outro policy, and Cast lifecycle branches.
 - [ ] Build the app and run unit tests with Android SDK API 36 configured.
-- [ ] Validate player changes, renderer loss, alarms, and account changes on a real device.
+- [ ] Validate rapid A → B episode changes, pause/seek/exit resume, intro/outro, final episode,
+  decoder fallback, Cast connect/disconnect, renderer loss, alarms, and account changes on a real
+  device.
+
+## Playback-core audit summary
+
+- **Player overlap:** the active native and embed surfaces are selected mutually exclusively, so
+  no persistent two-visible-player path was found. Two real lifecycle races could still sound like
+  overlapping players: the hidden Flixcloud resolver could outlive cancellation, and a late Cast
+  disconnect could resume ExoPlayer after leaving Watch. Both now have dedicated fixes.
+- **Last watched episode:** source selection can no longer silently substitute the first episode;
+  merely highlighting an episode on TV no longer writes history; native and embed progress now
+  have identity/finalization fixes on their own branches.
+- **Skip intro/outro:** partial provider markers now use AniSkip for only the missing range. Skip
+  Outro seeks to the end when autoplay is disabled and advances only when autoplay and a next
+  episode are both available; automatic skipping never fires while playback is paused.
+- **Autoplay and transitions:** same-origin embed completion is detected, native terminal events
+  are committed before Next, and duplicate/stale transitions are rejected.
+- **Branch model:** these fixes intentionally remain independent, one commit directly above
+  `main`. Several touch the same player files and must be integrated with the conflict checklist
+  above rather than blindly merged.
+
+## Remaining playback-core bugs
+
+### KI-028 — Cross-origin embeds expose no playback telemetry
+
+- **Priority:** high.
+- **Impact:** resume position, progress saving, intro/outro skipping, natural-end detection, and
+  autoplay remain unavailable when the actual video lives in a cross-origin iframe.
+- **Evidence:** `EmbedWebView` can inspect the main document and same-origin frames only. Browser
+  origin isolation prevents its injected JavaScript from reading a cross-origin `<video>`.
+- **Files:** `ui/watch/EmbedWebView.kt`, provider embed integrations.
+- **Required design:** a cooperative `postMessage` protocol, a provider API/native stream, or an
+  app-controlled player page; this cannot be made reliable by another DOM polling loop.
+
+### KI-029 — The generic web fallback has no reliable episode identity
+
+- **Priority:** high.
+- **Impact:** a user can play an episode on the fallback site while the app cannot safely know
+  which episode owns the progress, so resume/history/autoplay can be missing or misattributed.
+- **Evidence:** the error fallback opens `https://www.miruro.to/info/<animeId>` rather than an
+  episode-specific media item; subsequent selection happens inside the remote page.
+- **File:** `ui/watch/WatchScreen.kt`.
+- **Required design:** use an episode-specific fallback URL plus an authenticated episode/progress
+  bridge, or make the fallback explicitly external and do not claim app-managed resume.
+
+### KI-030 — Cast does not carry every local playback requirement
+
+- **Priority:** high.
+- **Impact:** protected sources may fail on the receiver, and external subtitles may disappear.
+- **Evidence:** local playback configures `Referer`/`Origin` on `DefaultHttpDataSource` and attaches
+  subtitle configurations to the `MediaItem`; a Cast receiver fetches media independently and the
+  default conversion does not reproduce that local HTTP data-source behavior.
+- **Files:** `playback/PlaybackService.kt`, `ui/watch/PlayerSurface.kt`.
+- **Required design:** a custom Cast receiver/converter, an authenticated proxy URL, or providers
+  that do not require sender-only headers.
+
+### KI-031 — Cast progress and navigation are owned by the Watch UI
+
+- **Priority:** high.
+- **Impact:** after leaving Watch while remote playback continues, progress saving and automatic
+  Next stop because the listener and ViewModel that perform those jobs are disposed.
+- **Evidence:** progress polling, `onEnded`, and episode navigation are attached in
+  `PlayerSurface`; `PlaybackService` owns playback but not the anime/episode history workflow.
+- **Files:** `playback/PlaybackService.kt`, `ui/watch/PlayerSurface.kt`,
+  `ui/watch/WatchViewModel.kt`.
+- **Required design:** move durable playback identity, progress persistence, and Cast queue/Next
+  policy into a service-owned coordinator.
+
+### KI-032 — A completed final episode stays in Continue Watching
+
+- **Priority:** medium.
+- **Impact:** finishing the last available episode leaves the title at 100% in Continue Watching,
+  and reopening it can immediately land at the end.
+- **Evidence:** `LibraryStore.updateProgress()` only replaces the one history entry, while
+  `ContinueRail` renders every history entry; no completion path removes or archives a final item.
+- **Files:** `data/library/LibraryStore.kt`, `ui/home/HomeScreen.kt`, player completion paths.
+- **Suggested branch:** `fix/completed-history-cleanup`.
+
+### KI-033 — Wall-clock rollback can freeze progress throttles
+
+- **Priority:** low.
+- **Impact:** if the device clock moves backward, progress and Watch Next updates can be suppressed
+  until wall time catches up.
+- **Evidence:** process-local throttles compare `System.currentTimeMillis()` against their last
+  timestamp. A negative delta still satisfies the “too soon” condition.
+- **Files:** `ui/watch/WatchViewModel.kt`, `data/tv/WatchNextManager.kt`.
+- **Suggested branch:** `fix/monotonic-playback-throttles`.
 
 ## High priority
 
@@ -69,16 +210,18 @@ Each branch contains a single commit based directly on `main`.
 
 ### KI-002 — Callbacks from an old embed modify the new episode
 
+- **Status:** fixed on `fix/embed-navigation-generation` (`3de7291`).
 - **Impact:** progress saved against the wrong episode, false playback errors, or controls and
   timestamps that stop updating after changing episode or quality.
 - **Evidence:** the same `AndroidView` is reused across URLs. `WebProgressBridge` is constructed
   only once and captures the first states created by `remember(url)`, while late ticks and errors
   use the current callbacks and URL. An event from A can therefore be dropped or attributed to B.
 - **Files:** `ui/watch/EmbedWebView.kt`, `ui/watch/WatchScreen.kt`.
-- **Suggested branch:** `fix/embed-navigation-generation`.
+- **Implemented branch:** `fix/embed-navigation-generation`.
 
 ### KI-003 — A cancelled resolution can publish stale playback state
 
+- **Status:** fixed on `fix/playback-resolution-generation` (`e1c5f52`).
 - **Impact:** quickly changing episode or server can jump back to the old episode, incorrectly
   report that no source exists, or mix two provider catalogs.
 - **Evidence:** `MiruroRepository.resolveSources()` wraps suspending calls in `runCatching`
@@ -86,7 +229,7 @@ Each branch contains a single commit based directly on `main`.
   then still writes to `spine`, `mergedIncludesAnivexa`, and global state without checking an ID
   or request generation.
 - **Files:** `data/MiruroRepository.kt`, `ui/watch/WatchViewModel.kt`.
-- **Suggested branch:** `fix/playback-resolution-generation`.
+- **Implemented branch:** `fix/playback-resolution-generation`.
 
 ### KI-004 — A profile request can complete after logout
 
