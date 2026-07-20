@@ -534,13 +534,38 @@ class WatchViewModel : ViewModel() {
     }
 
     private var lastProgressSave = 0L
+    private var lastKnownPositionMs = 0L
+    private var lastKnownDurationMs = 0L
+    private var lastKnownNumber: Double? = null
+
     fun onProgress(positionMs: Long, durationMs: Long) {
         val data = (_state.value as? UiState.Success)?.data ?: return
+        lastKnownPositionMs = positionMs
+        lastKnownDurationMs = durationMs
+        lastKnownNumber = data.current.number
         maybeSyncAniListProgress(data.current.number, positionMs, durationMs)
         val now = System.currentTimeMillis()
         if (now - lastProgressSave < 8_000) return
         lastProgressSave = now
         LibraryStore.updateProgress(anilistId, data.current.number, positionMs, durationMs)
+    }
+
+    /**
+     * TV tears the inline player down when leaving fullscreen. Persist the position it reached —
+     * bypassing the periodic-save throttle — and fold it into [WatchData.startPositionMs], so the
+     * next play (fullscreen pill, the inline play button, or re-picking the same episode chip)
+     * resumes there instead of restarting from the stale resolve-time position.
+     */
+    fun commitPlaybackPosition() {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        val number = lastKnownNumber ?: return
+        if (number != data.current.number || lastKnownPositionMs <= 0) return
+        lastProgressSave = System.currentTimeMillis()
+        LibraryStore.updateProgress(anilistId, number, lastKnownPositionMs, lastKnownDurationMs)
+        DiagnosticsLog.event(
+            "Watch commit position episode=${fmt(number)} positionMs=$lastKnownPositionMs",
+        )
+        _state.value = UiState.Success(data.copy(startPositionMs = lastKnownPositionMs))
     }
 
     private fun maybeSyncAniListProgress(episodeNumber: Double, positionMs: Long, durationMs: Long) {
@@ -681,6 +706,12 @@ class WatchViewModel : ViewModel() {
     private fun launchSourceValidation(number: Double) {
         sourceValidationJob?.cancel()
         sourceValidationJob = viewModelScope.launch {
+            // TV sticks have ~1GB RAM and validation is heavy (scraper networking plus Flixcloud
+            // WebView loads) — running it eagerly at 4-way concurrency alongside 1080p playback
+            // contributed to low-memory kills mid-episode. Give playback a head start and go
+            // one server at a time there.
+            val validationConcurrency = if (AppGraph.isTv) 1 else SOURCE_VALIDATION_CONCURRENCY
+            if (AppGraph.isTv) kotlinx.coroutines.delay(10_000)
             val candidates = availableSourceOptions(mergedEpisodes, number).filter { option ->
                 val key = EpisodeSourceKey(number, option.provider, option.category)
                 key !in confirmedSources && key !in unavailableSources
@@ -698,7 +729,7 @@ class WatchViewModel : ViewModel() {
                 _state.value = UiState.Success(initial.copy(isLoadingMoreSources = true))
             }
             val providerNames = mergedEpisodes.providerNames.toSet()
-            candidates.chunked(SOURCE_VALIDATION_CONCURRENCY).forEachIndexed { batchIndex, batch ->
+            candidates.chunked(validationConcurrency).forEachIndexed { batchIndex, batch ->
                 val results = batch.map { option ->
                     async {
                         val resolution = runCatching {
@@ -734,7 +765,7 @@ class WatchViewModel : ViewModel() {
                 }
                 val data = (_state.value as? UiState.Success)?.data ?: return@launch
                 if (data.current.number != number) return@launch
-                val hasMore = (batchIndex + 1) * SOURCE_VALIDATION_CONCURRENCY < candidates.size
+                val hasMore = (batchIndex + 1) * validationConcurrency < candidates.size
                 _state.value = UiState.Success(
                     data.copy(
                         sourceOptions = sourceOptions(number),

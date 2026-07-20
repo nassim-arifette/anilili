@@ -2,6 +2,9 @@ package com.miruronative.playback
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.res.Configuration
+import android.os.Build
+import android.view.KeyEvent
 import android.webkit.WebSettings
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
@@ -77,8 +80,22 @@ class PlaybackService : MediaSessionService() {
             FlixcloudPlaylistDataSource(cacheDataSource.createDataSource()) { activePlaylistKey }
         }
 
+        // Fire TV sticks have ~1GB of RAM and were getting killed by the low-memory killer mid
+        // episode: ExoPlayer's default ~50s buffer of 1080p HLS plus the app's WebViews exceed
+        // what the OS tolerates. A 30s cap keeps the buffer's memory (and network bursts)
+        // proportionate to the device; phones keep the defaults.
+        val isTvDevice = (getSystemService(UI_MODE_SERVICE) as? android.app.UiModeManager)
+            ?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
+        val loadControl = if (isTvDevice) {
+            androidx.media3.exoplayer.DefaultLoadControl.Builder()
+                .setBufferDurationsMs(10_000, 30_000, 1_500, 3_000)
+                .build()
+        } else {
+            androidx.media3.exoplayer.DefaultLoadControl.Builder().build()
+        }
         player = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(playbackDataSource))
+            .setLoadControl(loadControl)
             .setSeekBackIncrementMs(10_000)
             .setSeekForwardIncrementMs(10_000)
             .build()
@@ -100,6 +117,10 @@ class PlaybackService : MediaSessionService() {
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
                         DiagnosticsLog.event("PlaybackService player isPlaying=$isPlaying")
                         PlaybackStatus.update(isPlaying)
+                        // Any playback that actually starts (notification play, in-app play)
+                        // re-arms the media buttons; the suppression only covers the window
+                        // between the lifecycle pause and the next deliberate start.
+                        if (isPlaying) allowMediaButtonResume()
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
@@ -183,6 +204,36 @@ class PlaybackService : MediaSessionService() {
 
         session = MediaSession.Builder(this, episodeAwarePlayer)
             .setSessionActivity(sessionActivity(null))
+            .setCallback(object : MediaSession.Callback {
+                // A paused-but-loaded session normally resumes on any KEYCODE_MEDIA_PLAY —
+                // including ones a Bluetooth headset or car fires on reconnect, which made
+                // paused audio restart in the background "by itself". While the app is
+                // backgrounded after a lifecycle pause, ignore media-button play; the
+                // notification's own play action arrives as a controller command (not a key
+                // event), so deliberate resumes still work.
+                override fun onMediaButtonEvent(
+                    session: MediaSession,
+                    controllerInfo: MediaSession.ControllerInfo,
+                    intent: Intent,
+                ): Boolean {
+                    val key = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+                    }
+                    val isResumeKey = key?.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
+                        key?.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+                        key?.keyCode == KeyEvent.KEYCODE_HEADSETHOOK
+                    if (isResumeKey && suppressMediaButtonResume && !castPlayer.isPlaying) {
+                        DiagnosticsLog.event(
+                            "PlaybackService ignored background media-button resume key=${key?.keyCode}",
+                        )
+                        return true
+                    }
+                    return super.onMediaButtonEvent(session, controllerInfo, intent)
+                }
+            })
             .build()
         session.setMediaButtonPreferences(
             listOf(
@@ -265,6 +316,9 @@ class PlaybackService : MediaSessionService() {
             }
         }
 
+        @Volatile
+        private var suppressMediaButtonResume = false
+
         /** Pause playback when the app is backgrounded while keeping the current media loaded. */
         fun pauseActivePlayback() {
             DiagnosticsLog.event("PlaybackService.pauseActivePlayback")
@@ -274,6 +328,14 @@ class PlaybackService : MediaSessionService() {
                 return
             }
             active.pause()
+            // The media stays loaded so the notification can resume it, but stray media-button
+            // events (Bluetooth reconnects) must not restart it while the app is away.
+            suppressMediaButtonResume = true
+        }
+
+        /** The app is visible again (or playback deliberately restarted): buttons act normally. */
+        fun allowMediaButtonResume() {
+            suppressMediaButtonResume = false
         }
 
         /** Applies per-provider headers before Media3 creates manifest and segment data sources. */

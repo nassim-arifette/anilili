@@ -41,6 +41,24 @@ object PipeBridge {
     )
 
     private val main = Handler(Looper.getMainLooper())
+
+    /**
+     * The hidden tab hosts the full miruro SPA, whose scripts/animations otherwise run for the
+     * whole session — on a Fire TV stick its software-layer draws even stalled the main thread
+     * for seconds. Idle (View.onPause) the WebView when no pipe request has needed it for a
+     * while; each fetch resumes it first. The CF session/cookies survive onPause just fine.
+     */
+    private const val IDLE_AFTER_MS = 60_000L
+    private val idleRunnable = Runnable {
+        webView?.onPause()
+        DiagnosticsLog.event("PipeBridge webview idled")
+    }
+
+    private fun scheduleIdle() {
+        main.removeCallbacks(idleRunnable)
+        main.postDelayed(idleRunnable, IDLE_AFTER_MS)
+    }
+
     @Volatile private var webView: WebView? = null
     @Volatile private var ready = CompletableDeferred<Boolean>()
     @Volatile private var originIndex = 0
@@ -92,7 +110,13 @@ object PipeBridge {
                 Log.d(TAG, "onPageFinished: $url  title=${view?.title}")
                 // Give Cloudflare a moment to settle, then allow fetches.
                 if (url != null && url.startsWith(activeOrigin)) {
-                    main.postDelayed({ if (!ready.isCompleted) ready.complete(true) }, 2000)
+                    main.postDelayed(
+                        {
+                            if (!ready.isCompleted) ready.complete(true)
+                            scheduleIdle()
+                        },
+                        2000,
+                    )
                 }
             }
 
@@ -134,6 +158,7 @@ object PipeBridge {
     fun detach(wv: WebView) {
         if (webView !== wv) return
         DiagnosticsLog.event("PipeBridge.detach")
+        main.removeCallbacks(idleRunnable)
         webView = null
         ready = CompletableDeferred()
         pending.entries.toList().forEach { (id, request) ->
@@ -184,7 +209,10 @@ object PipeBridge {
             if (wv == null) {
                 pending.remove(id)?.complete("""{"ok":false,"status":-1,"error":"webview not ready"}""")
             } else {
+                main.removeCallbacks(idleRunnable)
+                wv.onResume()
                 wv.evaluateJavascript(js, null)
+                scheduleIdle()
             }
         }
 

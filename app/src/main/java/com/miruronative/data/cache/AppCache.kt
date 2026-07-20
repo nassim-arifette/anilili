@@ -133,6 +133,16 @@ class AppCache(
         return read(key) != null
     }
 
+    /** Fresh-only read: the decoded value when [key] exists and hasn't expired, else null. */
+    suspend fun <T> getIfFresh(key: String, serializer: KSerializer<T>): T? {
+        val now = System.currentTimeMillis()
+        val entry = read(key) ?: return null
+        if (now > entry.expiresAt) return null
+        val value = decode(entry, serializer) ?: return null
+        touch(entry, now)
+        return value
+    }
+
     suspend fun putBatch(entries: Map<String, String>, ttlMs: Long) {
         val now = System.currentTimeMillis()
         val cacheEntries = entries.map { (key, jsonString) ->

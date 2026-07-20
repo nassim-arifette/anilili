@@ -66,17 +66,41 @@ private class TvImeBridge(private val webView: WebView) {
     private val imm: InputMethodManager?
         get() = webView.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
 
+    private var lastShowRequestMs = 0L
+    private val hideRunnable = Runnable {
+        imm?.hideSoftInputFromWindow(webView.windowToken, 0)
+    }
+
+    private fun requestShow() {
+        webView.requestFocus()
+        imm?.showSoftInput(webView, 0)
+    }
+
     @JavascriptInterface
     fun onEditableFocused() {
         webView.post {
-            webView.requestFocus()
-            imm?.showSoftInput(webView, 0)
+            webView.removeCallbacks(hideRunnable)
+            lastShowRequestMs = android.os.SystemClock.uptimeMillis()
+            requestShow()
+            // TV boxes routinely drop the first request while the IME process spins up, and the
+            // opening IME window can steal focus from the WebView for a frame; re-assert both so
+            // the keyboard that appeared doesn't immediately dismiss itself.
+            webView.postDelayed({ if (webView.isAttachedToWindow) requestShow() }, 250)
+            webView.postDelayed({ if (webView.isAttachedToWindow) requestShow() }, 700)
         }
     }
 
     @JavascriptInterface
     fun onEditableBlurred() {
-        webView.post { imm?.hideSoftInputFromWindow(webView.windowToken, 0) }
+        webView.post {
+            // The IME opening (or the login page re-rendering its form) fires a transient
+            // focusout right after we asked to show — honoring that blur is what made the
+            // keyboard flash open and close on TV. Only hide for a blur that is neither the
+            // echo of a fresh show request nor immediately followed by another editable focus.
+            if (android.os.SystemClock.uptimeMillis() - lastShowRequestMs < 1500) return@post
+            webView.removeCallbacks(hideRunnable)
+            webView.postDelayed(hideRunnable, 400)
+        }
     }
 }
 @SuppressLint("SetJavaScriptEnabled")

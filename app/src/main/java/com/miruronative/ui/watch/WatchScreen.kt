@@ -12,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -80,7 +81,6 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
@@ -139,10 +139,15 @@ fun WatchScreen(
     val currentOnBack by rememberUpdatedState(onBack)
     var embeddedPlaybackStopper by remember { mutableStateOf<(() -> Unit)?>(null) }
     val currentEmbeddedPlaybackStopper by rememberUpdatedState(embeddedPlaybackStopper)
+    // YouTube-style leave: native playback PAUSES (media stays loaded, so the notification can
+    // resume it and re-entering the episode continues in place); the position is committed past
+    // the periodic-save throttle so "continue watching" lands exactly where the user left off.
+    // Embeds still stop — their WebView dies with this screen, so there is nothing to resume.
     val pauseAndBack = remember {
         {
             currentEmbeddedPlaybackStopper?.invoke()
-            PlaybackService.stopActivePlayback()
+            vm.commitPlaybackPosition()
+            PlaybackService.pauseActivePlayback()
             currentOnBack()
         }
     }
@@ -206,12 +211,15 @@ fun WatchScreen(
     BackHandler(enabled = fullscreen) { fullscreen = false }
     BackHandler(enabled = !fullscreen) { pauseAndBack() }
 
-    // Stop however the screen is left (back, Anime page, notification nav) — not just the
+    // Pause however the screen is left (back, Anime page, notification nav) — not just the
     // Back gesture. PiP keeps this screen composed, so picture-in-picture is unaffected.
+    // Pause rather than stop: the loaded session powers the notification's resume button,
+    // and background media-button events are suppressed so it can't restart by itself.
     DisposableEffect(Unit) {
         onDispose {
             currentEmbeddedPlaybackStopper?.invoke()
-            PlaybackService.stopActivePlayback()
+            vm.commitPlaybackPosition()
+            PlaybackService.pauseActivePlayback()
         }
     }
 
@@ -292,6 +300,7 @@ fun WatchScreen(
                     onProgress = vm::onProgress,
                     onPlaybackError = vm::onPlaybackError,
                     onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
+                    onPlayerClosed = vm::commitPlaybackPosition,
                 )
             }
         }
@@ -316,9 +325,9 @@ private fun WatchContent(
     onProgress: (Long, Long) -> Unit,
     onPlaybackError: (String, String, Long) -> Unit,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
+    onPlayerClosed: () -> Unit = {},
 ) {
     val device = LocalAppDeviceProfile.current
-    val configuration = LocalConfiguration.current
     val summaryFocus = remember { FocusRequester() }
     val sourceFocus = remember { FocusRequester() }
     val tvEpisodeListState = rememberLazyListState()
@@ -355,22 +364,30 @@ private fun WatchContent(
         }
     }
 
-    Column(Modifier.fillMaxSize()) {
+    // Fullscreen draws edge-to-edge; otherwise the player must stay clear of the status bar so
+    // the clock/battery icons never overlap the video, and its size must come from the actual
+    // constraints this screen was given (not LocalConfiguration, which ignores multi-window and
+    // navigation rails) so the video always fits the space it really has.
+    BoxWithConstraints(
+        Modifier
+            .fillMaxSize()
+            .then(if (fullscreen) Modifier else Modifier.statusBarsPadding()),
+    ) {
+        val availableWidthDp = maxWidth
+        val availableHeightDp = maxHeight
+        Column(Modifier.fillMaxSize()) {
         val playerModifier = if (fullscreen) {
             Modifier.fillMaxSize()
         } else {
-            val naturalHeightDp = configuration.screenWidthDp * 9f / 16f
-            val landscape = configuration.screenWidthDp > configuration.screenHeightDp
+            val naturalHeight = availableWidthDp * 9f / 16f
+            val landscape = availableWidthDp > availableHeightDp
             val maxHeightFraction = when {
                 device.isTv -> 0.56f
                 landscape -> 0.66f
-                else -> 1f
+                else -> 0.62f
             }
-            val playerHeightDp = minOf(
-                naturalHeightDp,
-                configuration.screenHeightDp * maxHeightFraction,
-            )
-            Modifier.fillMaxWidth().height(playerHeightDp.dp)
+            val playerHeight = minOf(naturalHeight, availableHeightDp * maxHeightFraction)
+            Modifier.fillMaxWidth().height(playerHeight)
         }
         // In the TV grid the Android player/WebView must not join the Compose focus graph: some
         // embeds retain native focus even after the ring moves, producing two remote owners.
@@ -383,19 +400,68 @@ private fun WatchContent(
         }
         Box(playerModifier.then(playerFocusModifier).background(Color.Black)) {
             val stream = data.chosenStream
-            key(data.provider, data.category, data.current.number, stream?.url, data.playbackGeneration) {
+            // Key on the KIND of player only, never per-episode/per-url: recreating PlayerSurface
+            // for every Next tore down and rebuilt the PlayerView + MediaController each episode
+            // (the new view was even created before the old one released). On weak TV hardware
+            // (Fire TV's OMX.MS.AVC decoder, 192MB heap) that churn froze the UI for seconds and
+            // could wedge the video decoder while audio played on. Both PlayerSurface and
+            // EmbedWebView already handle stream-url changes internally, reusing the surface,
+            // codec chain, and controller connection.
+            val playerKind = when {
+                device.isTv && !fullscreen -> "tv-idle"
+                stream == null -> "none"
+                stream.isEmbed || ProviderCatalog.isEmbed(data.provider) -> "embed"
+                else -> "native"
+            }
+            key(playerKind) {
                 when {
                     device.isTv && !fullscreen -> {
-                        // Keep native PlayerView/WebView focus out of the TV episode grid. The
-                        // explicit Fullscreen pill below creates the player when the user asks.
-                        LaunchedEffect(stream?.url) { PlaybackService.stopActivePlayback() }
+                        // Keep native PlayerView/WebView focus out of the TV episode grid: the
+                        // player only exists in fullscreen. Leaving fullscreen stops playback, so
+                        // first bank the position it reached — every resume path reads it.
+                        LaunchedEffect(stream?.url) {
+                            PlaybackService.stopActivePlayback()
+                            onPlayerClosed()
+                        }
+                        // A real focusable play button (not a decoration): Fire TV users expect
+                        // to click play here to continue watching, which re-enters fullscreen.
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Icon(
-                                Icons.Default.PlayArrow,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(54.dp),
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .semantics {
+                                        contentDescription = "Play"
+                                        onClick(label = "Play") {
+                                            onToggleFullscreen()
+                                            true
+                                        }
+                                    }
+                                    .onPreviewKeyEvent { event ->
+                                        val keyCode = event.nativeKeyEvent.keyCode
+                                        val activate = keyCode == AndroidKeyEvent.KEYCODE_DPAD_CENTER ||
+                                            keyCode == AndroidKeyEvent.KEYCODE_ENTER ||
+                                            keyCode == AndroidKeyEvent.KEYCODE_NUMPAD_ENTER
+                                        if (!activate) {
+                                            false
+                                        } else {
+                                            if (event.type == KeyEventType.KeyUp) onToggleFullscreen()
+                                            true
+                                        }
+                                    }
+                                    .focusHighlight(CircleShape)
+                                    .clip(CircleShape)
+                                    .background(Color.White.copy(alpha = 0.14f))
+                                    .clickable(onClick = onToggleFullscreen)
+                                    .focusable()
+                                    .size(72.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    Icons.Default.PlayArrow,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(46.dp),
+                                )
+                            }
                         }
                     }
                     stream == null -> NoSource(onWebFallback)
@@ -482,7 +548,7 @@ private fun WatchContent(
             if (!fullscreen) BackButton(onBack, Modifier.align(Alignment.TopStart))
         }
 
-        if (fullscreen) return
+        if (fullscreen) return@Column
 
         if (!device.isTv) {
             MobileWatchDetails(
@@ -558,6 +624,7 @@ private fun WatchContent(
                 }
             }
             item { Spacer(Modifier.height(24.dp)) }
+        }
         }
     }
 }

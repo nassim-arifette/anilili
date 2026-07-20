@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
@@ -73,6 +74,8 @@ import androidx.media3.common.ViewProvider
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.cast.MediaRouteButtonFactory
 import androidx.mediarouter.app.MediaRouteButton
+import androidx.mediarouter.media.MediaRouter
+import com.google.android.gms.cast.framework.CastContext
 import androidx.mediarouter.app.MediaRouteChooserDialog
 import androidx.mediarouter.app.MediaRouteChooserDialogFragment
 import androidx.mediarouter.app.MediaRouteControllerDialog
@@ -254,6 +257,11 @@ fun PlayerSurface(
     var nextStartPositionMs by remember(stream.url) { mutableLongStateOf(startPositionMs) }
     var playbackIsPlaying by remember { mutableStateOf(false) }
     var tracksRevision by remember { mutableIntStateOf(0) }
+    // One same-stream retry at a capped resolution before giving the provider up: weak TV
+    // decoders (Fire TV's OMX.MS.AVC) can die on 1080p with a codec error even though the
+    // format is nominally supported, and a provider failover for a device-side decode hiccup
+    // needlessly restarts the episode on another server.
+    var decoderRetryDone by remember(stream.url) { mutableStateOf(false) }
     val nativeQualityStreams = remember(stream.url, qualityStreams) {
         (listOf(stream) + qualityStreams)
             .filterNot(StreamItem::isEmbed)
@@ -302,6 +310,8 @@ fun PlayerSurface(
                         "PlayerSurface playbackState=${playbackState.stateName()} " +
                             "mediaId=${activeController.currentMediaItem?.mediaId?.take(120) ?: "none"}",
                     )
+                    // The default-quality effect waits for READY; re-trigger it when we get there.
+                    if (playbackState == Player.STATE_READY) tracksRevision++
                     if (playbackState == Player.STATE_ENDED) onEnded()
                 }
 
@@ -312,6 +322,22 @@ fun PlayerSurface(
 
                 override fun onPlayerError(error: PlaybackException) {
                     DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
+                    if (error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED && !decoderRetryDone) {
+                        decoderRetryDone = true
+                        val resumeAt = activeController.currentPosition.coerceAtLeast(0L)
+                        activeController.trackSelectionParameters = activeController.trackSelectionParameters
+                            .buildUpon()
+                            .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                            .setMaxVideoSize(1280, 720)
+                            .build()
+                        activeController.prepare()
+                        activeController.seekTo(resumeAt)
+                        activeController.play()
+                        DiagnosticsLog.event(
+                            "PlayerSurface decoder failed; retrying same stream capped at 720p resumeMs=$resumeAt",
+                        )
+                        return
+                    }
                     currentOnError(
                         error.localizedMessage ?: "Playback failed",
                         activeController.currentMediaItem?.mediaId.orEmpty(),
@@ -554,6 +580,10 @@ fun PlayerSurface(
         // The controller is persistent across episodes, so its tracks may still describe the
         // previous media item; only apply once it is actually reporting this stream.
         if (activeController.currentMediaItem?.mediaId != activeStream.url) return@LaunchedEffect
+        // Never force a track override mid-preparation: on weak TV decoders a codec reconfigure
+        // during the initial BUFFERING is exactly where OMX implementations wedge. Let playback
+        // reach READY on the ABR pick first; the state listener re-triggers this effect then.
+        if (activeController.playbackState != Player.STATE_READY) return@LaunchedEffect
         val heights = availableVideoHeights(activeController, nativeQualityStreams)
         val target = defaultQuality.pickHeight(heights) ?: return@LaunchedEffect
         defaultQualityApplied = true
@@ -562,6 +592,8 @@ fun PlayerSurface(
         )
         changeVideoHeight(activeController, target)
     }
+    // The speed to restore once a hold-for-2x gesture ends (the user's chosen playback speed).
+    var preHoldSpeed by remember { mutableStateOf(1f) }
     var seekFlash by remember { mutableIntStateOf(0) } // -10 / +10, 0 = hidden
     var seekFlashTick by remember { mutableIntStateOf(0) }
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
@@ -730,6 +762,15 @@ fun PlayerSurface(
                         seekFlash = -10
                     }
                     seekFlashTick++
+                },
+                onHoldSpeed = { active ->
+                    val activeController = controller ?: return@PlayerGestureControls
+                    if (active) {
+                        preHoldSpeed = activeController.playbackParameters.speed
+                        activeController.setPlaybackSpeed(2f)
+                    } else {
+                        activeController.setPlaybackSpeed(preHoldSpeed)
+                    }
                 },
             )
         }
@@ -993,21 +1034,85 @@ private fun toggleSubtitles(controller: MediaController, trackNameProvider: Defa
  * The Cast button as a Compose element. Media3's own controller is off, so we inflate the
  * MediaRouteButton ourselves (with the AppCompat-derived theme its dialogs require) and place it
  * in the custom control bar.
+ *
+ * Two behaviors behind one icon:
+ * - While Chromecast endpoints exist on the network, this is the real MediaRouteButton with its
+ *   chooser/controller dialogs. A discovery callback keeps scanning active the whole time the
+ *   control bar is visible — without it, MediaRouter only scans passively and nearby devices
+ *   can take a long time (or forever) to appear in the chooser.
+ * - When there are none — most TVs only speak the system's Miracast/"Smart View" cast, not
+ *   Google Cast — the icon opens the phone's native cast picker instead of a dead chooser, so
+ *   the user can mirror the whole screen to the TVs their phone already finds.
  */
 @OptIn(UnstableApi::class)
 @Composable
 private fun CastButton(modifier: Modifier = Modifier) {
-    AndroidView(
-        modifier = modifier,
-        factory = { ctx ->
-            val themed = ContextThemeWrapper(ctx, R.style.Theme_MiruroNative_MediaRouter)
-            val button = LayoutInflater.from(themed)
-                .inflate(androidx.media3.cast.R.layout.media_route_button_view, null, false) as MediaRouteButton
-            button.setDialogFactory(ThemedMediaRouteDialogFactory())
-            runCatching { MediaRouteButtonFactory.setUpMediaRouteButton(ctx, button) }
-            button
-        },
+    val context = LocalContext.current
+    val router = remember(context) { runCatching { MediaRouter.getInstance(context) }.getOrNull() }
+    val selector = remember(context) {
+        runCatching { CastContext.getSharedInstance(context).mergedSelector }.getOrNull()
+    }
+    var castRoutesAvailable by remember { mutableStateOf(false) }
+
+    DisposableEffect(router, selector) {
+        if (router == null || selector == null) {
+            castRoutesAvailable = false
+            onDispose { }
+        } else {
+            fun refresh() {
+                castRoutesAvailable = router.isRouteAvailable(
+                    selector,
+                    MediaRouter.AVAILABILITY_FLAG_IGNORE_DEFAULT_ROUTE,
+                )
+            }
+            val callback = object : MediaRouter.Callback() {
+                override fun onRouteAdded(router: MediaRouter, route: MediaRouter.RouteInfo) = refresh()
+                override fun onRouteRemoved(router: MediaRouter, route: MediaRouter.RouteInfo) = refresh()
+                override fun onRouteChanged(router: MediaRouter, route: MediaRouter.RouteInfo) = refresh()
+            }
+            router.addCallback(selector, callback, MediaRouter.CALLBACK_FLAG_REQUEST_DISCOVERY)
+            refresh()
+            onDispose { router.removeCallback(callback) }
+        }
+    }
+
+    if (castRoutesAvailable) {
+        AndroidView(
+            modifier = modifier,
+            factory = { ctx ->
+                val themed = ContextThemeWrapper(ctx, R.style.Theme_MiruroNative_MediaRouter)
+                val button = LayoutInflater.from(themed)
+                    .inflate(androidx.media3.cast.R.layout.media_route_button_view, null, false) as MediaRouteButton
+                button.setDialogFactory(ThemedMediaRouteDialogFactory())
+                runCatching { MediaRouteButtonFactory.setUpMediaRouteButton(ctx, button) }
+                button
+            },
+        )
+    } else {
+        androidx.compose.material3.IconButton(
+            onClick = { openSystemCastPicker(context) },
+            modifier = modifier,
+        ) {
+            androidx.compose.material3.Icon(
+                Icons.Default.Cast,
+                contentDescription = "Cast to TV",
+                tint = Color.White,
+            )
+        }
+    }
+}
+
+/** The phone's native cast/mirror picker; OEMs hang it off different settings actions. */
+private fun openSystemCastPicker(context: Context) {
+    val candidates = listOf(
+        android.content.Intent(android.provider.Settings.ACTION_CAST_SETTINGS),
+        android.content.Intent("android.settings.WIFI_DISPLAY_SETTINGS"),
+        android.content.Intent(android.provider.Settings.ACTION_WIRELESS_SETTINGS),
     )
+    for (intent in candidates) {
+        if (runCatching { context.startActivity(intent) }.isSuccess) return
+    }
+    DiagnosticsLog.event("CastButton no system cast settings activity found")
 }
 
 /** Heights offered by the loaded tracks plus any alternate per-quality source streams. */

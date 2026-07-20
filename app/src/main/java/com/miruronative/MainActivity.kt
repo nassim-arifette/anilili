@@ -180,6 +180,7 @@ class MainActivity : FragmentActivity() {
     override fun onStart() {
         super.onStart()
         DiagnosticsLog.event("MainActivity.onStart")
+        PlaybackService.allowMediaButtonResume()
     }
 
     override fun onResume() {
@@ -586,14 +587,16 @@ private fun AppNavHost(
                     onAnimeClick = { relatedId ->
                         if (relatedId != id) nav.navigate(Routes.detail(relatedId))
                     },
-                    onPlay = { provider, category, episode ->
+                    onPlay = { playId, provider, category, episode ->
                         // TV: Watch lands on the episode grid (playback starts inline) so the
                         // user picks an episode; going straight to fullscreen autoplay left no
                         // way to choose one. Phones keep the direct-to-player behavior.
+                        // playId may be another season of the same series — the detail page
+                        // hosts the whole chain and its Episodes tab filters between seasons.
                         if (deviceProfile.isTv) {
-                            nav.navigate(Routes.episodes(id, provider, category, episode))
+                            nav.navigate(Routes.episodes(playId, provider, category, episode))
                         } else {
-                            nav.navigate(Routes.watch(id, provider, category, episode))
+                            nav.navigate(Routes.watch(playId, provider, category, episode))
                         }
                     },
                     onSeasonWatch = { seasonId ->

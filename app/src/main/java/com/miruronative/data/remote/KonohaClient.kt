@@ -8,6 +8,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.intOrNull
@@ -22,6 +23,17 @@ internal data class CachedMapping(
 @Serializable
 private data class KonohaMappingResponse(
     val anilist_id: Int,
+)
+
+/** One episode from Konoha's per-anime `episodes.json` (TMDB-backed titles and stills). */
+@Serializable
+data class KonohaEpisode(
+    val number: Double? = null,
+    val title: String? = null,
+    val overview: String? = null,
+    val air_date: String? = null,
+    val still: String? = null,
+    val runtime: Int? = null,
 )
 
 class KonohaClient(
@@ -85,6 +97,36 @@ class KonohaClient(
         }
     }
 
+    /**
+     * Episode metadata (titles, thumbnails, synopses) for one AniList id from the Konoha CDN.
+     * Zero rate limits and ~CDN latency, so the detail page can show a full episode list
+     * instantly. Empty when Konoha doesn't know the title or on any failure.
+     */
+    suspend fun episodes(anilistId: Int): List<KonohaEpisode> = withContext(Dispatchers.IO) {
+        cache.getOrFetch(
+            key = "konohaeps:v1:$anilistId",
+            serializer = ListSerializer(KonohaEpisode.serializer()),
+            ttlMs = EPISODES_TTL_MS,
+        ) {
+            val shard = anilistId / 1000
+            val url = "https://cdn.jsdelivr.net/gh/AlokRepo/Konoha@main/data/anime/$shard/$anilistId/episodes.json"
+            val request = Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .build()
+            client.newCall(request).execute().use { response ->
+                when {
+                    response.code == 404 -> emptyList()
+                    !response.isSuccessful -> error("Konoha HTTP ${response.code}")
+                    else -> json.decodeFromString(
+                        ListSerializer(KonohaEpisode.serializer()),
+                        response.body?.string().orEmpty(),
+                    )
+                }
+            }
+        }
+    }
+
     private fun loadAssetMap(): Map<Int, Int> {
         malToAnilistMap?.let { return it }
         return synchronized(this) {
@@ -112,5 +154,7 @@ class KonohaClient(
 
     private companion object {
         const val TTL_HIT_MS = 30L * 24 * 60 * 60 * 1000 // 30 days
+        /** Airing shows gain an episode weekly; six hours keeps lists fresh without re-fetching. */
+        const val EPISODES_TTL_MS = 6L * 60 * 60 * 1000
     }
 }

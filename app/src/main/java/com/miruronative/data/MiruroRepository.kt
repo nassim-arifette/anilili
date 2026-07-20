@@ -23,6 +23,7 @@ import com.miruronative.data.remote.AniSkipClient
 import com.miruronative.data.remote.AnivexaClient
 import com.miruronative.data.remote.JikanClient
 import com.miruronative.data.remote.KonohaClient
+import com.miruronative.data.remote.KonohaEpisode
 import com.miruronative.data.remote.MalClient
 import com.miruronative.data.remote.MediaListProgressSnapshot
 import com.miruronative.data.remote.PipeClient
@@ -336,8 +337,35 @@ class MiruroRepository(
         forceRefresh = force,
     ) { aniList.animeInfo(id) }
 
+    /** Konoha CDN episode metadata (titles, thumbnails); empty when unknown or on failure. */
+    suspend fun konohaEpisodes(anilistId: Int): List<KonohaEpisode> =
+        runCatching { konoha.episodes(anilistId) }
+            .onFailure { DiagnosticsLog.throwable("Konoha episodes failed id=$anilistId", it) }
+            .getOrDefault(emptyList())
+
     /** Walks AniList's PREQUEL/SEQUEL chain so every season is reachable from one detail page. */
-    suspend fun animeSeries(root: Media): List<Media> = coroutineScope {
+    suspend fun animeSeries(root: Media): List<Media> {
+        // Season chains change rarely, so the walked chain's ids are cached under EVERY member
+        // id: whichever season's page the user opens, the full series hydrates instantly from
+        // the animeInfo cache (filled during the walk) instead of re-walking AniList relations.
+        val idsSerializer = ListSerializer(Int.serializer())
+        cache.getIfFresh("$SERIES_KEY_PREFIX${root.id}", idsSerializer)?.let { ids ->
+            val members = ids.mapNotNull { id ->
+                if (id == root.id) root else runCatching { animeInfo(id) }.getOrNull()
+            }
+            if (members.isNotEmpty()) {
+                val withRoot = if (members.none { it.id == root.id }) members + root else members
+                return withRoot.sortedWith(SERIES_AIRING_ORDER)
+            }
+        }
+
+        val chain = walkSeriesChain(root)
+        val payload = kotlinx.serialization.json.Json.encodeToString(idsSerializer, chain.map(Media::id))
+        cache.putBatch(chain.associate { "$SERIES_KEY_PREFIX${it.id}" to payload }, INFO_TTL)
+        return chain
+    }
+
+    private suspend fun walkSeriesChain(root: Media): List<Media> = coroutineScope {
         val found = linkedMapOf(root.id to root)
         val expanded = mutableSetOf<Int>()
         var frontier = listOf(root)
@@ -374,14 +402,7 @@ class MiruroRepository(
             depth++
         }
 
-        found.values.sortedWith(
-            compareBy<Media>(
-                { it.startDate?.year ?: it.seasonYear ?: Int.MAX_VALUE },
-                { it.startDate?.month ?: Int.MAX_VALUE },
-                { it.startDate?.day ?: Int.MAX_VALUE },
-                { it.id },
-            ),
-        )
+        found.values.sortedWith(SERIES_AIRING_ORDER)
     }
 
     // ---- streaming (two backends, cached per source) ----
@@ -594,8 +615,17 @@ class MiruroRepository(
         const val FILLER_FETCH_TIMEOUT_MS = 3_500L
         const val INFO_TTL = 24L * 60 * 60 * 1000
         const val OPTIONS_TTL = 7L * 24 * 60 * 60 * 1000
+        const val SERIES_KEY_PREFIX = "series:v1:"
     }
 }
+
+/** Chronological airing order shared by the series walk and the instant relation-based seed. */
+internal val SERIES_AIRING_ORDER: Comparator<Media> = compareBy(
+    { it.startDate?.year ?: it.seasonYear ?: Int.MAX_VALUE },
+    { it.startDate?.month ?: Int.MAX_VALUE },
+    { it.startDate?.day ?: Int.MAX_VALUE },
+    { it.id },
+)
 
 internal fun Media.seasonNeighbors(): List<Media> = relations.edges
     .asSequence()

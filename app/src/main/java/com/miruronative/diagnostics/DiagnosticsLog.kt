@@ -239,15 +239,25 @@ object DiagnosticsLog {
         context.startActivity(chooser)
     }.onFailure { throwable("diagnostics share failed", it) }
 
+    // Writes happen on a dedicated thread: appends used to run synchronously on whatever thread
+    // logged (usually main), and on a memory-starved Fire TV a single flash write inside
+    // onTrimMemory blocked the main thread for 17+ seconds — during playback, at the worst
+    // possible moment. The single thread preserves log ordering.
+    private val writeExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "anilili-diagnostics-log").apply { isDaemon = true }
+    }
+
     private fun append(text: String) {
-        val target = file ?: appContext?.let {
-            File(it.filesDir, LOG_DIR).resolve(LOG_FILE).also { resolved -> file = resolved }
-        } ?: return
-        runCatching {
-            synchronized(lock) {
-                target.parentFile?.mkdirs()
-                trimIfNeeded(target)
-                target.appendText(text)
+        writeExecutor.execute {
+            val target = file ?: appContext?.let {
+                File(it.filesDir, LOG_DIR).resolve(LOG_FILE).also { resolved -> file = resolved }
+            } ?: return@execute
+            runCatching {
+                synchronized(lock) {
+                    target.parentFile?.mkdirs()
+                    trimIfNeeded(target)
+                    target.appendText(text)
+                }
             }
         }
     }

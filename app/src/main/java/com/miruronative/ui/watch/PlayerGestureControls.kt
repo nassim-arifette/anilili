@@ -26,6 +26,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeDown
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.BrightnessHigh
+import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -83,6 +84,7 @@ internal fun PlayerGestureControls(
     modifier: Modifier = Modifier,
     onTap: (() -> Unit)? = null,
     onDoubleTap: ((isRightHalf: Boolean) -> Unit)? = null,
+    onHoldSpeed: ((active: Boolean) -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val activity = remember(context) { context.findActivity() }
@@ -92,6 +94,7 @@ internal fun PlayerGestureControls(
 
     var level by remember { mutableStateOf<GestureLevel?>(null) }
     var levelTick by remember { mutableIntStateOf(0) }
+    var holdSpeedActive by remember { mutableStateOf(false) }
     LaunchedEffect(levelTick) {
         if (level != null) {
             delay(700)
@@ -115,16 +118,37 @@ internal fun PlayerGestureControls(
                             readVolume(audioManager)
                         }
                         var dragging = false
+                        var holding = false
                         var up: PointerInputChange? = null
+                        // The long-press deadline is anchored to the down, not to the last event,
+                        // so finger tremor (which streams sub-slop moves) can't keep resetting it.
+                        val holdDeadline = down.uptimeMillis + viewConfiguration.longPressTimeoutMillis
 
                         while (true) {
-                            val event = awaitPointerEvent()
+                            val event = if (!dragging && !holding && onHoldSpeed != null) {
+                                val remaining = holdDeadline - android.os.SystemClock.uptimeMillis()
+                                if (remaining <= 0) {
+                                    null
+                                } else {
+                                    withTimeoutOrNull(remaining) { awaitPointerEvent() }
+                                }
+                            } else {
+                                awaitPointerEvent()
+                            }
+                            if (event == null) {
+                                // Stationary press outlived the long-press window: fast-forward
+                                // while held, like YouTube's hold-for-2x.
+                                holding = true
+                                holdSpeedActive = true
+                                onHoldSpeed?.invoke(true)
+                                continue
+                            }
                             val change = event.changes.firstOrNull { it.id == down.id } ?: break
                             if (!change.pressed) {
                                 up = change
                                 break
                             }
-                            if (!dragging) {
+                            if (!dragging && !holding) {
                                 val dy = change.position.y - down.position.y
                                 val dx = change.position.x - down.position.x
                                 if (abs(dy) > slop && abs(dy) > abs(dx)) dragging = true
@@ -142,8 +166,15 @@ internal fun PlayerGestureControls(
                                 levelTick++
                                 change.consume()
                             }
+                            if (holding) change.consume()
                         }
 
+                        if (holding) {
+                            holdSpeedActive = false
+                            onHoldSpeed?.invoke(false)
+                            up?.consume()
+                            return@awaitEachGesture
+                        }
                         if (dragging || up == null) return@awaitEachGesture
                         up.consume()
                         if (onDoubleTap == null) {
@@ -172,6 +203,28 @@ internal fun PlayerGestureControls(
         )
 
         level?.let { GestureLevelIndicator(it, Modifier.align(Alignment.Center)) }
+        if (holdSpeedActive) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 24.dp)
+                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(18.dp))
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "2x",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Icon(
+                    Icons.Default.FastForward,
+                    contentDescription = "Playing at double speed",
+                    tint = Color.White,
+                    modifier = Modifier.padding(start = 4.dp).size(16.dp),
+                )
+            }
+        }
     }
 }
 

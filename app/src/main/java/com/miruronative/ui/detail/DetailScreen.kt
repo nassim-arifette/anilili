@@ -87,7 +87,7 @@ private enum class DetailTab(val label: String) {
 fun DetailScreen(
     animeId: Int,
     onBack: () -> Unit,
-    onPlay: (provider: String, category: String, episode: String) -> Unit,
+    onPlay: (animeId: Int, provider: String, category: String, episode: String) -> Unit,
     onAnimeClick: (Int) -> Unit,
     onSeasonWatch: (Int) -> Unit,
     vm: DetailViewModel = viewModel(),
@@ -151,6 +151,7 @@ fun DetailScreen(
                         onPlay = onPlay,
                         onAnimeClick = onAnimeClick,
                         onSeasonWatch = onSeasonWatch,
+                        onSelectSeason = vm::selectSeason,
                     )
                 }
             }
@@ -165,9 +166,10 @@ private fun DetailContent(
     saved: Boolean,
     resume: HistoryEntry?,
     onToggleSaved: () -> Unit,
-    onPlay: (String, String, String) -> Unit,
+    onPlay: (Int, String, String, String) -> Unit,
     onAnimeClick: (Int) -> Unit,
     onSeasonWatch: (Int) -> Unit,
+    onSelectSeason: (Int) -> Unit,
 ) {
     val info = data.info
     val device = LocalAppDeviceProfile.current
@@ -176,8 +178,13 @@ private fun DetailContent(
     val canWatch = episodes.isNotEmpty()
     val playCurrent: () -> Unit = {
         when {
-            resume != null -> onPlay(resume.provider, resume.category, resume.episodeLabel)
-            canWatch -> onPlay("auto", data.preferredCategory.api, episodes.first().displayNumber)
+            resume != null -> onPlay(info.id, resume.provider, resume.category, resume.episodeLabel)
+            canWatch -> onPlay(
+                data.selectedSeasonId,
+                "auto",
+                data.preferredCategory.api,
+                episodes.first().displayNumber,
+            )
         }
     }
 
@@ -212,6 +219,18 @@ private fun DetailContent(
             }
 
             DetailTab.EPISODES -> {
+                val seasons = data.seasons
+                if (seasons.size > 1) {
+                    item {
+                        SeasonFilterRow(
+                            seasons = seasons,
+                            selectedSeasonId = data.selectedSeasonId,
+                            onSelect = onSelectSeason,
+                        )
+                    }
+                }
+                val seasonCover = seasons.firstOrNull { it.id == data.selectedSeasonId }
+                    ?.let { it.bannerImage ?: it.coverImage.best }
                 when {
                     episodes.isNotEmpty() -> items(
                         items = episodes,
@@ -219,10 +238,18 @@ private fun DetailContent(
                     ) { episode ->
                         DetailEpisodeRow(
                             episode = episode,
-                            fallbackImage = info.bannerImage ?: info.coverImage.best,
-                            onClick = { onPlay("auto", data.preferredCategory.api, episode.displayNumber) },
+                            fallbackImage = seasonCover ?: info.bannerImage ?: info.coverImage.best,
+                            onClick = {
+                                onPlay(
+                                    data.selectedSeasonId,
+                                    "auto",
+                                    data.preferredCategory.api,
+                                    episode.displayNumber,
+                                )
+                            },
                         )
                     }
+                    data.seasonEpisodesLoading -> item { InlineStatus("Loading episodes…", loading = true) }
                     else -> item { InlineStatus("No episode information is available yet.", loading = false) }
                 }
             }
@@ -525,6 +552,64 @@ private fun MetadataCard(info: Media) {
             Row(Modifier.fillMaxWidth().padding(vertical = 7.dp)) {
                 Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
                 Text(value, fontWeight = FontWeight.SemiBold)
+            }
+        }
+    }
+}
+
+/**
+ * Season chips for series with multiple episodic entries (JJK-style): the whole prequel/sequel
+ * chain lives on one page and this row swaps which season's episodes are listed below.
+ */
+@Composable
+private fun SeasonFilterRow(
+    seasons: List<Media>,
+    selectedSeasonId: Int,
+    onSelect: (Int) -> Unit,
+) {
+    LazyRow(
+        contentPadding = PaddingValues(
+            horizontal = LocalAppDeviceProfile.current.pagePadding,
+            vertical = 8.dp,
+        ),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        items(seasons.size) { index ->
+            val season = seasons[index]
+            val active = season.id == selectedSeasonId
+            Column(
+                modifier = Modifier
+                    .focusHighlight(RoundedCornerShape(12.dp))
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(
+                        if (active) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.surface,
+                    )
+                    .border(
+                        1.dp,
+                        if (active) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.outline,
+                        RoundedCornerShape(12.dp),
+                    )
+                    .clickable { onSelect(season.id) }
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    text = "Season ${index + 1}",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                    color = if (active) MaterialTheme.colorScheme.onPrimary
+                    else MaterialTheme.colorScheme.onSurface,
+                )
+                (season.seasonYear ?: season.startDate?.year)?.let { year ->
+                    Text(
+                        text = year.toString(),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (active) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.8f)
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }

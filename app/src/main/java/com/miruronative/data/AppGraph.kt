@@ -25,8 +25,15 @@ object AppGraph {
     lateinit var httpClient: OkHttpClient
         private set
 
+    /** TV boxes are memory/CPU-starved; non-UI layers use this to throttle background work. */
+    var isTv: Boolean = false
+        private set
+
     fun init(context: Context) {
         if (::repository.isInitialized) return
+
+        isTv = (context.getSystemService(Context.UI_MODE_SERVICE) as? android.app.UiModeManager)
+            ?.currentModeType == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
 
         val json = Json {
             ignoreUnknownKeys = true

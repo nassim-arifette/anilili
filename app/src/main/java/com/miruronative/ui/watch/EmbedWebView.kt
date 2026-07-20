@@ -138,6 +138,8 @@ fun EmbedWebView(
     var captionAppearanceVisible by remember(url) { mutableStateOf(false) }
     var settingsSheetVisible by remember(url) { mutableStateOf(false) }
     var playbackSpeed by remember(url) { mutableStateOf(1f) }
+    // The speed to restore once a hold-for-2x gesture ends (the user's chosen playback speed).
+    var preHoldSpeed by remember(url) { mutableStateOf(1f) }
     var webPlaybackAvailable by remember(activeUrl) { mutableStateOf(false) }
     var pendingSeekMs by remember(url, startPositionMs) { mutableLongStateOf(startPositionMs) }
     var loadError by remember { mutableStateOf<String?>(null) }
@@ -699,6 +701,24 @@ fun EmbedWebView(
             onTap = {
                 touchControlsVisible = !touchControlsVisible
                 touchControlsInteraction++
+            },
+            onDoubleTap = { isRightHalf ->
+                if (isRightHalf) {
+                    seekWebVideo(webView, positionMs + 10_000L)
+                    positionMs += 10_000L
+                } else {
+                    val target = (positionMs - 10_000L).coerceAtLeast(0L)
+                    seekWebVideo(webView, target)
+                    positionMs = target
+                }
+            },
+            onHoldSpeed = { active ->
+                if (active) {
+                    preHoldSpeed = playbackSpeed
+                    playbackSpeed = 2f
+                } else {
+                    playbackSpeed = preHoldSpeed
+                }
             },
         )
 
