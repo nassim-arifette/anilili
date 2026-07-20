@@ -30,9 +30,7 @@ import com.miruronative.data.model.Media
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.ui.nav.Routes
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -250,10 +248,10 @@ class ReleaseSyncWorker(
         }
         return try {
             val repo = AppGraph.repository
-            val localSaved = coroutineScope {
-                LibraryStore.watchlist.value.map { saved ->
-                    async { runCatching { repo.animeInfo(saved.anilistId) }.getOrNull() }
-                }.awaitAll().filterNotNull()
+            // Reconciliation removes alarms that are absent from this list, so never feed it a
+            // partial snapshot after a transient metadata failure.
+            val localSaved = fetchCompleteSnapshot(LibraryStore.watchlist.value) { saved ->
+                repo.animeInfo(saved.anilistId)
             }
             if (AuthManager.isLoggedIn) {
                 runCatching {
@@ -271,7 +269,8 @@ class ReleaseSyncWorker(
                 AutomaticReleaseManager.sync(localSaved.distinctBy { it.id })
             }
             Result.success()
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
             Result.retry()
         }
     }
