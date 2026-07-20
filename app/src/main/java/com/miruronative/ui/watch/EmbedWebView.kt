@@ -164,6 +164,13 @@ fun EmbedWebView(
     var webIsPlaying by remember(url) { mutableStateOf(false) }
     var webVolume by remember(url) { mutableStateOf(1f) }
     var lastAudibleVolume by remember(url) { mutableStateOf(1f) }
+    // Cross-origin embeds (some Kiwi mirrors) put the video out of the injected JS's reach, so
+    // web-volume calls silently do nothing and a muted page stays muted. The device media
+    // stream is always controllable; it becomes the volume/mute fallback for those servers.
+    val embedAudioManager = remember(context) {
+        context.getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
+    }
+    var deviceVolume by remember { mutableStateOf(readDeviceVolume(embedAudioManager)) }
     var tvControlsVisible by remember(url) { mutableStateOf(false) }
     var tvControlsInteraction by remember(url) { mutableIntStateOf(0) }
     var touchControlsVisible by remember(url) { mutableStateOf(true) }
@@ -881,7 +888,7 @@ fun EmbedWebView(
                 positionMs = positionMs,
                 durationMs = durationMs,
                 isPlaying = webIsPlaying,
-                isMuted = webVolume <= 0.001f,
+                isMuted = (if (webPlaybackAvailable) webVolume else deviceVolume) <= 0.001f,
                 hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
                 playPauseFocusRequester = tvPlayPauseFocus,
@@ -895,29 +902,50 @@ fun EmbedWebView(
                 onForward = { seekWebVideo(webView, positionMs + 10_000L) },
                 onNext = { currentOnNextEpisode?.invoke() },
                 onVolumeDown = {
-                    DiagnosticsLog.event("EmbedWebView TV control volumeDown")
-                    adjustWebVolume(webView, -0.1f) { volume ->
-                        webVolume = volume
-                        if (volume > 0f) lastAudibleVolume = volume
+                    DiagnosticsLog.event("EmbedWebView TV control volumeDown available=$webPlaybackAvailable")
+                    if (webPlaybackAvailable) {
+                        adjustWebVolume(webView, -0.1f) { volume ->
+                            webVolume = volume
+                            if (volume > 0f) lastAudibleVolume = volume
+                        }
+                    } else {
+                        deviceVolume = (readDeviceVolume(embedAudioManager) - 0.1f).coerceIn(0f, 1f)
+                        applyDeviceVolume(embedAudioManager, deviceVolume)
+                        if (deviceVolume > 0f) lastAudibleVolume = deviceVolume
                     }
                 },
                 onToggleMute = {
-                    DiagnosticsLog.event("EmbedWebView TV control toggleMute")
-                    if (webVolume > 0.001f) lastAudibleVolume = webVolume
-                    val target = if (webVolume > 0.001f) 0f else lastAudibleVolume.coerceAtLeast(0.1f)
-                    setWebVolume(webView, target) { webVolume = it }
+                    DiagnosticsLog.event("EmbedWebView TV control toggleMute available=$webPlaybackAvailable")
+                    if (webPlaybackAvailable) {
+                        if (webVolume > 0.001f) lastAudibleVolume = webVolume
+                        val target = if (webVolume > 0.001f) 0f else lastAudibleVolume.coerceAtLeast(0.1f)
+                        setWebVolume(webView, target) { webVolume = it }
+                    } else {
+                        val current = readDeviceVolume(embedAudioManager)
+                        if (current > 0.001f) lastAudibleVolume = current
+                        deviceVolume = if (current > 0.001f) 0f else lastAudibleVolume.coerceAtLeast(0.1f)
+                        applyDeviceVolume(embedAudioManager, deviceVolume)
+                    }
                 },
                 onVolumeUp = {
-                    DiagnosticsLog.event("EmbedWebView TV control volumeUp")
-                    adjustWebVolume(webView, 0.1f) { volume ->
-                        webVolume = volume
-                        lastAudibleVolume = volume
+                    DiagnosticsLog.event("EmbedWebView TV control volumeUp available=$webPlaybackAvailable")
+                    if (webPlaybackAvailable) {
+                        adjustWebVolume(webView, 0.1f) { volume ->
+                            webVolume = volume
+                            lastAudibleVolume = volume
+                        }
+                    } else {
+                        deviceVolume = (readDeviceVolume(embedAudioManager) + 0.1f).coerceIn(0f, 1f)
+                        applyDeviceVolume(embedAudioManager, deviceVolume)
+                        lastAudibleVolume = deviceVolume
                     }
                 },
                 onSettings = {
+                    // The full settings panel (quality, speed, captions, autoplay, auto-skip,
+                    // volume) with the TV side-panel presentation — the old quality-or-speed
+                    // dialog left most settings unreachable from a remote.
                     DiagnosticsLog.event("EmbedWebView TV control settings")
-                    if (embedQualityStreams.size > 1) qualityDialogVisible = true
-                    else speedDialogVisible = true
+                    settingsSheetVisible = true
                 },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
@@ -1244,6 +1272,24 @@ private fun SEEK_VIDEO_JS(targetSec: Double): String = """
       }
     })();
 """.trimIndent()
+
+private fun readDeviceVolume(audioManager: android.media.AudioManager?): Float {
+    audioManager ?: return 1f
+    val max = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+    if (max <= 0) return 1f
+    return audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC).toFloat() / max
+}
+
+private fun applyDeviceVolume(audioManager: android.media.AudioManager?, value: Float) {
+    audioManager ?: return
+    val max = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+    if (max <= 0) return
+    audioManager.setStreamVolume(
+        android.media.AudioManager.STREAM_MUSIC,
+        (value * max).toInt().coerceIn(0, max),
+        0,
+    )
+}
 
 private fun stopWebPlayback(webView: WebView) {
     DiagnosticsLog.event("EmbedWebView stop playback url=${webView.url ?: "none"}")
