@@ -5,6 +5,7 @@ import android.net.Uri
 import android.util.Base64
 import com.miruronative.diagnostics.DiagnosticsLog
 import java.security.SecureRandom
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -44,6 +45,7 @@ object MalAuthManager {
     private lateinit var tokenStore: SecureTokenStore
     private var httpClient: OkHttpClient? = null
     private val refreshMutex = Mutex()
+    private val sessionGate = SessionGate()
     private var pendingState: String? = null
     private var pendingVerifier: String? = null
 
@@ -54,12 +56,14 @@ object MalAuthManager {
     val loggedIn = MutableStateFlow(false)
 
     fun init(context: Context, client: OkHttpClient) {
-        tokenStore = SecureTokenStore(context.applicationContext, SecureTokenStore.KEY_MAL_TOKENS)
-        httpClient = client
-        _tokens.value = tokenStore.load()?.let { raw ->
-            runCatching { json.decodeFromString(MalTokens.serializer(), raw) }.getOrNull()
+        sessionGate.invalidate {
+            tokenStore = SecureTokenStore(context.applicationContext, SecureTokenStore.KEY_MAL_TOKENS)
+            httpClient = client
+            _tokens.value = tokenStore.load()?.let { raw ->
+                runCatching { json.decodeFromString(MalTokens.serializer(), raw) }.getOrNull()
+            }
+            loggedIn.value = _tokens.value != null
         }
-        loggedIn.value = _tokens.value != null
     }
 
     val isLoggedIn: Boolean get() = _tokens.value != null
@@ -69,8 +73,10 @@ object MalAuthManager {
         // PKCE `plain`: the verifier IS the challenge. 32 random bytes → 43-char base64url,
         // inside MAL's required 43–128 length window.
         val verifier = randomUrlSafe(32)
-        pendingState = state
-        pendingVerifier = verifier
+        sessionGate.invalidate {
+            pendingState = state
+            pendingVerifier = verifier
+        }
         return Uri.parse(AUTHORIZE_ENDPOINT).buildUpon()
             .appendQueryParameter("response_type", "code")
             .appendQueryParameter("client_id", CLIENT_ID)
@@ -98,16 +104,33 @@ object MalAuthManager {
 
     /** Trades the authorization code for the first token pair; throws on failure. */
     suspend fun exchangeCode(code: String) = withContext(Dispatchers.IO) {
-        val verifier = requireNotNull(pendingVerifier) { "No MAL login in progress" }
+        val loginAttempt = sessionGate.snapshot {
+            requireNotNull(pendingVerifier) { "No MAL login in progress" }
+        }
+        val verifier = loginAttempt.value
         val body = FormBody.Builder()
             .add("client_id", CLIENT_ID)
             .add("grant_type", "authorization_code")
             .add("code", code)
             .add("code_verifier", verifier)
             .build()
-        store(requestTokens(body))
-        pendingState = null
-        pendingVerifier = null
+        val fresh = try {
+            requestTokens(body)
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            val stillCurrent = sessionGate.invalidateIfCurrent(loginAttempt) {
+                pendingState = null
+                pendingVerifier = null
+            }
+            if (!stillCurrent) throw CancellationException("MAL login was superseded")
+            throw error
+        }
+        val committed = sessionGate.replaceIfCurrent(loginAttempt) {
+            store(fresh)
+            pendingState = null
+            pendingVerifier = null
+        }
+        if (!committed) throw CancellationException("MAL login was superseded")
         DiagnosticsLog.event("MAL login: token exchange succeeded")
     }
 
@@ -117,34 +140,45 @@ object MalAuthManager {
      * with an expired access token the session is cleared (MAL refresh tokens do die).
      */
     suspend fun freshAccessToken(): String? {
-        val current = _tokens.value ?: return null
-        val now = System.currentTimeMillis()
-        if (now < current.expiresAtMs - EXPIRY_MARGIN_MS) return current.accessToken
         return refreshMutex.withLock {
-            val latest = _tokens.value ?: return@withLock null
+            val session = sessionGate.snapshot { _tokens.value }
+            val latest = session.value ?: return@withLock null
             if (System.currentTimeMillis() < latest.expiresAtMs - EXPIRY_MARGIN_MS) {
                 return@withLock latest.accessToken
             }
-            withContext(Dispatchers.IO) {
-                val body = FormBody.Builder()
-                    .add("client_id", CLIENT_ID)
-                    .add("grant_type", "refresh_token")
-                    .add("refresh_token", latest.refreshToken)
-                    .build()
-                runCatching { requestTokens(body) }
-                    .onSuccess { store(it) }
-                    .onFailure { error ->
-                        DiagnosticsLog.throwable("MAL token refresh failed", error)
-                        // Only drop the session when the old access token is truly dead;
-                        // a transient network failure keeps the session for a later retry.
-                        if (System.currentTimeMillis() >= latest.expiresAtMs) logout()
-                    }
-                _tokens.value?.accessToken
+            val body = FormBody.Builder()
+                .add("client_id", CLIENT_ID)
+                .add("grant_type", "refresh_token")
+                .add("refresh_token", latest.refreshToken)
+                .build()
+            val fresh = try {
+                withContext(Dispatchers.IO) { requestTokens(body) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                DiagnosticsLog.throwable("MAL token refresh failed", error)
+                // Only the session that launched this request may be cleared or reused. A logout
+                // or newer login invalidates the snapshot while the HTTP call is in flight.
+                if (System.currentTimeMillis() >= latest.expiresAtMs) {
+                    sessionGate.invalidateIfCurrent(session, ::clearSession)
+                    return@withLock null
+                }
+                return@withLock latest.accessToken.takeIf { sessionGate.isCurrent(session) }
             }
+
+            var accessToken: String? = null
+            sessionGate.commitIfCurrent(session) {
+                store(fresh)
+                accessToken = fresh.accessToken
+            }
+            accessToken
         }
     }
 
     fun logout() {
+        sessionGate.invalidate(::clearSession)
+    }
+
+    private fun clearSession() {
         tokenStore.clear()
         _tokens.value = null
         loggedIn.value = false
