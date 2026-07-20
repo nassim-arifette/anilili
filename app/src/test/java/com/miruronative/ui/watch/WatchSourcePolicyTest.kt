@@ -6,6 +6,7 @@ import com.miruronative.data.model.Category
 import com.miruronative.data.model.EpisodeItem
 import com.miruronative.data.model.EpisodesResult
 import com.miruronative.data.model.ProviderData
+import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.StreamItem
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -170,6 +171,33 @@ class WatchSourcePolicyTest {
         val spine = pickNavigationSpine(EpisodesResult(listOf(preferred, other)), "bonk", Category.SUB)
 
         assertEquals("preferred", spine.first().pipeId)
+    }
+
+    @Test
+    fun `provider and AniSkip chapter markers merge by range`() {
+        val provider = SkipTimes(10.0, 95.0, null, null)
+        val aniSkip = SkipTimes(12.0, 96.0, 1_320.0, 1_410.0)
+
+        assertEquals(
+            SkipTimes(10.0, 95.0, 1_320.0, 1_410.0),
+            mergeSkipTimes(provider, aniSkip),
+        )
+    }
+
+    @Test
+    fun `empty provider skip object does not suppress AniSkip`() {
+        val emptyProvider = SkipTimes(null, null, null, null)
+        val aniSkip = SkipTimes(0.0, 90.0, 1_300.0, 1_390.0)
+
+        assertEquals(aniSkip, mergeSkipTimes(emptyProvider, aniSkip))
+        assertEquals(false, hasCompleteSkipTimes(emptyProvider))
+    }
+
+    @Test
+    fun `invalid chapter placeholders are discarded`() {
+        val invalid = SkipTimes(90.0, 10.0, 1_400.0, 1_300.0)
+
+        assertNull(mergeSkipTimes(invalid, null))
     }
 
     @Test

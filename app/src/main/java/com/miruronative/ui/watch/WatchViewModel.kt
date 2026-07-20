@@ -13,6 +13,7 @@ import com.miruronative.data.settings.DEFAULT_PREFERRED_PROVIDER
 import com.miruronative.data.model.Category
 import com.miruronative.data.model.EpisodeItem
 import com.miruronative.data.model.EpisodesResult
+import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.SourcesResult
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.remote.KonohaEpisode
@@ -442,13 +443,15 @@ class WatchViewModel : ViewModel() {
                     "episode=${fmt(number)}",
             )
         }
-        val sources = if (resolved.sources.skip == null) {
-            val fallbackSkip = withTimeoutOrNull(ANISKIP_WAIT_MS) { aniSkipFallback.await() }
-            fallbackSkip?.let { resolved.sources.copy(skip = it) } ?: resolved.sources
-        } else {
+        val providerSkip = normalizedSkipTimes(resolved.sources.skip)
+        val fallbackSkip = if (hasCompleteSkipTimes(providerSkip)) {
             aniSkipFallback.cancel()
-            resolved.sources
+            null
+        } else {
+            val fallbackSkip = withTimeoutOrNull(ANISKIP_WAIT_MS) { aniSkipFallback.await() }
+            normalizedSkipTimes(fallbackSkip)
         }
+        val sources = resolved.sources.copy(skip = mergeSkipTimes(providerSkip, fallbackSkip))
         val index = spine.indexOfFirst { it.number == number }.coerceAtLeast(0)
         val resume = LibraryStore.historyFor(anilistId)?.takeIf { it.episodeNumber == number }?.positionMs ?: 0L
         val chosen = pickProviderStream(resolved.provider, sources)
@@ -930,6 +933,47 @@ internal fun preferredProviderForWatch(storedPreferred: String?, routeProvider: 
     val stored = storedPreferred?.trim()?.lowercase().orEmpty()
     if (stored.isNotBlank() && stored != DEFAULT_PREFERRED_PROVIDER) return stored
     return routeProvider.trim().lowercase().ifBlank { DEFAULT_PREFERRED_PROVIDER }
+}
+
+/**
+ * Combines provider chapter markers with AniSkip a range at a time. A provider that only knows
+ * the opening must not suppress a usable ending from the fallback (or vice versa), and empty or
+ * inverted placeholder ranges are discarded before they reach the player.
+ */
+internal fun mergeSkipTimes(primary: SkipTimes?, fallback: SkipTimes?): SkipTimes? {
+    val normalizedPrimary = normalizedSkipTimes(primary)
+    val normalizedFallback = normalizedSkipTimes(fallback)
+    val intro = introRange(normalizedPrimary) ?: introRange(normalizedFallback)
+    val outro = outroRange(normalizedPrimary) ?: outroRange(normalizedFallback)
+    if (intro == null && outro == null) return null
+    return SkipTimes(
+        introStart = intro?.first,
+        introEnd = intro?.second,
+        outroStart = outro?.first,
+        outroEnd = outro?.second,
+    )
+}
+
+internal fun hasCompleteSkipTimes(skip: SkipTimes?): Boolean =
+    introRange(skip) != null && outroRange(skip) != null
+
+private fun normalizedSkipTimes(skip: SkipTimes?): SkipTimes? {
+    val intro = introRange(skip)
+    val outro = outroRange(skip)
+    if (intro == null && outro == null) return null
+    return SkipTimes(intro?.first, intro?.second, outro?.first, outro?.second)
+}
+
+private fun introRange(skip: SkipTimes?): Pair<Double, Double>? {
+    val end = skip?.introEnd ?: return null
+    val start = skip.introStart ?: 0.0
+    return (start to end).takeIf { start >= 0.0 && end > start }
+}
+
+private fun outroRange(skip: SkipTimes?): Pair<Double, Double>? {
+    val start = skip?.outroStart ?: return null
+    val end = skip.outroEnd ?: return null
+    return (start to end).takeIf { start >= 0.0 && end > start }
 }
 
 private fun bestHls(streams: List<StreamItem>): StreamItem? = streams
