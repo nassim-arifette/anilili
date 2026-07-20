@@ -173,6 +173,54 @@ class WatchSourcePolicyTest {
     }
 
     @Test
+    fun `navigation spine unions non-contiguous provider catalogs`() {
+        val preferred = ProviderData(
+            "bonk",
+            listOf(episode(1, id = "preferred-1"), episode(3, id = "preferred-3")),
+            emptyList(),
+        )
+        val longer = ProviderData(
+            "hop",
+            listOf(episode(1, id = "other-1"), episode(2), episode(4)),
+            emptyList(),
+        )
+
+        val spine = pickNavigationSpine(EpisodesResult(listOf(preferred, longer)), "bonk", Category.SUB)
+
+        assertEquals(listOf(1.0, 2.0, 3.0, 4.0), spine.map(EpisodeItem::number))
+        assertEquals("preferred-1", spine.first().pipeId)
+        assertEquals(2, navigationEpisodeIndex(spine, 3.0))
+    }
+
+    @Test
+    fun `missing navigation episode has no fallback index`() {
+        assertEquals(null, navigationEpisodeIndex(listOf(episode(1)), 3.0))
+    }
+
+    @Test
+    fun `navigation union is preserved for a switched audio category`() {
+        val preferred = ProviderData(
+            "bonk",
+            sub = emptyList(),
+            dub = listOf(episode(1, id = "preferred-1"), episode(3, id = "preferred-3")),
+        )
+        val fallback = ProviderData(
+            "hop",
+            sub = listOf(episode(99)),
+            dub = listOf(episode(1, id = "other-1"), episode(2)),
+        )
+
+        val spine = pickNavigationSpine(
+            EpisodesResult(listOf(preferred, fallback)),
+            "bonk",
+            Category.DUB,
+        )
+
+        assertEquals(listOf(1.0, 2.0, 3.0), spine.map(EpisodeItem::number))
+        assertEquals("preferred-1", spine.first().pipeId)
+    }
+
+    @Test
     fun `anilist progress waits until most of a full integer episode was watched`() {
         assertTrue(shouldSyncAniListProgress(3.0, positionMs = 1_200_000, durationMs = 1_440_000))
         assertEquals(false, shouldSyncAniListProgress(3.0, positionMs = 600_000, durationMs = 1_440_000))
