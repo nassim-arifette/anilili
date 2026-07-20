@@ -299,6 +299,7 @@ fun WatchScreen(
                     onToggleFullscreen = { fullscreen = !fullscreen },
                     onFullscreenChanged = { fullscreen = it },
                     onProgress = vm::onProgress,
+                    onPlayerPresented = vm::onPlayerPresented,
                     onPlaybackError = vm::onPlaybackError,
                     onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
                     onPlayerClosed = vm::commitPlaybackPosition,
@@ -324,6 +325,7 @@ private fun WatchContent(
     onToggleFullscreen: () -> Unit,
     onFullscreenChanged: (Boolean) -> Unit,
     onProgress: (Long, Long) -> Unit,
+    onPlayerPresented: (PlayerPresentation) -> Unit,
     onPlaybackError: (String, String, Long) -> Unit,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
     onPlayerClosed: () -> Unit = {},
@@ -468,6 +470,7 @@ private fun WatchContent(
                     stream == null -> NoSource(onWebFallback)
                     stream.isEmbed || ProviderCatalog.isEmbed(data.provider) ->
                         Box(Modifier.fillMaxSize()) {
+                            PlayerPresentationEffect(data, onPlayerPresented)
                             LaunchedEffect(stream.url) { PlaybackService.stopActivePlayback() }
                             EmbedEpisodeNavigationEffect(
                                 hasPrevious = data.hasPrev,
@@ -515,33 +518,36 @@ private fun WatchContent(
                                 )
                             }
                         }
-                    else -> PlayerSurface(
-                        stream = stream,
-                        qualityStreams = data.sources.streams.filterNot(StreamItem::isEmbed),
-                        subtitles = data.sources.subtitles,
-                        subtitleOffsetMs = data.sources.subtitleOffsetMs,
-                        skip = data.sources.skip,
-                        seriesTitle = data.seriesTitle,
-                        episodeTitle = "Episode ${data.current.displayNumber}" +
-                            (data.current.title?.let { ": $it" } ?: ""),
-                        artworkUrl = data.artworkUrl,
-                        animeId = data.anilistId,
-                        provider = data.provider,
-                        category = data.category.api,
-                        episode = data.current.displayNumber,
-                        onEnded = { if (com.miruronative.data.settings.SettingsStore.autoplay.value) onNext() },
-                        onNextEpisode = onNext,
-                        onError = onPlaybackError,
-                        modifier = Modifier.fillMaxSize(),
-                        onToggleFullscreen = onToggleFullscreen,
-                        startPositionMs = data.startPositionMs,
-                        onProgress = onProgress,
-                        onPreviousEpisode = onPrev,
-                        hasNextEpisode = data.hasNext,
-                        hasPreviousEpisode = data.hasPrev,
-                        focusPlayerOnStart = fullscreen,
-                        isFullscreen = fullscreen,
-                    )
+                    else -> Box(Modifier.fillMaxSize()) {
+                        PlayerPresentationEffect(data, onPlayerPresented)
+                        PlayerSurface(
+                            stream = stream,
+                            qualityStreams = data.sources.streams.filterNot(StreamItem::isEmbed),
+                            subtitles = data.sources.subtitles,
+                            subtitleOffsetMs = data.sources.subtitleOffsetMs,
+                            skip = data.sources.skip,
+                            seriesTitle = data.seriesTitle,
+                            episodeTitle = "Episode ${data.current.displayNumber}" +
+                                (data.current.title?.let { ": $it" } ?: ""),
+                            artworkUrl = data.artworkUrl,
+                            animeId = data.anilistId,
+                            provider = data.provider,
+                            category = data.category.api,
+                            episode = data.current.displayNumber,
+                            onEnded = { if (com.miruronative.data.settings.SettingsStore.autoplay.value) onNext() },
+                            onNextEpisode = onNext,
+                            onError = onPlaybackError,
+                            modifier = Modifier.fillMaxSize(),
+                            onToggleFullscreen = onToggleFullscreen,
+                            startPositionMs = data.startPositionMs,
+                            onProgress = onProgress,
+                            onPreviousEpisode = onPrev,
+                            hasNextEpisode = data.hasNext,
+                            hasPreviousEpisode = data.hasPrev,
+                            focusPlayerOnStart = fullscreen,
+                            isFullscreen = fullscreen,
+                        )
+                    }
                 }
             }
             if (data.isResolving) {
@@ -637,6 +643,16 @@ private fun WatchContent(
         }
         }
     }
+}
+
+@Composable
+private fun PlayerPresentationEffect(
+    data: WatchData,
+    onPlayerPresented: (PlayerPresentation) -> Unit,
+) {
+    val presentation = data.playerPresentation() ?: return
+    val currentCallback by rememberUpdatedState(onPlayerPresented)
+    LaunchedEffect(presentation) { currentCallback(presentation) }
 }
 
 @Composable

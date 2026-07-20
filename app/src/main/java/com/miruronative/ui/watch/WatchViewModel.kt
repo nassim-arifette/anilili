@@ -79,6 +79,17 @@ private data class EpisodeSourceKey(
     val category: Category,
 )
 
+internal fun WatchData.playerPresentation(): PlayerPresentation? = chosenStream?.let { stream ->
+    PlayerPresentation(
+        generation = playbackGeneration,
+        anilistId = anilistId,
+        episodeNumber = current.number,
+        provider = provider,
+        category = category.api,
+        streamUrl = stream.url,
+    )
+}
+
 class WatchViewModel : ViewModel() {
     private val repo = AppGraph.repository
 
@@ -117,6 +128,10 @@ class WatchViewModel : ViewModel() {
     private var sourceValidationJob: Job? = null
     private var mergedIncludesAnivexa = false
     private var mergedEpisodes = EpisodesResult(emptyList())
+    private val playerPresentationGate = PlayerPresentationGate()
+    private var playbackGenerationCounter = 0
+    private var resolveRequestCounter = 0
+    private var pendingResolveRequest: Int? = null
 
     fun start(id: Int, providerName: String, categoryApi: String, episodeNumber: String) {
         val key = "$id/$providerName/$categoryApi/$episodeNumber"
@@ -148,6 +163,7 @@ class WatchViewModel : ViewModel() {
         anivexaMergeJob?.cancel()
         miruroLateMergeJob?.cancel()
         sourceValidationJob?.cancel()
+        val resolveRequest = beginResolveRequest()
         // Runs beside source resolution: providers hand back bare numbered lists, so without this
         // the episode list here reads "Episode 5" where the Anime page shows the real title.
         episodeMetaJob = viewModelScope.launch { loadEpisodeMetadata(id) }
@@ -249,8 +265,9 @@ class WatchViewModel : ViewModel() {
                 // Launched before the first resolve so a miss on the partial catalog can await
                 // the remaining servers instead of reporting "no source" prematurely.
                 if (!mergedIncludesAnivexa) launchAnivexaMerge(id)
-                resolveAndPlay(startNumber)
+                resolveAndPlay(startNumber, resolveRequest)
             } catch (e: Exception) {
+                finishResolveRequest(resolveRequest)
                 e.rethrowIfCancellation()
                 DiagnosticsLog.throwable("Watch start failed key=$key", e)
                 _loadingStatus.value = null
@@ -354,7 +371,7 @@ class WatchViewModel : ViewModel() {
         )
     }
 
-    private suspend fun resolveAndPlay(number: Double) {
+    private suspend fun resolveAndPlay(number: Double, resolveRequest: Int) {
         failedStreamUrls.clear()
         val requestedProvider = preferred
         DiagnosticsLog.event(
@@ -410,6 +427,7 @@ class WatchViewModel : ViewModel() {
             _loadingStatus.value = null
             val message = "No playable source for episode ${fmt(number)} on any server"
             DiagnosticsLog.event("Watch resolve no source id=$anilistId episode=${fmt(number)}")
+            finishResolveRequest(resolveRequest)
             _state.value = previous?.let {
                 UiState.Success(
                     it.copy(
@@ -465,6 +483,7 @@ class WatchViewModel : ViewModel() {
                 },
         )
         _loadingStatus.value = null
+        finishResolveRequest(resolveRequest)
         _state.value = UiState.Success(
             WatchData(
                 episodes = spine,
@@ -482,13 +501,13 @@ class WatchViewModel : ViewModel() {
                 popularity = popularity,
                 description = description,
                 startPositionMs = resume,
+                playbackGeneration = nextPlaybackGeneration(),
                 preferredProvider = globalPreferredProvider,
                 isResolving = false,
                 isLoadingMoreSources = !mergedIncludesAnivexa,
                 notice = fallbackNotice,
             ),
         )
-        recordHistory(number, resolved.provider)
         launchSourceValidation(number)
     }
 
@@ -547,19 +566,41 @@ class WatchViewModel : ViewModel() {
         launchResolve(currentNumber)
     }
 
-    private suspend fun recordHistory(number: Double, provider: String) {
-        val ep = spine.firstOrNull { it.number == number }
+    /** Called by the UI when a native surface or embed WebView is actually presented. */
+    internal fun onPlayerPresented(presentation: PlayerPresentation) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        val current = data.playerPresentation()
+        val resolutionPending = pendingResolveRequest != null || data.isResolving
+        if (!playerPresentationGate.accept(presentation, current, resolutionPending)) {
+            DiagnosticsLog.event(
+                "Watch player presentation ignored generation=${presentation.generation} " +
+                    "episode=${fmt(presentation.episodeNumber)} pending=$resolutionPending " +
+                    "matchesCurrent=${presentation == current}",
+            )
+            return
+        }
+
+        DiagnosticsLog.event(
+            "Watch player presented generation=${presentation.generation} " +
+                "episode=${fmt(presentation.episodeNumber)} provider=${presentation.provider}",
+        )
+        recordHistory(data)
+    }
+
+    private fun recordHistory(data: WatchData) {
+        val number = data.current.number
+        val existing = LibraryStore.historyFor(data.anilistId)?.takeIf { it.episodeNumber == number }
         LibraryStore.upsertHistory(
             HistoryEntry(
-                anilistId = anilistId,
-                title = seriesTitle,
-                cover = artworkUrl,
+                anilistId = data.anilistId,
+                title = data.seriesTitle,
+                cover = data.artworkUrl,
                 episodeNumber = number,
-                episodeTitle = ep?.title,
-                provider = provider,
-                category = category.api,
-                positionMs = LibraryStore.historyFor(anilistId)?.takeIf { it.episodeNumber == number }?.positionMs ?: 0L,
-                durationMs = LibraryStore.historyFor(anilistId)?.takeIf { it.episodeNumber == number }?.durationMs ?: 0L,
+                episodeTitle = data.current.title,
+                provider = data.provider,
+                category = data.category.api,
+                positionMs = existing?.positionMs ?: 0L,
+                durationMs = existing?.durationMs ?: 0L,
             ),
         )
     }
@@ -655,11 +696,13 @@ class WatchViewModel : ViewModel() {
     private fun launchResolve(number: Double, before: (suspend () -> Unit)? = null) {
         DiagnosticsLog.event("Watch launchResolve episode=${fmt(number)}")
         resolveJob?.cancel()
+        val resolveRequest = beginResolveRequest()
         resolveJob = viewModelScope.launch {
             try {
                 before?.invoke()
-                resolveAndPlay(number)
+                resolveAndPlay(number, resolveRequest)
             } catch (e: Exception) {
+                finishResolveRequest(resolveRequest)
                 e.rethrowIfCancellation()
                 DiagnosticsLog.throwable("Watch resolve failed id=$anilistId episode=${fmt(number)}", e)
                 _loadingStatus.value = null
@@ -699,7 +742,7 @@ class WatchViewModel : ViewModel() {
                     data.copy(
                         chosenStream = next,
                         startPositionMs = resume,
-                        playbackGeneration = data.playbackGeneration + 1,
+                        playbackGeneration = nextPlaybackGeneration(),
                         notice = "${failed?.label ?: "AllAnime source"} failed. Trying ${next.label}…",
                     ),
                 )
@@ -808,6 +851,19 @@ class WatchViewModel : ViewModel() {
     }
 
     private fun fmt(n: Double): String = if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
+
+    /** Set before launching so a TV fullscreen recomposition cannot present the previous episode. */
+    private fun beginResolveRequest(): Int {
+        val request = ++resolveRequestCounter
+        pendingResolveRequest = request
+        return request
+    }
+
+    private fun finishResolveRequest(request: Int) {
+        if (pendingResolveRequest == request) pendingResolveRequest = null
+    }
+
+    private fun nextPlaybackGeneration(): Int = ++playbackGenerationCounter
 
     private fun StreamItem.diagnosticLabel(): String {
         val type = when {
