@@ -708,7 +708,7 @@ private fun InlineStatus(message: String, loading: Boolean) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        if (loading) CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+        if (loading) com.miruronative.ui.components.NoFaceLoadingIndicator(size = 48.dp)
         Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

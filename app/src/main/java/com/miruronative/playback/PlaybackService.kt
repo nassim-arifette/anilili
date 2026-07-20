@@ -202,6 +202,13 @@ class PlaybackService : MediaSessionService() {
             }
         }
 
+        // Brand the media notification: Media3's provider handles layout, actions, and artwork
+        // (loading MediaMetadata.artworkUri itself); only the small icon needs overriding.
+        setMediaNotificationProvider(
+            androidx.media3.session.DefaultMediaNotificationProvider.Builder(this)
+                .build()
+                .apply { setSmallIcon(com.miruronative.R.drawable.ic_notification) },
+        )
         session = MediaSession.Builder(this, episodeAwarePlayer)
             .setSessionActivity(sessionActivity(null))
             .setCallback(object : MediaSession.Callback {

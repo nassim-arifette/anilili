@@ -22,8 +22,8 @@ android {
         applicationId = "com.miruronative"
         minSdk = 26
         targetSdk = 36
-        versionCode = 26
-        versionName = "0.1.25"
+        versionCode = 27
+        versionName = "0.1.26"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -118,6 +118,7 @@ dependencies {
     ksp(libs.androidx.room.compiler)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.androidx.tvprovider)
     implementation(libs.zxing.core)
     testImplementation(libs.junit)
     androidTestImplementation("androidx.test:core-ktx:1.6.1")

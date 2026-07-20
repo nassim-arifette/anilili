@@ -90,6 +90,7 @@ class NotificationsViewModel : ViewModel() {
                 _state.value = UiState.Success(items)
                 _unreadCount.value = if (markAllRead) 0 else unread
                 if (keepUnreadHighlight) _unreadCount.value = 0
+                com.miruronative.data.reminder.NotificationCenter.setUnread(_unreadCount.value)
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
                 _state.value = UiState.Error(e.message ?: "Couldn't load notifications")
@@ -125,6 +126,12 @@ fun NotificationsScreen(
     val state by vm.state.collectAsState()
     val unreadCount by vm.unreadCount.collectAsState()
     var tab by remember { mutableStateOf(Tab.ALL) }
+    // The user is now looking at the same items the tray was advertising: clear the shade so
+    // the system notifications never outlive the in-app read state.
+    val notifContext = androidx.compose.ui.platform.LocalContext.current
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        com.miruronative.data.reminder.AniListNotificationPushManager.dismissAll(notifContext)
+    }
 
     Scaffold(
         modifier = modifier,

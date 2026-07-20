@@ -134,11 +134,25 @@ fun HomeScreen(
                     }
                 },
                 actions = {
+                    val unread by com.miruronative.data.reminder.NotificationCenter.unread.collectAsState()
                     IconButton(
                         onClick = onNotificationsClick,
                         modifier = Modifier.focusHighlight(CircleShape),
                     ) {
-                        Icon(Icons.Default.Notifications, contentDescription = "Notifications")
+                        androidx.compose.material3.BadgedBox(
+                            badge = {
+                                if (unread > 0) {
+                                    androidx.compose.material3.Badge {
+                                        Text(if (unread > 99) "99+" else unread.toString())
+                                    }
+                                }
+                            },
+                        ) {
+                            Icon(
+                                Icons.Default.Notifications,
+                                contentDescription = if (unread > 0) "Notifications, $unread unread" else "Notifications",
+                            )
+                        }
                     }
                     IconButton(
                         onClick = onSearchClick,

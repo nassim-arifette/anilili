@@ -58,6 +58,7 @@ object AniListNotificationPushManager {
             .take(MAX_PUSHES_PER_SYNC)
             .asReversed()
             .forEach { item -> notify(app, item) }
+        postGroupSummary(app)
 
         writeDelivered(
             app,
@@ -72,6 +73,20 @@ object AniListNotificationPushManager {
             .edit()
             .remove(KEY_DELIVERED_IDS)
             .apply()
+    }
+
+    /**
+     * Removes this channel's notifications from the system tray. Called when the in-app
+     * Notifications page opens (the user is looking at the same items) and on "mark all read",
+     * so the shade never shows entries the app already considers handled.
+     */
+    fun dismissAll(context: Context) {
+        val manager = context.applicationContext.getSystemService(NotificationManager::class.java) ?: return
+        runCatching {
+            manager.activeNotifications
+                .filter { it.notification.channelId == CHANNEL_ID }
+                .forEach { manager.cancel(it.id) }
+        }
     }
 
     private fun notify(context: Context, item: AppNotification) {
@@ -107,6 +122,31 @@ object AniListNotificationPushManager {
         context.getSystemService(NotificationManager::class.java)
             .notify(item.id, notification)
     }
+
+    /** Without a summary, Android never collapses the group — each push stays a separate row. */
+    private fun postGroupSummary(context: Context) {
+        val open = PendingIntent.getActivity(
+            context,
+            SUMMARY_ID,
+            Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(Routes.EXTRA_ROUTE, Routes.NOTIFICATIONS)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val summary = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("AniList notifications")
+            .setContentIntent(open)
+            .setGroup(CHANNEL_ID)
+            .setGroupSummary(true)
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_EVENT)
+            .build()
+        context.getSystemService(NotificationManager::class.java).notify(SUMMARY_ID, summary)
+    }
+
+    private const val SUMMARY_ID = -1001
 
     private fun itemText(item: AppNotification): String = when {
         item.badge != null -> "${item.title} - ${item.badge}"

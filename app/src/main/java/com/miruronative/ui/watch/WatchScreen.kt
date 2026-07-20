@@ -542,7 +542,7 @@ private fun WatchContent(
                     Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)),
                     contentAlignment = Alignment.Center,
                 ) {
-                    CircularProgressIndicator()
+                    com.miruronative.ui.components.NoFaceLoadingIndicator(size = 72.dp)
                 }
             }
             if (!fullscreen) BackButton(onBack, Modifier.align(Alignment.TopStart))

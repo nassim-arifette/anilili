@@ -918,7 +918,10 @@ fun PlayerSurface(
         }
 
         if (controller == null) {
-            CircularProgressIndicator(Modifier.align(Alignment.Center))
+            com.miruronative.ui.components.NoFaceLoadingIndicator(
+                modifier = Modifier.align(Alignment.Center),
+                size = 72.dp,
+            )
         }
 
         if (device.isTv && focusPlayerOnStart && tvControlsVisible && controller != null) {

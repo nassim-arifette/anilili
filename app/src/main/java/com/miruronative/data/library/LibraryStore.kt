@@ -48,12 +48,16 @@ object LibraryStore {
 
     /** Insert/replace the anime's record (keeps one per anime, most-recent first). */
     fun upsertHistory(entry: HistoryEntry) {
+        val stamped = entry.copy(updatedAt = System.currentTimeMillis())
         val updated = buildList {
-            add(entry.copy(updatedAt = System.currentTimeMillis()))
+            add(stamped)
             addAll(_history.value.filter { it.anilistId != entry.anilistId })
         }.take(MAX_HISTORY)
         _history.value = updated
         persist(KEY_HISTORY, updated, HistoryEntry.serializer())
+        // TV launchers surface in-progress titles in their Continue Watching row; publishing is
+        // throttled inside the manager and a no-op off Android TV.
+        scope.launch { WatchNextManager.publish(appContext, stamped) }
     }
 
     fun updateProgress(anilistId: Int, episodeNumber: Double, positionMs: Long, durationMs: Long) {
@@ -67,6 +71,7 @@ object LibraryStore {
     fun clearHistory() {
         _history.value = emptyList()
         prefs.edit().remove(KEY_HISTORY).apply()
+        scope.launch { WatchNextManager.removeAll(appContext) }
     }
 
     // ---- watchlist ----

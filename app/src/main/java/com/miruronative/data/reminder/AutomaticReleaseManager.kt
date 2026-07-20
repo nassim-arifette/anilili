@@ -192,8 +192,21 @@ class AutomaticReleaseReceiver : BroadcastReceiver() {
             .setCategory(NotificationCompat.CATEGORY_EVENT)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
-        context.getSystemService(NotificationManager::class.java)
-            .notify(17 * mediaId + episode, notification)
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager.notify(17 * mediaId + episode, notification)
+        // Group summary so multiple release alerts collapse into one expandable entry.
+        manager.notify(
+            -1002,
+            NotificationCompat.Builder(context, AutomaticReleaseManager.CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("New episode releases")
+                .setContentIntent(open)
+                .setGroup(AutomaticReleaseManager.CHANNEL_ID)
+                .setGroupSummary(true)
+                .setAutoCancel(true)
+                .setCategory(NotificationCompat.CATEGORY_EVENT)
+                .build(),
+        )
     }
 }
 
@@ -244,7 +257,8 @@ class ReleaseSyncWorker(
             }
             if (AuthManager.isLoggedIn) {
                 runCatching {
-                    val (items, _) = repo.notifications(markAllRead = false)
+                    val (items, unread) = repo.notifications(markAllRead = false)
+                    NotificationCenter.setUnread(unread)
                     AniListNotificationPushManager.notifyUnread(applicationContext, items)
                 }
 
