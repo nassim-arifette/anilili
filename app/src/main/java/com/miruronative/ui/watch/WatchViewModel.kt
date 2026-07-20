@@ -79,6 +79,11 @@ private data class EpisodeSourceKey(
     val category: Category,
 )
 
+private data class PendingResolution(
+    val id: Long,
+    val key: EpisodeResolutionKey,
+)
+
 class WatchViewModel : ViewModel() {
     private val repo = AppGraph.repository
 
@@ -117,6 +122,9 @@ class WatchViewModel : ViewModel() {
     private var sourceValidationJob: Job? = null
     private var mergedIncludesAnivexa = false
     private var mergedEpisodes = EpisodesResult(emptyList())
+    private var pendingResolution: PendingResolution? = null
+    private var resolutionRequestId = 0L
+    private var playbackGenerationCounter = 0
 
     fun start(id: Int, providerName: String, categoryApi: String, episodeNumber: String) {
         val key = "$id/$providerName/$categoryApi/$episodeNumber"
@@ -143,6 +151,7 @@ class WatchViewModel : ViewModel() {
         mergedIncludesAnivexa = false
         episodeMeta = emptyList()
 
+        invalidatePendingResolution()
         resolveJob?.cancel()
         episodeMetaJob?.cancel()
         anivexaMergeJob?.cancel()
@@ -482,6 +491,7 @@ class WatchViewModel : ViewModel() {
                 popularity = popularity,
                 description = description,
                 startPositionMs = resume,
+                playbackGeneration = nextPlaybackGeneration(),
                 preferredProvider = globalPreferredProvider,
                 isResolving = false,
                 isLoadingMoreSources = !mergedIncludesAnivexa,
@@ -638,10 +648,34 @@ class WatchViewModel : ViewModel() {
         playIndex(cur + 1)
     }
 
+    internal fun nextFromPlayback(requestedBy: PlaybackNavigationIdentity) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (!isCurrentPlaybackNavigation(requestedBy, data.playbackNavigationIdentity())) {
+            DiagnosticsLog.event(
+                "Watch ignored stale player next episode=${fmt(requestedBy.episodeNumber)} " +
+                    "generation=${requestedBy.playbackGeneration}",
+            )
+            return
+        }
+        next()
+    }
+
     fun prev() {
         DiagnosticsLog.event("Watch prev requested")
         val cur = (_state.value as? UiState.Success)?.data?.currentIndex ?: return
         playIndex(cur - 1)
+    }
+
+    internal fun prevFromPlayback(requestedBy: PlaybackNavigationIdentity) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (!isCurrentPlaybackNavigation(requestedBy, data.playbackNavigationIdentity())) {
+            DiagnosticsLog.event(
+                "Watch ignored stale player previous episode=${fmt(requestedBy.episodeNumber)} " +
+                    "generation=${requestedBy.playbackGeneration}",
+            )
+            return
+        }
+        prev()
     }
 
     fun retry() {
@@ -653,7 +687,20 @@ class WatchViewModel : ViewModel() {
 
     /** All episode resolution goes through here so a failure becomes an error state, not a crash. */
     private fun launchResolve(number: Double, before: (suspend () -> Unit)? = null) {
-        DiagnosticsLog.event("Watch launchResolve episode=${fmt(number)}")
+        val key = EpisodeResolutionKey(
+            animeId = anilistId,
+            episodeNumber = number,
+            preferredProvider = preferred,
+            category = category,
+            excludedProviders = failedProviders.toSet(),
+        )
+        if (isDuplicateEpisodeResolution(resolveJob?.isActive == true, pendingResolution?.key, key)) {
+            DiagnosticsLog.event("Watch ignored duplicate resolve episode=${fmt(number)}")
+            return
+        }
+        val request = PendingResolution(++resolutionRequestId, key)
+        pendingResolution = request
+        DiagnosticsLog.event("Watch launchResolve episode=${fmt(number)} request=${request.id}")
         resolveJob?.cancel()
         resolveJob = viewModelScope.launch {
             try {
@@ -664,8 +711,24 @@ class WatchViewModel : ViewModel() {
                 DiagnosticsLog.throwable("Watch resolve failed id=$anilistId episode=${fmt(number)}", e)
                 _loadingStatus.value = null
                 _state.value = UiState.Error(e.message ?: "Failed to load episode")
+            } finally {
+                if (pendingResolution?.id == request.id) pendingResolution = null
             }
         }
+    }
+
+    private fun invalidatePendingResolution() {
+        resolutionRequestId++
+        pendingResolution = null
+    }
+
+    private fun nextPlaybackGeneration(): Int {
+        playbackGenerationCounter = if (playbackGenerationCounter == Int.MAX_VALUE) {
+            1
+        } else {
+            playbackGenerationCounter + 1
+        }
+        return playbackGenerationCounter
     }
 
     fun onPlaybackError(message: String, streamUrl: String, positionMs: Long) {
@@ -699,7 +762,7 @@ class WatchViewModel : ViewModel() {
                     data.copy(
                         chosenStream = next,
                         startPositionMs = resume,
-                        playbackGeneration = data.playbackGeneration + 1,
+                        playbackGeneration = nextPlaybackGeneration(),
                         notice = "${failed?.label ?: "AllAnime source"} failed. Trying ${next.label}…",
                     ),
                 )

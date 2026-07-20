@@ -289,6 +289,8 @@ fun WatchScreen(
                     onBack = pauseAndBack,
                     onPrev = vm::prev,
                     onNext = vm::next,
+                    onPlayerPrev = vm::prevFromPlayback,
+                    onPlayerNext = vm::nextFromPlayback,
                     onChangeSource = vm::changeSource,
                     onChangeCategory = vm::changeCategory,
                     onSelectEpisode = { index ->
@@ -317,6 +319,8 @@ private fun WatchContent(
     onBack: () -> Unit,
     onPrev: () -> Unit,
     onNext: () -> Unit,
+    onPlayerPrev: (PlaybackNavigationIdentity) -> Unit,
+    onPlayerNext: (PlaybackNavigationIdentity) -> Unit,
     onChangeSource: (String, String) -> Unit,
     onChangeCategory: (String) -> Unit,
     onSelectEpisode: (Int) -> Unit,
@@ -329,6 +333,7 @@ private fun WatchContent(
     onPlayerClosed: () -> Unit = {},
 ) {
     val device = LocalAppDeviceProfile.current
+    val playbackNavigation = data.playbackNavigationIdentity()
     val summaryFocus = remember { FocusRequester() }
     val sourceFocus = remember { FocusRequester() }
     val tvEpisodeListState = rememberLazyListState()
@@ -472,8 +477,8 @@ private fun WatchContent(
                             EmbedEpisodeNavigationEffect(
                                 hasPrevious = data.hasPrev,
                                 hasNext = data.hasNext,
-                                onPrevious = onPrev,
-                                onNext = onNext,
+                                onPrevious = { onPlayerPrev(playbackNavigation) },
+                                onNext = { onPlayerNext(playbackNavigation) },
                             )
                             EmbedWebView(
                                 url = stream.url,
@@ -482,8 +487,8 @@ private fun WatchContent(
                                 qualityStreams = data.sources.embedStreams,
                                 startPositionMs = data.startPositionMs,
                                 skip = data.sources.skip,
-                                onPreviousEpisode = onPrev,
-                                onNextEpisode = onNext,
+                                onPreviousEpisode = { onPlayerPrev(playbackNavigation) },
+                                onNextEpisode = { onPlayerNext(playbackNavigation) },
                                 hasPreviousEpisode = data.hasPrev,
                                 hasNextEpisode = data.hasNext,
                                 focusPlayerOnStart = fullscreen,
@@ -529,14 +534,19 @@ private fun WatchContent(
                         provider = data.provider,
                         category = data.category.api,
                         episode = data.current.displayNumber,
-                        onEnded = { if (com.miruronative.data.settings.SettingsStore.autoplay.value) onNext() },
-                        onNextEpisode = onNext,
+                        playbackNavigationIdentity = playbackNavigation,
+                        onEnded = { endedBy ->
+                            if (com.miruronative.data.settings.SettingsStore.autoplay.value) {
+                                onPlayerNext(endedBy)
+                            }
+                        },
+                        onNextEpisode = { onPlayerNext(playbackNavigation) },
                         onError = onPlaybackError,
                         modifier = Modifier.fillMaxSize(),
                         onToggleFullscreen = onToggleFullscreen,
                         startPositionMs = data.startPositionMs,
                         onProgress = onProgress,
-                        onPreviousEpisode = onPrev,
+                        onPreviousEpisode = { onPlayerPrev(playbackNavigation) },
                         hasNextEpisode = data.hasNext,
                         hasPreviousEpisode = data.hasPrev,
                         focusPlayerOnStart = fullscreen,

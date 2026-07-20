@@ -92,6 +92,7 @@ import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.DefaultTrackNameProvider
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.SubtitleView
+import com.miruronative.data.model.Category
 import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.model.SubtitleItem
@@ -215,6 +216,38 @@ private class EpisodeControlPlayer(
     }
 }
 
+private const val EXTRA_NAV_ANIME_ID = "anilili.navigation.ANIME_ID"
+private const val EXTRA_NAV_EPISODE_NUMBER = "anilili.navigation.EPISODE_NUMBER"
+private const val EXTRA_NAV_PROVIDER = "anilili.navigation.PROVIDER"
+private const val EXTRA_NAV_CATEGORY = "anilili.navigation.CATEGORY"
+private const val EXTRA_NAV_GENERATION = "anilili.navigation.GENERATION"
+private const val EXTRA_NAV_STREAM_URL = "anilili.navigation.STREAM_URL"
+private const val EXTRA_NAV_MEDIA_ID = "anilili.navigation.MEDIA_ID"
+
+private fun MediaItem.playbackNavigationIdentityOrNull(): PlaybackNavigationIdentity? {
+    val extras = mediaMetadata.extras ?: return null
+    if (
+        !extras.containsKey(EXTRA_NAV_ANIME_ID) ||
+        !extras.containsKey(EXTRA_NAV_EPISODE_NUMBER) ||
+        !extras.containsKey(EXTRA_NAV_PROVIDER) ||
+        !extras.containsKey(EXTRA_NAV_CATEGORY) ||
+        !extras.containsKey(EXTRA_NAV_GENERATION) ||
+        !extras.containsKey(EXTRA_NAV_STREAM_URL) ||
+        !extras.containsKey(EXTRA_NAV_MEDIA_ID)
+    ) {
+        return null
+    }
+    if (extras.getString(EXTRA_NAV_MEDIA_ID) != mediaId) return null
+    return PlaybackNavigationIdentity(
+        animeId = extras.getInt(EXTRA_NAV_ANIME_ID),
+        episodeNumber = extras.getDouble(EXTRA_NAV_EPISODE_NUMBER),
+        provider = extras.getString(EXTRA_NAV_PROVIDER) ?: return null,
+        category = Category.from(extras.getString(EXTRA_NAV_CATEGORY) ?: return null),
+        playbackGeneration = extras.getInt(EXTRA_NAV_GENERATION),
+        streamUrl = extras.getString(EXTRA_NAV_STREAM_URL),
+    )
+}
+
 /** Media3 player surface backed by [PlaybackService] for PiP and system media controls. */
 @OptIn(UnstableApi::class)
 @Composable
@@ -230,8 +263,9 @@ fun PlayerSurface(
     provider: String,
     category: String,
     episode: String,
-    onEnded: () -> Unit,
-    onNextEpisode: () -> Unit = onEnded,
+    playbackNavigationIdentity: PlaybackNavigationIdentity,
+    onEnded: (PlaybackNavigationIdentity) -> Unit,
+    onNextEpisode: () -> Unit,
     onError: (String, String, Long) -> Unit,
     modifier: Modifier = Modifier,
     onToggleFullscreen: (() -> Unit)? = null,
@@ -320,7 +354,9 @@ fun PlayerSurface(
                     )
                     // The default-quality effect waits for READY; re-trigger it when we get there.
                     if (playbackState == Player.STATE_READY) tracksRevision++
-                    if (playbackState == Player.STATE_ENDED) onEnded()
+                    if (playbackState == Player.STATE_ENDED) {
+                        activeController.currentMediaItem?.playbackNavigationIdentityOrNull()?.let(onEnded)
+                    }
                 }
 
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -376,9 +412,13 @@ fun PlayerSurface(
         }
     }
 
-    LaunchedEffect(controller, activeStream.url, subtitles) {
+    LaunchedEffect(controller, activeStream.url, subtitles, playbackNavigationIdentity) {
         val activeController = controller ?: return@LaunchedEffect
-        if (activeController.currentMediaItem?.mediaId == activeStream.url) {
+        val currentItem = activeController.currentMediaItem
+        if (
+            currentItem?.mediaId == activeStream.url &&
+            currentItem?.playbackNavigationIdentityOrNull() == playbackNavigationIdentity
+        ) {
             DiagnosticsLog.event(
                 "PlayerSurface media item already active " +
                     "host=${activeStream.host()} type=${activeStream.typeLabel()}",
@@ -399,6 +439,13 @@ fun PlayerSurface(
             .apply { artworkUrl?.let { setArtworkUri(Uri.parse(it)) } }
             .setExtras(Bundle().apply {
                 putString(PlaybackService.EXTRA_WATCH_ROUTE, watchRoute)
+                putInt(EXTRA_NAV_ANIME_ID, playbackNavigationIdentity.animeId)
+                putDouble(EXTRA_NAV_EPISODE_NUMBER, playbackNavigationIdentity.episodeNumber)
+                putString(EXTRA_NAV_PROVIDER, playbackNavigationIdentity.provider)
+                putString(EXTRA_NAV_CATEGORY, playbackNavigationIdentity.category.api)
+                putInt(EXTRA_NAV_GENERATION, playbackNavigationIdentity.playbackGeneration)
+                putString(EXTRA_NAV_STREAM_URL, playbackNavigationIdentity.streamUrl)
+                putString(EXTRA_NAV_MEDIA_ID, activeStream.url)
             })
             .build()
         val item = MediaItem.Builder()
