@@ -13,6 +13,7 @@ import androidx.media3.common.DeviceInfo
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlayerTransferState
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.cast.CastPlayer
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -112,6 +113,30 @@ class PlaybackService : MediaSessionService() {
             }
         castPlayer = CastPlayer.Builder(this)
             .setLocalPlayer(player)
+            .setTransferCallback { sourcePlayer, targetPlayer ->
+                val sourceRoute = sourcePlayer.playbackRoute()
+                val targetRoute = targetPlayer.playbackRoute()
+                val directive = castTransferDirective(
+                    sourceRoute = sourceRoute,
+                    targetRoute = targetRoute,
+                    hasLocalPlaybackOwner = localPlaybackOwners.hasOwner(),
+                )
+                DiagnosticsLog.event(
+                    "PlaybackService Cast transfer source=$sourceRoute target=$targetRoute " +
+                        "directive=$directive",
+                )
+                if (directive == CastTransferDirective.TRANSFER_LOCAL_PAUSED) {
+                    // Copy the same state as Media3's default callback, but never send a transient
+                    // play command to ExoPlayer while it is still becoming the active route.
+                    PlayerTransferState.builderFromPlayer(sourcePlayer)
+                        .setPlayWhenReady(false)
+                        .build()
+                        .setToPlayer(targetPlayer)
+                    suppressMediaButtonResume = true
+                } else {
+                    CastPlayer.TransferCallback.DEFAULT.transferState(sourcePlayer, targetPlayer)
+                }
+            }
             .build()
             .apply {
                 addListener(object : Player.Listener {
@@ -306,6 +331,19 @@ class PlaybackService : MediaSessionService() {
         private var activePlaylistKey: String? = null
         @Volatile
         private var activePlayer: Player? = null
+        private val localPlaybackOwners = LocalPlaybackOwnerRegistry()
+
+        internal fun acquireLocalPlaybackOwner(): LocalPlaybackOwnerToken {
+            val token = localPlaybackOwners.acquire()
+            DiagnosticsLog.event("PlaybackService local playback owner acquired id=${token.id}")
+            return token
+        }
+
+        internal fun releaseLocalPlaybackOwner(token: LocalPlaybackOwnerToken) {
+            if (localPlaybackOwners.release(token)) {
+                DiagnosticsLog.event("PlaybackService local playback owner released id=${token.id}")
+            }
+        }
 
         /**
          * Set by the watch screen while it is visible: receives +1/-1 and resolves the
@@ -381,6 +419,13 @@ class PlaybackService : MediaSessionService() {
         }
     }
 }
+
+private fun Player.playbackRoute(): PlaybackRoute =
+    if (deviceInfo.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE) {
+        PlaybackRoute.REMOTE
+    } else {
+        PlaybackRoute.LOCAL
+    }
 
 private fun Int.stateName(): String = when (this) {
     Player.STATE_IDLE -> "IDLE"
