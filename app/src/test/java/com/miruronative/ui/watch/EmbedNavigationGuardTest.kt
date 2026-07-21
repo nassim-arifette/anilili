@@ -122,6 +122,7 @@ class EmbedNavigationGuardTest {
             videoIdentity = EmbedVideoIdentity(signedVideo, 1),
         )
         val sourceIdentity = checkNotNull(identity.aniSkipSourceIdentity())
+        val playbackIdentity = checkNotNull(identity.playbackProgressIdentity())
         val diagnostic = identity.toString()
 
         assertTrue(sourceIdentity.startsWith("embed-sha256:"))
@@ -130,6 +131,10 @@ class EmbedNavigationGuardTest {
         assertFalse(diagnostic.contains(signedDocument))
         assertFalse(diagnostic.contains(signedVideo))
         assertFalse(identity.videoIdentity.toString().contains("video-secret"))
+        assertEquals(signedDocument, playbackIdentity.mediaId)
+        assertEquals(sourceIdentity, playbackIdentity.sourceIdentityForAniSkipLookup())
+        assertFalse(playbackIdentity.toString().contains("document-secret"))
+        assertFalse(playbackIdentity.toString().contains(sourceIdentity))
     }
 
     @Test

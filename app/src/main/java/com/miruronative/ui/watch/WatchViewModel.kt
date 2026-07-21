@@ -1054,6 +1054,7 @@ class WatchViewModel : ViewModel() {
             }
             EmbedMediaHandoffDecision.KEEP -> Unit
             EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP -> {
+                flushProgressBeforeEmbedMediaHandoff(data)
                 activeEmbedMediaIdentity = identity
                 activeNativePlaybackIdentity = null
                 cancelAniSkipWork()
@@ -1094,9 +1095,8 @@ class WatchViewModel : ViewModel() {
             return
         }
         val key = identity.playbackKey
-        val sourceIdentity = identity.aniSkipSourceIdentity()
-        val mediaInstanceId = identity.mediaInstanceId
-        if (sourceIdentity == null || mediaInstanceId == null) {
+        val progressIdentity = identity.playbackProgressIdentity()
+        if (progressIdentity == null) {
             DiagnosticsLog.event(
                 "Watch ignored embed progress without concrete video identity " +
                     "episode=${fmt(key.episodeNumber)} generation=${key.sourceGeneration} " +
@@ -1106,13 +1106,7 @@ class WatchViewModel : ViewModel() {
         }
         acceptProgress(
             data = data,
-            identity = PlaybackIdentity(
-                animeId = key.animeId,
-                episodeNumber = key.episodeNumber,
-                generation = key.sourceGeneration,
-                mediaId = sourceIdentity,
-                mediaInstanceId = mediaInstanceId,
-            ),
+            identity = progressIdentity,
             positionMs = positionMs,
             durationMs = durationMs,
         )
@@ -1177,13 +1171,16 @@ class WatchViewModel : ViewModel() {
             )
             return false
         }
-        val progressIdentity = PlaybackIdentity(
-            animeId = commit.playbackKey.animeId,
-            episodeNumber = commit.playbackKey.episodeNumber,
-            generation = commit.playbackKey.sourceGeneration,
-            mediaId = data.chosenStream?.url
-                ?: "embed:${commit.playbackKey.provider}:${commit.playbackKey.category}",
-        )
+        val progressIdentity = activeEmbedMediaIdentity
+            ?.takeIf { it.playbackKey == commit.playbackKey }
+            ?.playbackProgressIdentity()
+            ?: PlaybackIdentity(
+                animeId = commit.playbackKey.animeId,
+                episodeNumber = commit.playbackKey.episodeNumber,
+                generation = commit.playbackKey.sourceGeneration,
+                mediaId = data.chosenStream?.url
+                    ?: "embed:${commit.playbackKey.provider}:${commit.playbackKey.category}",
+            )
         committedEmbedPlaybackKey = commit.playbackKey
         confirmedHistoryIdentity = progressIdentity
         lastKnownProgress = PlaybackProgressSnapshot(progressIdentity, commit.positionMs, commit.durationMs)
@@ -1310,10 +1307,30 @@ class WatchViewModel : ViewModel() {
         return flushProgressBeforeTransition(
             candidate = lastKnownProgress,
             confirmedIdentity = confirmedHistoryIdentity,
-            activeTarget = data?.playbackTarget(),
+            activeTarget = data?.activePlaybackTarget(),
             persist = ::persistTransitionProgress,
             transition = transition,
         )
+    }
+
+    /**
+     * A same-document video or quality handoff invalidates its former instance immediately. Bank
+     * the outgoing confirmed position against the old active identity first, then discard that
+     * snapshot so an exit between activation and the replacement's first tick cannot save it as
+     * though it belonged to the new concrete video.
+     */
+    private fun flushProgressBeforeEmbedMediaHandoff(data: WatchData) {
+        val outgoingInstanceId = activeEmbedMediaIdentity?.mediaInstanceId ?: return
+        flushProgressBeforeTransition(
+            candidate = lastKnownProgress,
+            confirmedIdentity = confirmedHistoryIdentity,
+            activeTarget = data.activePlaybackTarget(),
+            persist = ::persistTransitionProgress,
+            transition = {},
+        )
+        lastKnownProgress = lastKnownProgress?.takeUnless { snapshot ->
+            snapshot.identity.mediaInstanceId == outgoingInstanceId
+        }
     }
 
     private fun persistTransitionProgress(progress: PlaybackProgressSnapshot) {
@@ -1391,6 +1408,16 @@ class WatchViewModel : ViewModel() {
         )
     }
 
+    /** Native sources have no in-document instance; managed embeds require the exact active one. */
+    private fun WatchData.activePlaybackTarget(): ActivePlaybackTarget {
+        val target = playbackTarget()
+        if (chosenStream?.isEmbed != true && !ProviderCatalog.isEmbed(provider)) return target
+        return target.scopedToActiveEmbedMedia(
+            active = activeEmbedMediaIdentity,
+            currentPlaybackKey = embedPlaybackKey(),
+        )
+    }
+
     fun onEmbedPlaybackError(
         key: EmbedPlaybackKey,
         message: String,
@@ -1446,7 +1473,7 @@ class WatchViewModel : ViewModel() {
             return
         }
         val progress = lastKnownProgress ?: return
-        if (!acceptsPlaybackProgress(progress.identity, data.playbackTarget()) || progress.positionMs <= 0) return
+        if (!acceptsPlaybackProgress(progress.identity, data.activePlaybackTarget()) || progress.positionMs <= 0) return
         lastProgressSave = SystemClock.elapsedRealtime()
         lastProgressSaveIdentity = progress.identity
         LibraryStore.updateProgress(
@@ -1985,7 +2012,7 @@ private fun WatchData.aniSkipLookupIdentity(
     provider = provider,
     category = category,
     sourceGeneration = playbackGeneration,
-    mediaId = playbackIdentity.mediaId,
+    mediaId = playbackIdentity.sourceIdentityForAniSkipLookup(),
     durationBucketMs = durationBucketMs,
     mediaInstanceId = playbackIdentity.mediaInstanceId,
 )
