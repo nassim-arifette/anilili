@@ -1384,14 +1384,21 @@ internal fun PlayerSurface(
             )
         }
 
-        // Phone controls, shown: the shared control bar (identical to the embed player) over a
-        // full-screen scrim that hides it again on a tap in empty space.
-        if (controller != null && !device.isTv && phoneControlsVisible) {
-            Box(
-                Modifier
-                    .matchParentSize()
-                    .pointerInput(Unit) { detectTapGestures { phoneControlsVisible = false } },
-            )
+        // Phone shared chrome: the full bar sits over a dismissible scrim while visible. After it
+        // auto-hides, only a contextual skip/next action remains mounted above GestureControls;
+        // taps elsewhere still reach the gesture layer and reveal the full chrome again.
+        if (
+            controller != null &&
+            !device.isTv &&
+            shouldComposePlayerChrome(phoneControlsVisible, primaryAction != null)
+        ) {
+            if (phoneControlsVisible) {
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .pointerInput(Unit) { detectTapGestures { phoneControlsVisible = false } },
+                )
+            }
             PlayerControlsScaffold(
                 isPlaying = playbackIsPlaying,
                 positionMs = positionMs,
@@ -1430,6 +1437,7 @@ internal fun PlayerSurface(
                 episodeTitle = episodeTitle,
                 onExitFullscreen = if (isFullscreen) onToggleFullscreen else null,
                 onInteract = { phoneControlsInteraction++ },
+                showChrome = phoneControlsVisible,
                 primaryAction = primaryAction,
             ) {
                 PlayerControlIconButton(

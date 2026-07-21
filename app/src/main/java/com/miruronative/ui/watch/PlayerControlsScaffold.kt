@@ -94,6 +94,7 @@ internal fun PlayerControlsScaffold(
     episodeTitle: String? = null,
     onExitFullscreen: (() -> Unit)? = null,
     onInteract: () -> Unit = {},
+    showChrome: Boolean = true,
     primaryAction: PlayerChromeAction? = null,
     bottomRightIcons: @Composable RowScope.() -> Unit = {},
 ) {
@@ -119,25 +120,27 @@ internal fun PlayerControlsScaffold(
             PlayerChromeLayout.CINEMA -> 24.dp
         }
 
-        Box(
-            Modifier
-                .matchParentSize()
-                .background(
-                    Brush.verticalGradient(
-                        0f to Color.Black.copy(alpha = 0.56f),
-                        0.30f to Color.Transparent,
-                        0.58f to Color.Transparent,
-                        1f to Color.Black.copy(alpha = 0.88f),
+        if (showChrome) {
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .background(
+                        Brush.verticalGradient(
+                            0f to Color.Black.copy(alpha = 0.56f),
+                            0.30f to Color.Transparent,
+                            0.58f to Color.Transparent,
+                            1f to Color.Black.copy(alpha = 0.88f),
+                        ),
                     ),
-                ),
-        )
+            )
+        }
 
         PlayerChromeHeader(
-            seriesTitle = seriesTitle,
-            episodeTitle = episodeTitle,
+            seriesTitle = seriesTitle.takeIf { showChrome },
+            episodeTitle = episodeTitle.takeIf { showChrome },
             compact = compact,
-            showMetadata = !minimal,
-            onExitFullscreen = onExitFullscreen,
+            showMetadata = showChrome && !minimal,
+            onExitFullscreen = onExitFullscreen.takeIf { showChrome },
             action = primaryAction,
             actionPresentation = playerChromeActionPresentation(
                 widthDp = maxWidth.value,
@@ -153,6 +156,8 @@ internal fun PlayerControlsScaffold(
                 .fillMaxWidth()
                 .padding(start = horizontalPadding, end = horizontalPadding, top = if (compact) 4.dp else 12.dp),
         )
+
+        if (!showChrome) return@BoxWithConstraints
 
         Row(
             modifier = Modifier

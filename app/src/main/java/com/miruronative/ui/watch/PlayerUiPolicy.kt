@@ -46,6 +46,12 @@ internal fun playerChromeActionContent(
     contentDescription = label,
 )
 
+/** Keeps the contextual action mounted when transport chrome auto-hides. */
+internal fun shouldComposePlayerChrome(
+    showChrome: Boolean,
+    hasPrimaryAction: Boolean,
+): Boolean = showChrome || hasPrimaryAction
+
 internal fun playerChromeLayout(
     widthDp: Float,
     heightDp: Float,

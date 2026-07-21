@@ -56,6 +56,7 @@ internal fun EmbedTouchControls(
     isFullscreen: Boolean = false,
     onFullscreen: (() -> Unit)? = null,
     onInteract: () -> Unit = {},
+    showChrome: Boolean = true,
     primaryAction: PlayerChromeAction? = null,
 ) {
     PlayerControlsScaffold(
@@ -74,6 +75,7 @@ internal fun EmbedTouchControls(
         episodeTitle = episodeTitle,
         onExitFullscreen = if (isFullscreen) onFullscreen else null,
         onInteract = onInteract,
+        showChrome = showChrome,
         primaryAction = primaryAction,
         modifier = modifier,
     ) {

@@ -107,6 +107,14 @@ class PlayerUiPolicyTest {
     }
 
     @Test
+    fun `contextual action stays composed when transport chrome auto hides`() {
+        assertEquals(true, shouldComposePlayerChrome(showChrome = true, hasPrimaryAction = false))
+        assertEquals(true, shouldComposePlayerChrome(showChrome = true, hasPrimaryAction = true))
+        assertEquals(true, shouldComposePlayerChrome(showChrome = false, hasPrimaryAction = true))
+        assertEquals(false, shouldComposePlayerChrome(showChrome = false, hasPrimaryAction = false))
+    }
+
+    @Test
     fun `settings only expose capabilities supported by active player`() {
         val sections = availablePlayerSettingsSections(
             PlayerSettingsAvailability(

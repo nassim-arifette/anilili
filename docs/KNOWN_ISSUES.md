@@ -86,7 +86,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | ID | Status | Fix | Topic branch |
 | --- | --- | --- | --- |
 | UI-001 | [x] | Make adaptive player chrome selection aware of Android font scale. Short inline players now omit metadata before enlarged two-line titles can overlap transport controls, while layouts with enough room retain their compact or cinema presentation. | `fix/player-large-font-overlap` |
-| UI-002 | [x] | Reserve one shared, chrome-aware skip/next action slot for native and managed-embed players. Minimal 320 x 180 chrome uses a 48 dp icon target with the full accessible label; compact and cinema chrome retain the full visible pure, mixed, recap, or next-episode label without covering metadata, transport, timeline, or footer controls. | `fix/player-skip-action-layout` |
+| UI-002 | [x] | Reserve one shared, chrome-aware skip/next action slot for native and managed-embed players, including an action-only state while transport chrome auto-hides. Minimal 320 x 180 chrome uses a 48 dp icon target with the full accessible label; compact and cinema chrome retain the full visible pure, mixed, recap, or next-episode label without covering metadata, transport, timeline, or footer controls. | `fix/player-skip-action-layout` |
 
 ## Follow-up issue checklist
 

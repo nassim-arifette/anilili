@@ -1189,7 +1189,13 @@ fun EmbedWebView(
                 },
         )
 
-        if (touchControlsActive && touchControlsVisible) {
+        // Keep the shared contextual action mounted after transport auto-hide. The transparent
+        // scaffold has no surface-wide pointer handler, so taps outside that button still reach
+        // PlayerGestureControls and reveal the complete embed chrome.
+        if (
+            touchControlsActive &&
+            shouldComposePlayerChrome(touchControlsVisible, primaryAction != null)
+        ) {
             EmbedTouchControls(
                 positionMs = positionMs,
                 durationMs = durationMs,
@@ -1221,6 +1227,7 @@ fun EmbedWebView(
                 isFullscreen = isFullscreen,
                 onFullscreen = onToggleFullscreen,
                 onInteract = { touchControlsInteraction++ },
+                showChrome = touchControlsVisible,
                 primaryAction = primaryAction,
             )
         }
