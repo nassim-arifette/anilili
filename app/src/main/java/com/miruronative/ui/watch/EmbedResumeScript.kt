@@ -4,15 +4,18 @@ private const val EMBED_RESUME_RETRY_INTERVAL_MS = 250
 private const val EMBED_RESUME_TIMEOUT_MS = 60_000
 
 /**
- * Waits for a directly accessible HTML5 video, seeks to the saved position, then starts it.
+ * Waits for the exact identified HTML5 video, seeks to the saved position, then starts it.
  *
  * Embed pages often finish loading before their player or same-origin iframe exists. Keep retrying
  * for a bounded period, and re-check the navigation generation and revocation state before every
- * attempt so a timer created by a replaced document cannot control the new playback session.
+ * attempt so a timer created by a replaced document cannot control the new playback session. The
+ * expected concrete identity also prevents a same-document replacement from receiving the seek.
  */
 internal fun embedResumeWhenReadyJs(
     targetSec: Double,
     navigationGeneration: Long,
+    expectedMediaIdentity: String,
+    expectedMediaGeneration: Long,
 ): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
@@ -22,6 +25,8 @@ internal fun embedResumeWhenReadyJs(
           window.__aniliNavigationRevoked !== true;
       }
       ${embedContentVideoSelectorJs()}
+      var expectedMediaIdentity = ${expectedMediaIdentity.toJsStringLiteral()};
+      var expectedMediaGeneration = $expectedMediaGeneration;
       function scheduleRetry() {
         if (Date.now() >= deadline) return;
         setTimeout(attemptResume, $EMBED_RESUME_RETRY_INTERVAL_MS);
@@ -32,6 +37,8 @@ internal fun embedResumeWhenReadyJs(
         try {
           var video = findContentVideo();
           if (video && video.readyState >= 1) {
+            if (__aniliMediaIdentity(video) !== expectedMediaIdentity ||
+                __aniliMediaGeneration(video) !== expectedMediaGeneration) return;
             var target = $targetSec;
             video.currentTime = isFinite(video.duration) && video.duration > 0
               ? Math.min(target, video.duration)

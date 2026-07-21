@@ -203,6 +203,7 @@ fun EmbedWebView(
     var durationMs by remember(playbackKey, url) { mutableLongStateOf(0L) }
     var webIsPlaying by remember(playbackKey, url) { mutableStateOf(false) }
     var webMediaIdentity by remember(playbackKey, url) { mutableStateOf<EmbedVideoIdentity?>(null) }
+    var resumeDispatched by remember(navigationSession.generation) { mutableStateOf(false) }
     var webVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     var lastAudibleVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     // Cross-origin embeds (some Kiwi mirrors) put the video out of the injected JS's reach, so
@@ -772,6 +773,34 @@ fun EmbedWebView(
     LaunchedEffect(
         canControlPlayback,
         controlledMediaInstanceId,
+        webView,
+        navigationSession.generation,
+    ) {
+        if (
+            resumeDispatched ||
+            !canControlPlayback ||
+            navigationSession.request.resumePositionMs <= 0L ||
+            !navigationGuard.isCurrent(navigationSession)
+        ) {
+            return@LaunchedEffect
+        }
+        val web = webView ?: return@LaunchedEffect
+        val expectedMedia = webMediaIdentity ?: return@LaunchedEffect
+        resumeDispatched = true
+        web.evaluateJavascript(
+            embedResumeWhenReadyJs(
+                targetSec = navigationSession.request.resumePositionMs / 1_000.0,
+                navigationGeneration = navigationSession.generation,
+                expectedMediaIdentity = expectedMedia.mediaId,
+                expectedMediaGeneration = expectedMedia.generation,
+            ),
+            null,
+        )
+    }
+
+    LaunchedEffect(
+        canControlPlayback,
+        controlledMediaInstanceId,
         playbackSpeed,
         webView,
         navigationSession.generation,
@@ -1306,25 +1335,13 @@ fun EmbedWebView(
                                         "host=${loadedUrl.hostOrNone()} title=${finishedView.title ?: "none"}",
                                 )
                                 if (playbackMode.exposesNativeBridge) {
-                                    val navigationSetupJs = buildString {
-                                        appendLine(
-                                            authenticatedProgressPollJs(
-                                                navigationSession.generation,
-                                                progressBridgeToken,
-                                            ),
-                                        )
-                                        if (navigationSession.request.resumePositionMs > 0L) {
-                                            append(
-                                                embedResumeWhenReadyJs(
-                                                    navigationSession.request.resumePositionMs / 1000.0,
-                                                    navigationSession.generation,
-                                                ),
-                                            )
-                                        }
-                                    }
-                                    // One evaluation preserves setup order: the document receives
-                                    // its capability before the capability-scoped resume timer.
-                                    finishedView.evaluateJavascript(navigationSetupJs, null)
+                                    finishedView.evaluateJavascript(
+                                        authenticatedProgressPollJs(
+                                            navigationSession.generation,
+                                            progressBridgeToken,
+                                        ),
+                                        null,
+                                    )
                                 }
                             },
                             onMainFrameErrorAccepted = { message ->
@@ -1971,7 +1988,7 @@ private fun CaptionEdgeStyle.toCssTextShadow(): String = when (this) {
     CaptionEdgeStyle.DROP_SHADOW -> "2px 2px 3px rgba(0, 0, 0, 0.9)"
 }
 
-private fun String.toJsStringLiteral(): String =
+internal fun String.toJsStringLiteral(): String =
     "'" + replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
 
 internal fun togglePlaybackCommandJs(
