@@ -110,7 +110,8 @@ class ProfileViewModel : ViewModel() {
                 loadIfLoggedIn()
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
-                MalAuthManager.logout()
+                // MalAuthManager clears only the login attempt that actually failed. An
+                // unconditional logout here could erase a newer login that won the race.
                 _profile.value = UiState.Error(e.message ?: "MyAnimeList login failed")
             }
         }
