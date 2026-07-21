@@ -45,6 +45,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | HISTORY-006 | [x] | Require a known series episode total and an exact final-episode match before marking a title completed. The latest released episode of an airing series remains resumable. | `fix/final-episode-completion-evidence` |
 | HISTORY-007 | [x] | Key Watch Next throttling by episode/source context, use a monotonic clock, and remove completed titles. | `fix/watch-next-content-aware-throttle` |
 | HISTORY-008 | [x] | Persist sparse per-episode device progress and render only episodes actually played. Opening episode 90 no longer marks episodes 1-89 complete or fills their thumbnail bars. | `fix/per-episode-watch-progress` |
+| HISTORY-010 | [x] | Publish an identity-checked seek acknowledgement as progress after that exact embed video has already produced real playing samples. Seeking while paused and immediately closing now preserves the acknowledged position without allowing an unplayed scrub to create history. | `fix/embed-paused-seek-persistence` |
 
 ### Intro, outro, embed, and autoplay
 
