@@ -69,6 +69,7 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.CrashReporter
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
@@ -1372,7 +1373,8 @@ fun EmbedWebView(
                 if (webView === web) webView = null
                 val releasedUrl = runCatching { web.url }.getOrNull()
                 DiagnosticsLog.event(
-                    "EmbedWebView release url=${releasedUrl ?: "none"} size=${web.width}x${web.height}",
+                    "EmbedWebView release ${privacySafeUrlDiagnosticLabel(releasedUrl)} " +
+                        "size=${web.width}x${web.height}",
                 )
                 stopWebPlayback(web)
                 runCatching { web.removeJavascriptInterface("AniliProgress") }
@@ -2193,7 +2195,9 @@ private fun beginEmbedDocumentTeardown(
 }
 
 private fun stopWebPlayback(webView: WebView) {
-    DiagnosticsLog.event("EmbedWebView stop playback url=${webView.url ?: "none"}")
+    DiagnosticsLog.event(
+        "EmbedWebView stop playback ${privacySafeUrlDiagnosticLabel(webView.url)}",
+    )
     // pauseTimers() is process-wide and can freeze OAuth and hidden resolver WebViews.
     runCatching { webView.onPause() }
     var blankRequested = false

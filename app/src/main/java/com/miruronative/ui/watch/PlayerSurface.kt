@@ -95,6 +95,7 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.DefaultQuality
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import com.miruronative.playback.LocalPlaybackOwnerToken
 import com.miruronative.playback.CastSourceDecision
 import com.miruronative.playback.chooseCastSource
@@ -598,7 +599,7 @@ internal fun PlayerSurface(
                     val accepted = runIfPlaybackOwnerActive {
                         DiagnosticsLog.event(
                             "PlayerSurface playbackState=${playbackState.stateName()} " +
-                                "mediaId=${activeController.currentMediaItem?.mediaId?.take(120) ?: "none"}",
+                                "media=${privacySafeUrlDiagnosticLabel(activeController.currentMediaItem?.mediaId)}",
                         )
                         // The default-quality effect waits for READY; re-trigger it when we get there.
                         if (playbackState == Player.STATE_READY) tracksRevision++
