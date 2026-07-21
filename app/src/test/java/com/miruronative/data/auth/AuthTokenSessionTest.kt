@@ -70,6 +70,19 @@ class AuthTokenSessionTest {
     }
 
     @Test
+    fun `captured credentials never switch to a replacement account`() {
+        val session = AuthTokenSession("token-a")
+        val generationA = requireNotNull(session.authenticatedGeneration())
+
+        assertEquals("token-a", session.tokenForGeneration(generationA))
+        session.replace("token-b") {}
+
+        assertNull(session.tokenForGeneration(generationA))
+        val generationB = requireNotNull(session.authenticatedGeneration())
+        assertEquals("token-b", session.tokenForGeneration(generationB))
+    }
+
+    @Test
     fun `logged out session has no authenticated generation`() {
         val session = AuthTokenSession()
 

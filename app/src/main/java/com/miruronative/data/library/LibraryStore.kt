@@ -5,16 +5,25 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.miruronative.data.reminder.ReleaseSyncScheduler
 import com.miruronative.data.AppGraph
+import com.miruronative.data.LatestMutationTracker
+import com.miruronative.data.MutationTicket
 import com.miruronative.data.auth.AccountService
+import com.miruronative.data.auth.AccountSessionIdentity
+import com.miruronative.data.auth.AuthManager
+import com.miruronative.data.auth.MalAuthManager
+import com.miruronative.data.auth.currentAccountSession
+import com.miruronative.data.auth.isCurrentAccountSession
+import com.miruronative.data.auth.jwtSubject
 import com.miruronative.data.settings.SettingsStore
+import com.miruronative.diagnostics.DiagnosticsLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 
 /**
@@ -30,7 +39,11 @@ object LibraryStore {
     private lateinit var prefs: SharedPreferences
     private lateinit var appContext: Context
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val aniListSyncMutex = Mutex()
+    private val watchlistSyncVersions = LatestMutationTracker<Int>()
+    private val watchlistLock = Any()
+    private val remoteSyncQueue = Channel<RemoteWatchlistCommand>(Channel.UNLIMITED)
+    private val remoteSyncStartLock = Any()
+    private var remoteSyncStarted = false
 
     private val _history = MutableStateFlow<List<HistoryEntry>>(emptyList())
     val history = _history.asStateFlow()
@@ -43,6 +56,12 @@ object LibraryStore {
         prefs = appContext.getSharedPreferences("miruro_library", Context.MODE_PRIVATE)
         _history.value = decodeList(prefs.getString(KEY_HISTORY, null), HistoryEntry.serializer())
         _watchlist.value = decodeList(prefs.getString(KEY_WATCHLIST, null), WatchlistEntry.serializer())
+        synchronized(remoteSyncStartLock) {
+            if (!remoteSyncStarted) {
+                remoteSyncStarted = true
+                scope.launch { processRemoteSyncQueue() }
+            }
+        }
     }
 
     // ---- history ----
@@ -121,67 +140,149 @@ object LibraryStore {
 
     // ---- watchlist ----
 
-    fun isInWatchlist(anilistId: Int): Boolean = _watchlist.value.any { it.anilistId == anilistId }
+    fun isInWatchlist(anilistId: Int): Boolean =
+        synchronized(watchlistLock) { _watchlist.value.any { it.anilistId == anilistId } }
 
     fun toggleWatchlist(entry: WatchlistEntry) {
-        val updated = if (isInWatchlist(entry.anilistId)) {
-            _watchlist.value.filter { it.anilistId != entry.anilistId }
-        } else {
-            listOf(entry.copy(addedAt = System.currentTimeMillis())) + _watchlist.value
+        val updated = synchronized(watchlistLock) {
+            val current = _watchlist.value
+            val next = if (current.any { it.anilistId == entry.anilistId }) {
+                current.filter { it.anilistId != entry.anilistId }
+            } else {
+                listOf(entry.copy(addedAt = System.currentTimeMillis())) + current
+            }
+            _watchlist.value = next
+            persist(KEY_WATCHLIST, next, WatchlistEntry.serializer())
+            next
         }
-        _watchlist.value = updated
-        persist(KEY_WATCHLIST, updated, WatchlistEntry.serializer())
         ReleaseSyncScheduler.runNow(appContext)
-        val service = AccountService.active
-        if (service != null && SettingsStore.syncSavedToAniList.value) {
+        val session = currentAccountSession()
+        if (session != null && SettingsStore.syncSavedToAniList.value) {
             val saved = updated.any { it.anilistId == entry.anilistId }
-            scope.launch {
-                aniListSyncMutex.withLock {
-                    runCatching {
-                        when (service) {
-                            AccountService.ANILIST -> AppGraph.repository.syncSavedAnime(entry.anilistId, saved)
-                            AccountService.MAL -> AppGraph.repository.malSyncSavedAnime(entry.anilistId, saved)
-                        }
-                    }.onFailure {
-                        com.miruronative.diagnostics.DiagnosticsLog.throwable(
-                            "${service.label} saved sync failed id=${entry.anilistId} saved=$saved",
-                            it,
-                        )
-                    }
-                }
+            val ticket = watchlistSyncVersions.begin(listOf(entry.anilistId))
+            val command = RemoteWatchlistCommand.Item(
+                session = session,
+                ticket = ticket,
+                anilistId = entry.anilistId,
+                saved = saved,
+            )
+            if (remoteSyncQueue.trySend(command).isFailure) {
+                watchlistSyncVersions.complete(ticket)
+                DiagnosticsLog.event("${session.service.label} saved sync queue unavailable")
             }
         }
     }
 
     /** Push the whole device watchlist to whichever list service is signed in. */
     fun syncSavedToRemote() {
-        val service = AccountService.active ?: return
+        val session = currentAccountSession() ?: return
         if (!SettingsStore.syncSavedToAniList.value) return
-        val savedIds = _watchlist.value.map { it.anilistId }
-        scope.launch {
-            aniListSyncMutex.withLock {
-                runCatching {
-                    when (service) {
-                        AccountService.ANILIST -> AppGraph.repository.syncSavedAnime(savedIds)
-                        AccountService.MAL -> AppGraph.repository.malSyncSavedAnime(savedIds)
-                    }
-                }.onFailure {
-                    com.miruronative.diagnostics.DiagnosticsLog.throwable(
-                        "${service.label} watchlist sync failed (${savedIds.size} titles)",
-                        it,
-                    )
-                }
-            }
+        val savedIds = synchronized(watchlistLock) { _watchlist.value.map { it.anilistId } }
+        if (remoteSyncQueue.trySend(RemoteWatchlistCommand.Full(session, savedIds)).isFailure) {
+            DiagnosticsLog.event("${session.service.label} watchlist sync queue unavailable")
         }
     }
 
     /** Merge AniList Planning into this device without deleting device-only saves. */
     fun hydrateWatchlistFromAniList(entries: List<WatchlistEntry>) {
-        val merged = mergeWatchlistEntries(_watchlist.value, entries)
-        if (merged == _watchlist.value) return
-        _watchlist.value = merged
-        persist(KEY_WATCHLIST, merged, WatchlistEntry.serializer())
+        val changed = synchronized(watchlistLock) {
+            val current = _watchlist.value
+            val merged = mergeWatchlistEntries(current, entries)
+            if (merged == current) {
+                false
+            } else {
+                _watchlist.value = merged
+                persist(KEY_WATCHLIST, merged, WatchlistEntry.serializer())
+                true
+            }
+        }
+        if (!changed) return
         ReleaseSyncScheduler.runNow(appContext)
+    }
+
+    private suspend fun processRemoteSyncQueue() {
+        for (command in remoteSyncQueue) {
+            when (command) {
+                is RemoteWatchlistCommand.Item -> processRemoteItemSync(command)
+                is RemoteWatchlistCommand.Full -> processRemoteFullSync(command)
+            }
+        }
+    }
+
+    private suspend fun processRemoteItemSync(command: RemoteWatchlistCommand.Item) {
+        val shouldContinue = {
+            SettingsStore.syncSavedToAniList.value &&
+                watchlistSyncVersions.isLatest(command.ticket) &&
+                isCurrentAccountSession(command.session)
+        }
+        try {
+            if (!shouldContinue()) return
+            when (command.session.service) {
+                AccountService.ANILIST -> {
+                    val token = AuthManager.tokenForSession(command.session.generation) ?: return
+                    AppGraph.repository.syncSavedAnimeForSession(
+                        mediaId = command.anilistId,
+                        saved = command.saved,
+                        authenticationToken = token,
+                        shouldContinue = shouldContinue,
+                    )
+                }
+                AccountService.MAL -> {
+                    val token = MalAuthManager.freshAccessToken(command.session.generation) ?: return
+                    AppGraph.repository.malSyncSavedAnimeForSession(
+                        anilistId = command.anilistId,
+                        saved = command.saved,
+                        accessToken = token,
+                        shouldContinue = shouldContinue,
+                    )
+                }
+            }
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            DiagnosticsLog.throwable(
+                "${command.session.service.label} saved sync failed " +
+                    "id=${command.anilistId} saved=${command.saved}",
+                error,
+            )
+        } finally {
+            watchlistSyncVersions.complete(command.ticket)
+        }
+    }
+
+    private suspend fun processRemoteFullSync(command: RemoteWatchlistCommand.Full) {
+        val shouldContinue = {
+            SettingsStore.syncSavedToAniList.value && isCurrentAccountSession(command.session)
+        }
+        try {
+            if (!shouldContinue()) return
+            when (command.session.service) {
+                AccountService.ANILIST -> {
+                    val token = AuthManager.tokenForSession(command.session.generation) ?: return
+                    val viewerId = jwtSubject(token) ?: return
+                    AppGraph.repository.syncSavedAnimeForSession(
+                        mediaIds = command.savedIds,
+                        viewerId = viewerId,
+                        authenticationToken = token,
+                        shouldContinue = shouldContinue,
+                    )
+                }
+                AccountService.MAL -> {
+                    val token = MalAuthManager.freshAccessToken(command.session.generation) ?: return
+                    AppGraph.repository.malSyncSavedAnimeForSession(
+                        anilistIds = command.savedIds,
+                        accessToken = token,
+                        shouldContinue = shouldContinue,
+                    )
+                }
+            }
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            DiagnosticsLog.throwable(
+                "${command.session.service.label} watchlist sync failed " +
+                    "(${command.savedIds.size} titles)",
+                error,
+            )
+        }
     }
 
     // ---- persistence ----
@@ -206,5 +307,21 @@ object LibraryStore {
         return runCatching {
             json.decodeFromString(kotlinx.serialization.builtins.ListSerializer(serializer), raw)
         }.getOrDefault(emptyList())
+    }
+
+    private sealed interface RemoteWatchlistCommand {
+        val session: AccountSessionIdentity
+
+        data class Item(
+            override val session: AccountSessionIdentity,
+            val ticket: MutationTicket<Int>,
+            val anilistId: Int,
+            val saved: Boolean,
+        ) : RemoteWatchlistCommand
+
+        data class Full(
+            override val session: AccountSessionIdentity,
+            val savedIds: List<Int>,
+        ) : RemoteWatchlistCommand
     }
 }

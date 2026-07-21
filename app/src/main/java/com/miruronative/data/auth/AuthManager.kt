@@ -111,6 +111,12 @@ object AuthManager {
     /** Auth generation used to reject UI results loaded for a replaced account. */
     internal fun sessionGeneration(): Long? = tokenSession.authenticatedGeneration()
 
+    /** A captured token for one generation; it can never silently become another account's. */
+    internal fun tokenForSession(generation: Long): String? {
+        current() ?: return null
+        return tokenSession.tokenForGeneration(generation)
+    }
+
     /** Compares the generation and publishes [change] under the auth-session lock. */
     internal fun commitIfSessionCurrent(generation: Long, change: () -> Unit): Boolean =
         tokenSession.commitIfGenerationCurrent(generation, change)

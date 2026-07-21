@@ -86,6 +86,15 @@ internal class AuthTokenSession(initialToken: String? = null) {
         return snapshot.generation.takeIf { snapshot.value != null }
     }
 
+    /** Returns credentials only when [generation] still owns this exact authenticated session. */
+    fun tokenForGeneration(generation: Long): String? {
+        var currentToken: String? = null
+        gate.commitIfGenerationCurrent(generation) {
+            currentToken = token
+        }
+        return currentToken
+    }
+
     fun commitIfGenerationCurrent(generation: Long, change: () -> Unit): Boolean {
         var committed = false
         gate.commitIfGenerationCurrent(generation) {
