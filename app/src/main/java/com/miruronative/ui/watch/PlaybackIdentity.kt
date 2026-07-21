@@ -8,6 +8,13 @@ data class PlaybackIdentity(
     val mediaId: String,
 )
 
+/** Last position reported by a concrete, identity-bearing playback item. */
+internal data class PlaybackProgressSnapshot(
+    val identity: PlaybackIdentity,
+    val positionMs: Long,
+    val durationMs: Long,
+)
+
 /**
  * Compose state that belongs to one logical native playback must not use the media URL as its
  * identity. Some providers reuse one manifest URL for several episodes, and quality changes can
@@ -57,3 +64,31 @@ internal fun isNewConfirmedPlayback(
     previouslyConfirmed: PlaybackIdentity?,
     callback: PlaybackIdentity,
 ): Boolean = previouslyConfirmed == null || !isSamePlaybackSession(previouslyConfirmed, callback)
+
+/**
+ * Banks the last confirmed, still-current native position before a caller invalidates that
+ * playback session. Keeping the write and transition in one helper makes their ordering explicit:
+ * a replacement MediaItem may be installed immediately after [transition] starts, at which point
+ * callbacks from the old item must be rejected rather than relabelled as the new episode.
+ *
+ * [persist] is intentionally never called for an unconfirmed sample. In particular, a source that
+ * fails during preparation must not create a Continue Watching entry merely because the user
+ * selected it.
+ */
+internal fun <T> flushProgressBeforeTransition(
+    candidate: PlaybackProgressSnapshot?,
+    confirmedIdentity: PlaybackIdentity?,
+    activeTarget: ActivePlaybackTarget?,
+    persist: (PlaybackProgressSnapshot) -> Unit,
+    transition: () -> T,
+): T {
+    val current = candidate?.takeIf { progress ->
+        progress.positionMs > 0L &&
+            activeTarget != null &&
+            acceptsPlaybackProgress(progress.identity, activeTarget) &&
+            confirmedIdentity != null &&
+            isSamePlaybackSession(confirmedIdentity, progress.identity)
+    }
+    current?.let(persist)
+    return transition()
+}

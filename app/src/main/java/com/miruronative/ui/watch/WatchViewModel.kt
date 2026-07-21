@@ -89,12 +89,6 @@ private data class PendingResolution(
     val key: EpisodeResolutionKey,
 )
 
-private data class PlaybackProgress(
-    val identity: PlaybackIdentity,
-    val positionMs: Long,
-    val durationMs: Long,
-)
-
 private data class ProgressSyncKey(
     val animeId: Int,
     val episode: Int,
@@ -150,7 +144,10 @@ class WatchViewModel : ViewModel() {
             DiagnosticsLog.event("Watch start ignored duplicate key=$key")
             return
         }
-        val request = requestGate.startSession()
+        val previous = (_state.value as? UiState.Success)?.data
+        val request = withNativeProgressFlushedBeforeTransition(previous) {
+            requestGate.startSession()
+        }
         DiagnosticsLog.event("Watch start key=$key")
         startedKey = key
         activeNativePlaybackIdentity = null
@@ -630,13 +627,11 @@ class WatchViewModel : ViewModel() {
         // Keep resolution on the provider that is actually playing for the rest of this watch
         // session. A SUB/DUB switch is not a request to change the user's global preference, but
         // it must not fall back to the stale provider that failed earlier in the session either.
-        preferred = providerName
-        if (rememberProvider) {
-            globalPreferredProvider = providerName
-            SettingsStore.setPreferredProvider(providerName)
-        }
         if (current?.provider == providerName && current.category == nextCategory) {
             if (rememberProvider) {
+                preferred = providerName
+                globalPreferredProvider = providerName
+                SettingsStore.setPreferredProvider(providerName)
                 _state.value = UiState.Success(
                     current.copy(
                         preferredProvider = providerName,
@@ -646,29 +641,36 @@ class WatchViewModel : ViewModel() {
             }
             return
         }
-        category = nextCategory
-        // Selecting a server changes metadata priority, not which episodes are navigable. Keep
-        // the category-wide union so switching source cannot silently shrink the season again.
-        spine = pickNavigationSpine(mergedEpisodes, providerName, nextCategory)
-        failedProviders.clear()
-        if (current != null) {
-            _state.value = UiState.Success(
-                current.copy(
-                    preferredProvider = globalPreferredProvider,
-                    notice = if (rememberProvider) {
-                        "${ProviderCatalog.label(providerName)} is now your preferred server."
-                    } else {
-                        current.notice
-                    },
-                ),
-            )
+        withNativeProgressFlushedBeforeTransition(current) {
+            preferred = providerName
+            if (rememberProvider) {
+                globalPreferredProvider = providerName
+                SettingsStore.setPreferredProvider(providerName)
+            }
+            category = nextCategory
+            // Selecting a server changes metadata priority, not which episodes are navigable. Keep
+            // the category-wide union so switching source cannot silently shrink the season again.
+            spine = pickNavigationSpine(mergedEpisodes, providerName, nextCategory)
+            failedProviders.clear()
+            if (current != null) {
+                _state.value = UiState.Success(
+                    current.copy(
+                        preferredProvider = globalPreferredProvider,
+                        notice = if (rememberProvider) {
+                            "${ProviderCatalog.label(providerName)} is now your preferred server."
+                        } else {
+                            current.notice
+                        },
+                    ),
+                )
+            }
+            launchResolve(currentNumber, progressAlreadyFlushed = true)
         }
-        launchResolve(currentNumber)
     }
 
     private var lastProgressSave = 0L
     private var lastProgressSaveIdentity: PlaybackIdentity? = null
-    private var lastKnownProgress: PlaybackProgress? = null
+    private var lastKnownProgress: PlaybackProgressSnapshot? = null
     private var confirmedHistoryIdentity: PlaybackIdentity? = null
     private var activeNativePlaybackIdentity: NativePlaybackIdentity? = null
     private var committedNativePlaybackIdentity: NativePlaybackIdentity? = null
@@ -760,7 +762,7 @@ class WatchViewModel : ViewModel() {
             return false
         }
         committedNativePlaybackIdentity = commit.identity
-        lastKnownProgress = PlaybackProgress(progressIdentity, commit.positionMs, commit.durationMs)
+        lastKnownProgress = PlaybackProgressSnapshot(progressIdentity, commit.positionMs, commit.durationMs)
         lastProgressSaveIdentity = progressIdentity
         lastProgressSave = SystemClock.elapsedRealtime()
         DiagnosticsLog.event(
@@ -830,7 +832,7 @@ class WatchViewModel : ViewModel() {
         positionMs: Long,
         durationMs: Long,
     ) {
-        lastKnownProgress = PlaybackProgress(identity, positionMs, durationMs)
+        lastKnownProgress = PlaybackProgressSnapshot(identity, positionMs, durationMs)
         maybeSyncAniListProgress(identity, positionMs, durationMs, totalEpisodes)
         val lastIdentity = lastProgressSaveIdentity
         if (lastIdentity == null || !isSamePlaybackSession(lastIdentity, identity)) {
@@ -867,6 +869,69 @@ class WatchViewModel : ViewModel() {
         LibraryStore.updateProgress(identity.animeId, identity.episodeNumber, positionMs, durationMs)
     }
 
+    private fun <T> withNativeProgressFlushedBeforeTransition(
+        data: WatchData?,
+        transition: () -> T,
+    ): T = flushProgressBeforeTransition(
+        candidate = lastKnownProgress,
+        confirmedIdentity = confirmedHistoryIdentity,
+        activeTarget = data?.nativePlaybackTarget(),
+        persist = ::persistTransitionProgress,
+        transition = transition,
+    )
+
+    private fun persistTransitionProgress(progress: PlaybackProgressSnapshot) {
+        // updateProgress deliberately cannot create history. The matching entry was inserted by
+        // the first confirmed playing callback; if it is gone or belongs to another episode, the
+        // transition still proceeds without manufacturing an unconfirmed Continue Watching row.
+        val saved = LibraryStore.historyFor(progress.identity.animeId)
+            ?.takeIf { it.episodeNumber == progress.identity.episodeNumber }
+            ?: run {
+                DiagnosticsLog.event(
+                    "Watch transition progress ignored without confirmed history " +
+                        "episode=${fmt(progress.identity.episodeNumber)}",
+                )
+                return
+            }
+        val durationMs = maxOf(saved.durationMs, progress.durationMs)
+        if (saved.positionMs != progress.positionMs || saved.durationMs != durationMs) {
+            LibraryStore.updateProgress(
+                progress.identity.animeId,
+                progress.identity.episodeNumber,
+                progress.positionMs,
+                durationMs,
+            )
+        }
+        lastProgressSave = SystemClock.elapsedRealtime()
+        lastProgressSaveIdentity = progress.identity
+        DiagnosticsLog.event(
+            "Watch transition position committed episode=${fmt(progress.identity.episodeNumber)} " +
+                "positionMs=${progress.positionMs}",
+        )
+    }
+
+    /** Fold the player's error-time position into its last confirmed tick before failover. */
+    private fun captureNativeFailureProgress(data: WatchData, streamUrl: String, positionMs: Long) {
+        if (streamUrl.isBlank() || positionMs <= 0L) return
+        val target = data.nativePlaybackTarget() ?: return
+        val identity = PlaybackIdentity(
+            animeId = data.anilistId,
+            episodeNumber = data.current.number,
+            generation = data.playbackGeneration,
+            mediaId = streamUrl,
+        )
+        val confirmed = confirmedHistoryIdentity ?: return
+        if (!acceptsPlaybackProgress(identity, target) || !isSamePlaybackSession(confirmed, identity)) return
+        val previous = lastKnownProgress?.takeIf { isSamePlaybackSession(it.identity, identity) }
+        lastKnownProgress = PlaybackProgressSnapshot(
+            identity = identity,
+            positionMs = positionMs,
+            durationMs = previous?.durationMs
+                ?: LibraryStore.historyFor(identity.animeId)?.durationMs
+                ?: 0L,
+        )
+    }
+
     private fun resetProgressSession() {
         // Invalidate callbacks from the previous route even before the next MediaItem is ready.
         nextPlaybackGeneration()
@@ -887,6 +952,7 @@ class WatchViewModel : ViewModel() {
     )
 
     private fun WatchData.nativePlaybackTarget(): ActivePlaybackTarget? {
+        if (isResolving) return null
         val chosen = chosenStream ?: return null
         if (chosen.isEmbed || ProviderCatalog.isEmbed(provider)) return null
         return ActivePlaybackTarget(
@@ -1040,7 +1106,11 @@ class WatchViewModel : ViewModel() {
     }
 
     /** All episode resolution goes through here so a failure becomes an error state, not a crash. */
-    private fun launchResolve(number: Double, before: (suspend () -> Unit)? = null) {
+    private fun launchResolve(
+        number: Double,
+        before: (suspend () -> Unit)? = null,
+        progressAlreadyFlushed: Boolean = false,
+    ) {
         val key = EpisodeResolutionKey(
             animeId = anilistId,
             episodeNumber = number,
@@ -1052,15 +1122,30 @@ class WatchViewModel : ViewModel() {
             DiagnosticsLog.event("Watch ignored duplicate resolve episode=${fmt(number)}")
             return
         }
-        // Reject ENDED from the item being replaced during asynchronous source resolution.
-        activeNativePlaybackIdentity = null
-        val request = requestGate.nextRequest()
+        val current = (_state.value as? UiState.Success)?.data
+        // Bank the last accepted native tick before invalidating ENDED/progress callbacks from
+        // the MediaItem being replaced. Source/category selection already did this before it
+        // changed its routing fields, hence the explicit hand-off flag.
+        val request = if (progressAlreadyFlushed) {
+            activeNativePlaybackIdentity = null
+            requestGate.nextRequest()
+        } else {
+            withNativeProgressFlushedBeforeTransition(current) {
+                activeNativePlaybackIdentity = null
+                requestGate.nextRequest()
+            }
+        }
         val pending = PendingResolution(request, key)
         pendingResolution = pending
         DiagnosticsLog.event(
             "Watch launchResolve episode=${fmt(number)} " +
                 "request=${request.sessionGeneration}/${request.requestGeneration}",
         )
+        // Publish the invalidation synchronously. PlayerSurface is reused, so its old controller
+        // can emit another tick before the resolver coroutine gets its first dispatch otherwise.
+        if (current != null && !current.isResolving) {
+            _state.value = UiState.Success(current.copy(isResolving = true, notice = null))
+        }
         resolveJob?.cancel()
         sourceValidationJob?.cancel()
         resolveJob = viewModelScope.launch {
@@ -1097,7 +1182,10 @@ class WatchViewModel : ViewModel() {
     fun onPlaybackError(message: String, streamUrl: String, positionMs: Long) {
         val data = (_state.value as? UiState.Success)?.data ?: return
         if (data.isResolving) return
-        activeNativePlaybackIdentity = null
+        captureNativeFailureProgress(data, streamUrl, positionMs)
+        withNativeProgressFlushedBeforeTransition(data) {
+            activeNativePlaybackIdentity = null
+        }
         DiagnosticsLog.event(
             "Watch playback error provider=${data.provider} episode=${data.current.displayNumber} " +
                 "streamHost=${runCatching { Uri.parse(streamUrl).host }.getOrNull() ?: "unknown"} " +
@@ -1139,14 +1227,14 @@ class WatchViewModel : ViewModel() {
 
         failedProviders += data.provider
         unavailableSources += EpisodeSourceKey(data.current.number, data.provider, data.category)
-        launchResolve(data.current.number) {
+        launchResolve(data.current.number, before = {
             _state.value = UiState.Success(
                 data.copy(
                     isResolving = true,
                     notice = "${ProviderCatalog.label(data.provider)} failed: $message. Trying another source…",
                 ),
             )
-        }
+        }, progressAlreadyFlushed = true)
     }
 
     private fun sourceOptions(number: Double): List<WatchSourceOption> =
