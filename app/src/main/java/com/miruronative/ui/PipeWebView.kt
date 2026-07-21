@@ -3,6 +3,11 @@ package com.miruronative.ui
 import android.webkit.WebView
 import android.view.View
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -21,7 +26,9 @@ import com.miruronative.diagnostics.DiagnosticsLog
  */
 @Composable
 fun PipeWebView() {
-    AndroidView(
+    var rendererGeneration by remember { mutableIntStateOf(0) }
+    key(rendererGeneration) {
+        AndroidView(
         factory = { ctx ->
             try {
                 DiagnosticsLog.event("PipeWebView factory create WebView start")
@@ -34,7 +41,7 @@ fun PipeWebView() {
                     // overlay path: with "WebView overlays" enabled (server-side WebView flag),
                     // the hardware overlay of even a 1dp WebView can black out the whole window.
                     it.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
-                    PipeBridge.attach(it)
+                    PipeBridge.attach(it) { rendererGeneration++ }
                     DiagnosticsLog.event("PipeWebView factory create WebView complete")
                 }
             } catch (e: Throwable) {
@@ -44,13 +51,15 @@ fun PipeWebView() {
         },
         onRelease = { view ->
             val web = view as? WebView ?: return@AndroidView
-            DiagnosticsLog.event("PipeWebView release url=${web.url ?: "none"} size=${web.width}x${web.height}")
+            val releasedUrl = runCatching { web.url }.getOrNull()
+            DiagnosticsLog.event("PipeWebView release url=${releasedUrl ?: "none"} size=${web.width}x${web.height}")
             PipeBridge.detach(web)
-            web.stopLoading()
-            web.webChromeClient = null
-            web.webViewClient = android.webkit.WebViewClient()
-            web.destroy()
+            runCatching { web.stopLoading() }
+            runCatching { web.webChromeClient = null }
+            runCatching { web.webViewClient = android.webkit.WebViewClient() }
+            runCatching { web.destroy() }
         },
-        modifier = Modifier.size(1.dp),
-    )
+            modifier = Modifier.size(1.dp),
+        )
+    }
 }

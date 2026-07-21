@@ -68,7 +68,7 @@ object PipeBridge {
 
     /** Called from the hosting Composable on the main thread with a freshly created WebView. */
     @SuppressLint("SetJavaScriptEnabled")
-    fun attach(wv: WebView) {
+    fun attach(wv: WebView, onRendererGone: () -> Unit = {}) {
         DiagnosticsLog.event("PipeBridge.attach")
         webView = wv
         if (ready.isCompleted) ready = CompletableDeferred()
@@ -111,6 +111,7 @@ object PipeBridge {
                 if (url != null && url.startsWith(activeOrigin)) {
                     main.postDelayed(
                         {
+                            if (webView !== wv) return@postDelayed
                             if (!ready.isCompleted) ready.complete(true)
                             scheduleIdle()
                         },
@@ -134,7 +135,7 @@ object PipeBridge {
                 if (originIndex < ORIGINS.lastIndex) {
                     originIndex++
                     DiagnosticsLog.event("PipeBridge trying mirror $activeOrigin")
-                    main.post { webView?.loadUrl("$activeOrigin/") }
+                    main.post { if (webView === wv) wv.loadUrl("$activeOrigin/") }
                 } else if (!ready.isCompleted) {
                     ready.complete(false)
                 }
@@ -145,7 +146,10 @@ object PipeBridge {
                     "PipeBridge render process gone didCrash=${detail?.didCrash()} " +
                         "priority=${detail?.rendererPriorityAtExit()}",
                 )
-                view?.let(::detach)
+                (view ?: webView)?.let(::detach)
+                // The reported WebView can never be used again. Let the Compose host replace its
+                // AndroidView after detach has failed any requests owned by this renderer.
+                main.post(onRendererGone)
                 return true
             }
         }
