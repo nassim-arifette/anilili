@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -15,11 +16,14 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.TouchApp
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -174,6 +178,71 @@ internal fun TvPlayerControls(
                     TvControlButton("Toggle fullscreen", onClick = callback) {
                         Icon(Icons.Default.Fullscreen, contentDescription = null)
                     }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * TV-safe boundary for a cross-origin provider. No playback state or transport is invented here:
+ * the primary action moves real focus into the WebView, where D-pad and Select reach the provider.
+ */
+@Composable
+internal fun TvProviderHandoffControls(
+    providerFocusRequester: FocusRequester,
+    onUseProviderControls: () -> Unit,
+    onSettings: (() -> Unit)?,
+    isFullscreen: Boolean,
+    onFullscreen: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Color.Black.copy(alpha = 0.84f))
+            .padding(horizontal = 28.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "Provider playback",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.White,
+        )
+        Text(
+            text = "Play, pause, and seeking stay inside this video. Back returns to AniLili+.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White.copy(alpha = 0.72f),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Button(
+                onClick = onUseProviderControls,
+                modifier = Modifier
+                    .focusRequester(providerFocusRequester)
+                    .focusHighlight(RoundedCornerShape(12.dp), focusedScale = 1.05f),
+            ) {
+                Icon(Icons.Default.TouchApp, contentDescription = null)
+                Text("Use provider controls", modifier = Modifier.padding(start = 8.dp))
+            }
+            Spacer(Modifier.weight(1f))
+            onSettings?.let { callback ->
+                TvControlButton("Playback settings", onClick = callback) {
+                    Icon(Icons.Default.Settings, contentDescription = null)
+                }
+            }
+            onFullscreen?.let { callback ->
+                TvControlButton(
+                    if (isFullscreen) "Exit fullscreen" else "Fullscreen",
+                    onClick = callback,
+                ) {
+                    Icon(
+                        if (isFullscreen) Icons.Default.FullscreenExit else Icons.Default.Fullscreen,
+                        contentDescription = null,
+                    )
                 }
             }
         }
