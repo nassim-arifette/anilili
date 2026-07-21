@@ -115,7 +115,8 @@ fun EmbedWebView(
     isFullscreen: Boolean = false,
     onToggleFullscreen: (() -> Unit)? = null,
     onFullscreenChanged: (Boolean) -> Unit = {},
-    onProgress: ((EmbedPlaybackKey, Long, Long) -> Unit)? = null,
+    onActiveMediaChanged: ((EmbedMediaIdentity) -> Unit)? = null,
+    onProgress: ((EmbedMediaIdentity, Long, Long) -> Unit)? = null,
     onPlaybackEnded: ((EmbedPlaybackCompletion) -> Boolean)? = null,
     onPlaybackError: ((EmbedPlaybackKey, String, String, Long) -> Unit)? = null,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
@@ -167,12 +168,20 @@ fun EmbedWebView(
             ),
         )
     }
+    val activeMediaIdentity = remember(navigationIdentity, navigationSession.generation) {
+        EmbedMediaIdentity(
+            playbackKey = playbackKey,
+            navigationGeneration = navigationSession.generation,
+            mediaId = activeUrl,
+        )
+    }
     var webPlaybackAvailable by remember(navigationSession.generation) { mutableStateOf(false) }
     var loadError by remember(navigationSession.generation) { mutableStateOf<String?>(null) }
     var webView by remember { mutableStateOf<WebView?>(null) }
     var finishedUrl by remember(navigationSession.generation) { mutableStateOf<String?>(null) }
     val currentOnPlaybackStopperChanged by rememberUpdatedState(onPlaybackStopperChanged)
     val currentOnFullscreenChanged by rememberUpdatedState(onFullscreenChanged)
+    val currentOnActiveMediaChanged by rememberUpdatedState(onActiveMediaChanged)
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnPlaybackEnded by rememberUpdatedState(onPlaybackEnded)
     val currentOnPreviousEpisode by rememberUpdatedState(onPreviousEpisode)
@@ -184,6 +193,7 @@ fun EmbedWebView(
     // third-party iframe from forging callbacks; the navigation token rejects superseded pages.
     val progressBridgeToken = remember { UUID.randomUUID().toString() }
     val currentNavigationSession by rememberUpdatedState(navigationSession)
+    val currentActiveMediaIdentity by rememberUpdatedState(activeMediaIdentity)
     // The WebView is built once, so the remote handler below has to read this live rather than
     // capture the value it was created with.
     val currentPlayerOwnsRemote by rememberUpdatedState(focusPlayerOnStart)
@@ -220,6 +230,11 @@ fun EmbedWebView(
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
     val autoplay by SettingsStore.autoplay.collectAsState()
     val captionStyle by SettingsStore.captionStyle.collectAsState()
+    LaunchedEffect(activeMediaIdentity, playbackMode.exposesNativeBridge) {
+        if (playbackMode.exposesNativeBridge) {
+            currentOnActiveMediaChanged?.invoke(activeMediaIdentity)
+        }
+    }
     val skipPlan = remember(skip, aniSkipSegments, aniSkipLookupStatus) {
         buildPlaybackSkipPlan(skip, aniSkipSegments, aniSkipLookupStatus)
     }
@@ -267,7 +282,11 @@ fun EmbedWebView(
                 webMediaIdentity = mediaIdentity.takeIf(String::isNotBlank)
                 webVolume = if (muted) 0f else volume.toFloat().coerceIn(0f, 1f)
                 if (playbackMode.exposesNativeBridge && isPlaying && nextPositionMs > 0L) {
-                    currentOnProgress?.invoke(playbackKey, nextPositionMs, nextDurationMs)
+                    currentOnProgress?.invoke(
+                        currentActiveMediaIdentity,
+                        nextPositionMs,
+                        nextDurationMs,
+                    )
                 }
             }
         },

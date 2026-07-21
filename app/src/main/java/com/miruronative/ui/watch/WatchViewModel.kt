@@ -866,6 +866,7 @@ class WatchViewModel : ViewModel() {
     private var activeNativePlaybackIdentity: NativePlaybackIdentity? = null
     private var committedNativePlaybackIdentity: NativePlaybackIdentity? = null
     private var committedEmbedPlaybackKey: EmbedPlaybackKey? = null
+    private var activeEmbedMediaIdentity: EmbedMediaIdentity? = null
 
     fun onNativePlaybackIdentityChanged(identity: NativePlaybackIdentity) {
         val data = (_state.value as? UiState.Success)?.data ?: return
@@ -1027,23 +1028,79 @@ class WatchViewModel : ViewModel() {
         sourceGeneration = playbackGeneration,
     )
 
-    fun onEmbedProgress(key: EmbedPlaybackKey, positionMs: Long, durationMs: Long) {
+    fun onEmbedMediaIdentityChanged(identity: EmbedMediaIdentity) {
         val data = (_state.value as? UiState.Success)?.data ?: return
-        if (!acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) {
+        if (data.isResolving || data.playbackTeardownGeneration != null) {
             DiagnosticsLog.event(
-                "Watch ignored stale embed progress episode=${fmt(key.episodeNumber)} " +
-                    "generation=${key.sourceGeneration}",
+                "Watch ignored embed media activation during transition " +
+                    "episode=${fmt(identity.playbackKey.episodeNumber)} " +
+                    "generation=${identity.playbackKey.sourceGeneration}",
             )
             return
         }
-        val stream = data.chosenStream ?: return
+        when (
+            planEmbedMediaHandoff(
+                active = activeEmbedMediaIdentity,
+                reported = identity,
+                currentPlaybackKey = data.embedPlaybackKey(),
+            )
+        ) {
+            EmbedMediaHandoffDecision.REJECT -> {
+                DiagnosticsLog.event(
+                    "Watch ignored stale embed media activation " +
+                        "episode=${fmt(identity.playbackKey.episodeNumber)} " +
+                        "generation=${identity.playbackKey.sourceGeneration}",
+                )
+            }
+            EmbedMediaHandoffDecision.KEEP -> Unit
+            EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP -> {
+                activeEmbedMediaIdentity = identity
+                activeNativePlaybackIdentity = null
+                cancelAniSkipWork()
+                if (
+                    data.aniSkipSegments.isNotEmpty() ||
+                    data.aniSkipLookupStatus != AniSkipLookupStatus.AWAITING_DURATION
+                ) {
+                    _state.value = UiState.Success(
+                        data.copy(
+                            aniSkipSegments = emptyList(),
+                            aniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
+                        ),
+                    )
+                }
+                DiagnosticsLog.event(
+                    "Watch embed media active episode=${fmt(identity.playbackKey.episodeNumber)} " +
+                        "generation=${identity.playbackKey.sourceGeneration} " +
+                        "navigation=${identity.navigationGeneration}",
+                )
+            }
+        }
+    }
+
+    fun onEmbedProgress(identity: EmbedMediaIdentity, positionMs: Long, durationMs: Long) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (
+            !acceptsEmbedMediaCallback(
+                reported = identity,
+                active = activeEmbedMediaIdentity,
+                currentPlaybackKey = data.embedPlaybackKey(),
+            )
+        ) {
+            DiagnosticsLog.event(
+                "Watch ignored stale embed progress episode=${fmt(identity.playbackKey.episodeNumber)} " +
+                    "generation=${identity.playbackKey.sourceGeneration} " +
+                    "navigation=${identity.navigationGeneration}",
+            )
+            return
+        }
+        val key = identity.playbackKey
         acceptProgress(
             data = data,
             identity = PlaybackIdentity(
                 animeId = key.animeId,
                 episodeNumber = key.episodeNumber,
                 generation = key.sourceGeneration,
-                mediaId = stream.url,
+                mediaId = identity.mediaId,
             ),
             positionMs = positionMs,
             durationMs = durationMs,
@@ -1302,6 +1359,7 @@ class WatchViewModel : ViewModel() {
         lastKnownProgress = null
         confirmedHistoryIdentity = null
         committedEmbedPlaybackKey = null
+        activeEmbedMediaIdentity = null
     }
 
     private fun WatchData.nativePlaybackTarget(): ActivePlaybackTarget? {
@@ -1508,10 +1566,12 @@ class WatchViewModel : ViewModel() {
         // fields, hence the explicit hand-off flag.
         val request = if (progressAlreadyFlushed) {
             activeNativePlaybackIdentity = null
+            activeEmbedMediaIdentity = null
             requestGate.nextRequest()
         } else {
             withProgressFlushedBeforeTransition(current) {
                 activeNativePlaybackIdentity = null
+                activeEmbedMediaIdentity = null
                 requestGate.nextRequest()
             }
         }
