@@ -1413,7 +1413,12 @@ class WatchViewModel : ViewModel() {
         return playbackGenerationCounter
     }
 
-    fun onPlaybackError(message: String, streamUrl: String, positionMs: Long) {
+    fun onPlaybackError(
+        message: String,
+        streamUrl: String,
+        positionMs: Long,
+        attemptedStreamUrls: Set<String> = setOf(streamUrl),
+    ) {
         val data = (_state.value as? UiState.Success)?.data ?: return
         if (data.isResolving) return
         captureNativeFailureProgress(data, streamUrl, positionMs)
@@ -1427,7 +1432,8 @@ class WatchViewModel : ViewModel() {
         )
 
         if (data.provider == "allanime" && streamUrl.isNotBlank()) {
-            if (!failedStreamUrls.add(streamUrl)) {
+            val attemptedUrls = (attemptedStreamUrls + streamUrl).filterTo(linkedSetOf(), String::isNotBlank)
+            if (!failedStreamUrls.addAll(attemptedUrls)) {
                 DiagnosticsLog.event("Watch ignored duplicate AllAnime stream failure host=${Uri.parse(streamUrl).host}")
                 return
             }
@@ -1477,6 +1483,7 @@ class WatchViewModel : ViewModel() {
         message: String,
         streamUrl: String,
         positionMs: Long,
+        attemptedStreamUrls: Set<String>,
     ) {
         val data = (_state.value as? UiState.Success)?.data ?: return
         val active = data.nativePlaybackTarget()
@@ -1487,7 +1494,10 @@ class WatchViewModel : ViewModel() {
             )
             return
         }
-        onPlaybackError(message, streamUrl, positionMs)
+        val currentSessionAttempts = attemptedStreamUrls.filterTo(linkedSetOf()) {
+            it in active.mediaIds
+        }
+        onPlaybackError(message, streamUrl, positionMs, currentSessionAttempts)
     }
 
     private fun sourceOptions(number: Double): List<WatchSourceOption> =
