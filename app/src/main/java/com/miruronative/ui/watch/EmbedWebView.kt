@@ -424,12 +424,12 @@ fun EmbedWebView(
                     Lifecycle.Event.ON_PAUSE,
                     Lifecycle.Event.ON_STOP -> {
                         runCatching { web.evaluateJavascript(PAUSE_VIDEO_JS, null) }
+                        // onPause is scoped to this instance. pauseTimers() is intentionally not
+                        // used because it freezes every WebView in the application process.
                         web.onPause()
-                        web.pauseTimers()
                     }
                     Lifecycle.Event.ON_RESUME,
                     Lifecycle.Event.ON_START -> {
-                        web.resumeTimers()
                         web.onResume()
                     }
                     else -> Unit
@@ -1282,8 +1282,8 @@ private fun dispatchWebTapAt(webView: WebView?, xFraction: Float, yFraction: Flo
 private fun stopWebPlayback(webView: WebView) {
     DiagnosticsLog.event("EmbedWebView stop playback url=${webView.url ?: "none"}")
     runCatching { webView.evaluateJavascript(PAUSE_VIDEO_JS, null) }
+    // Keep shutdown local to this player; pauseTimers() would also freeze OAuth and resolvers.
     webView.onPause()
-    webView.pauseTimers()
     webView.stopLoading()
     webView.loadUrl("about:blank")
 }
