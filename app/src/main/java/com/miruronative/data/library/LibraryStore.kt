@@ -1,5 +1,6 @@
 package com.miruronative.data.library
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.SharedPreferences
 import com.miruronative.data.reminder.ReleaseSyncScheduler
@@ -48,23 +49,66 @@ object LibraryStore {
 
     /** Insert/replace the anime's record (keeps one per anime, most-recent first). */
     fun upsertHistory(entry: HistoryEntry) {
+        upsertHistoryInternal(entry, commitToDisk = false)
+    }
+
+    /**
+     * Persists a history entry to disk before returning. Terminal playback events use this path so
+     * an immediate autoplay transition cannot outrun SharedPreferences' asynchronous apply().
+     */
+    fun upsertHistoryDurably(entry: HistoryEntry): Boolean =
+        upsertHistoryInternal(entry, commitToDisk = true)
+
+    private fun upsertHistoryInternal(entry: HistoryEntry, commitToDisk: Boolean): Boolean {
         val stamped = entry.copy(updatedAt = System.currentTimeMillis())
         val updated = buildList {
             add(stamped)
             addAll(_history.value.filter { it.anilistId != entry.anilistId })
         }.take(MAX_HISTORY)
-        _history.value = updated
-        persist(KEY_HISTORY, updated, HistoryEntry.serializer())
-        // TV launchers surface in-progress titles in their Continue Watching row; publishing is
-        // throttled inside the manager and a no-op off Android TV.
-        val watchNextRequest = WatchNextManager.preparePublish(stamped)
-        scope.launch { WatchNextManager.publish(appContext, watchNextRequest) }
+        if (commitToDisk) {
+            if (!persist(KEY_HISTORY, updated, HistoryEntry.serializer(), commitToDisk = true)) {
+                return false
+            }
+            _history.value = updated
+        } else {
+            _history.value = updated
+            persist(KEY_HISTORY, updated, HistoryEntry.serializer())
+        }
+        // TV launchers surface only in-progress titles. remove() invalidates any older queued
+        // publish ticket, so an asynchronous progress write cannot resurrect a completed title.
+        if (stamped.completed) {
+            scope.launch { WatchNextManager.remove(appContext, stamped.anilistId) }
+        } else {
+            val watchNextRequest = WatchNextManager.preparePublish(stamped)
+            scope.launch { WatchNextManager.publish(appContext, watchNextRequest) }
+        }
+        return true
     }
 
     fun updateProgress(anilistId: Int, episodeNumber: Double, positionMs: Long, durationMs: Long) {
         val existing = _history.value.firstOrNull { it.anilistId == anilistId } ?: return
         if (existing.episodeNumber != episodeNumber) return
         upsertHistory(existing.copy(positionMs = positionMs, durationMs = durationMs))
+    }
+
+    /** Atomically commits a terminal position and the final-series completion state. */
+    fun updateProgressDurably(
+        anilistId: Int,
+        episodeNumber: Double,
+        positionMs: Long,
+        durationMs: Long,
+        completed: Boolean,
+    ): Boolean {
+        val existing = _history.value.firstOrNull { it.anilistId == anilistId } ?: return false
+        if (existing.episodeNumber != episodeNumber) return false
+        return upsertHistoryInternal(
+            existing.copy(
+                positionMs = positionMs,
+                durationMs = durationMs,
+                completed = completed,
+            ),
+            commitToDisk = true,
+        )
     }
 
     fun historyFor(anilistId: Int): HistoryEntry? = _history.value.firstOrNull { it.anilistId == anilistId }
@@ -142,9 +186,19 @@ object LibraryStore {
 
     // ---- persistence ----
 
-    private fun <T> persist(key: String, list: List<T>, serializer: kotlinx.serialization.KSerializer<T>) {
+    @SuppressLint("ApplySharedPref") // Terminal events deliberately require commit() before Next.
+    private fun <T> persist(
+        key: String,
+        list: List<T>,
+        serializer: kotlinx.serialization.KSerializer<T>,
+        commitToDisk: Boolean = false,
+    ): Boolean {
         val encoded = json.encodeToString(kotlinx.serialization.builtins.ListSerializer(serializer), list)
-        prefs.edit().putString(key, encoded).apply()
+        val editor = prefs.edit().putString(key, encoded)
+        return if (commitToDisk) editor.commit() else {
+            editor.apply()
+            true
+        }
     }
 
     private fun <T> decodeList(raw: String?, serializer: kotlinx.serialization.KSerializer<T>): List<T> {

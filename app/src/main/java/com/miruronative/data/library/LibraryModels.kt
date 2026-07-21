@@ -14,6 +14,8 @@ data class HistoryEntry(
     val category: String,
     val positionMs: Long = 0,
     val durationMs: Long = 0,
+    /** Completed final episodes stay in viewing history but are hidden from Continue Watching. */
+    val completed: Boolean = false,
     val updatedAt: Long = 0,
 ) {
     val progressFraction: Float
@@ -21,6 +23,12 @@ data class HistoryEntry(
 
     val episodeLabel: String
         get() = if (episodeNumber % 1.0 == 0.0) episodeNumber.toInt().toString() else episodeNumber.toString()
+
+    val belongsInContinueWatching: Boolean
+        get() = !completed
+
+    fun resumePositionFor(episode: Double): Long? =
+        positionMs.takeIf { !completed && episodeNumber == episode }
 }
 
 /** A saved series the user wants to watch. */

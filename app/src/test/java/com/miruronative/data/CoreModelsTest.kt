@@ -39,6 +39,12 @@ class CoreModelsTest {
         assertEquals("3", entry.episodeLabel)
         assertEquals(.75f, entry.progressFraction)
         assertTrue(entry.copy(positionMs = 200_000).progressFraction <= 1f)
+        assertTrue(entry.belongsInContinueWatching)
+        assertEquals(75_000L, entry.resumePositionFor(3.0))
+
+        val completed = entry.copy(positionMs = 100_000, completed = true)
+        assertEquals(false, completed.belongsInContinueWatching)
+        assertEquals(null, completed.resumePositionFor(3.0))
     }
 
     @Test

@@ -292,6 +292,7 @@ fun WatchScreen(
                 modifier = Modifier.fillMaxSize(),
                 onFullscreenChanged = { fullscreen = it },
                 onProgress = vm::onEmbedProgress,
+                onPlaybackEnded = vm::onEmbedPlaybackEnded,
                 onPlaybackError = vm::onEmbedPlaybackError,
                 onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
             )
@@ -364,6 +365,7 @@ fun WatchScreen(
                     onNativePlaybackIdentityChanged = vm::onNativePlaybackIdentityChanged,
                     onNativePlaybackEnded = vm::onNativePlaybackEnded,
                     onEmbedProgress = vm::onEmbedProgress,
+                    onEmbedPlaybackEnded = vm::onEmbedPlaybackEnded,
                     onNativeProgress = vm::onNativeProgress,
                     onPlaybackError = vm::onPlaybackError,
                     onEmbedPlaybackError = vm::onEmbedPlaybackError,
@@ -397,6 +399,7 @@ private fun WatchContent(
     onNativePlaybackIdentityChanged: (NativePlaybackIdentity) -> Unit,
     onNativePlaybackEnded: (NativePlaybackCompletion) -> Boolean,
     onEmbedProgress: (EmbedPlaybackKey, Long, Long) -> Unit,
+    onEmbedPlaybackEnded: (EmbedPlaybackCompletion) -> Boolean,
     onNativeProgress: (PlaybackIdentity, Long, Long, Boolean) -> Unit,
     onPlaybackError: (String, String, Long) -> Unit,
     onEmbedPlaybackError: (EmbedPlaybackKey, String, String, Long) -> Unit,
@@ -584,6 +587,7 @@ private fun WatchContent(
                                 onToggleFullscreen = onToggleFullscreen,
                                 onFullscreenChanged = onFullscreenChanged,
                                 onProgress = onEmbedProgress,
+                                onPlaybackEnded = onEmbedPlaybackEnded,
                                 onPlaybackError = onEmbedPlaybackError.takeIf { data.provider == "allanime" },
                                 onPlaybackStopperChanged = onPlaybackStopperChanged,
                             )

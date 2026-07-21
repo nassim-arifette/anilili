@@ -56,6 +56,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.key as compositionKey
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -117,6 +118,7 @@ fun EmbedWebView(
     onToggleFullscreen: (() -> Unit)? = null,
     onFullscreenChanged: (Boolean) -> Unit = {},
     onProgress: ((EmbedPlaybackKey, Long, Long) -> Unit)? = null,
+    onPlaybackEnded: ((EmbedPlaybackCompletion) -> Boolean)? = null,
     onPlaybackError: ((EmbedPlaybackKey, String, String, Long) -> Unit)? = null,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
 ) {
@@ -152,9 +154,11 @@ fun EmbedWebView(
         usesIframeShell = usesAllAnimeIframeShell,
     )
     val navigationGuard = remember { EmbedNavigationGuard() }
+    var rendererGeneration by remember { mutableIntStateOf(0) }
     // remember() runs as soon as Compose observes a logical playback, URL, or referer change. This
-    // revokes the preceding capability before AndroidView's later update reuses the WebView.
-    val navigationSession = remember(navigationIdentity) {
+    // revokes the preceding capability before AndroidView's later update reuses the WebView. A
+    // renderer loss also gets a fresh session because Chromium forbids reusing the dead instance.
+    val navigationSession = remember(navigationIdentity, rendererGeneration) {
         navigationGuard.begin(
             EmbedNavigationRequest(
                 streamUrl = activeUrl,
@@ -171,6 +175,7 @@ fun EmbedWebView(
     val currentOnPlaybackStopperChanged by rememberUpdatedState(onPlaybackStopperChanged)
     val currentOnFullscreenChanged by rememberUpdatedState(onFullscreenChanged)
     val currentOnProgress by rememberUpdatedState(onProgress)
+    val currentOnPlaybackEnded by rememberUpdatedState(onPlaybackEnded)
     val currentOnPreviousEpisode by rememberUpdatedState(onPreviousEpisode)
     val currentOnNextEpisode by rememberUpdatedState(onNextEpisode)
     val currentHasPreviousEpisode by rememberUpdatedState(hasPreviousEpisode)
@@ -261,16 +266,36 @@ fun EmbedWebView(
                     webIsPlaying = false
                     positionMs = sample.positionMs
                     durationMs = sample.durationMs
-                    currentOnProgress?.invoke(playbackKey, sample.positionMs, sample.durationMs)
-                    if (
-                        autoAdvanceGate.tryAdvance(
-                            navigationToken = navigationToken,
-                            autoplay = autoplay,
-                            hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
+                    val completion = EmbedPlaybackCompletion(
+                        playbackKey = playbackKey,
+                        reportedPositionMs = sample.positionMs,
+                        durationMs = sample.durationMs,
+                        observedPlayingSamples = sample.observedPlayingSamples,
+                    )
+                    val committed = finalizeEmbedCompletionThenNavigate(
+                        completion = completion,
+                        shouldNavigate =
+                            autoplay && currentHasNextEpisode && currentOnNextEpisode != null,
+                        commit = currentOnPlaybackEnded ?: { false },
+                        navigate = {
+                            if (
+                                autoAdvanceGate.tryAdvance(
+                                    navigationToken = navigationToken,
+                                    autoplay = true,
+                                    hasNextEpisode = true,
+                                )
+                            ) {
+                                DiagnosticsLog.event(
+                                    "EmbedWebView auto advance reason=ended token=$navigationToken",
+                                )
+                                currentOnNextEpisode?.invoke(playbackKey)
+                            }
+                        },
+                    )
+                    if (!committed) {
+                        DiagnosticsLog.event(
+                            "EmbedWebView withheld autoplay after uncommitted end token=$navigationToken",
                         )
-                    ) {
-                        DiagnosticsLog.event("EmbedWebView auto advance reason=ended token=$navigationToken")
-                        currentOnNextEpisode?.invoke(playbackKey)
                     }
                 }
             }
@@ -540,7 +565,8 @@ fun EmbedWebView(
                 footnote = "This server renders its own subtitles, so it may ignore some of these.",
             )
         }
-        AndroidView(
+        compositionKey(rendererGeneration) {
+            AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
                 try {
@@ -661,6 +687,7 @@ fun EmbedWebView(
                 val headers = activeReferer?.let { mapOf("Referer" to it) } ?: emptyMap()
                 if (lastRequestedGeneration.value != navigationSession.generation) {
                     lastRequestedGeneration.value = navigationSession.generation
+                    web.tag = navigationSession
                     // Stop both the old document and its app-facing capability before installing
                     // callbacks for the replacement navigation.
                     runCatching { web.evaluateJavascript(REVOKE_EMBED_NAVIGATION_JS, null) }
@@ -695,7 +722,7 @@ fun EmbedWebView(
                                 )
                                 if (navigationSession.request.resumePositionMs > 0L) {
                                     append(
-                                        RESUME_WHEN_READY_JS(
+                                        embedResumeWhenReadyJs(
                                             navigationSession.request.resumePositionMs / 1000.0,
                                             navigationSession.generation,
                                         ),
@@ -720,13 +747,18 @@ fun EmbedWebView(
                                 "EmbedWebView render process gone generation=${navigationSession.generation} " +
                                     "didCrash=${detail?.didCrash()} priority=${detail?.rendererPriorityAtExit()}",
                             )
+                            // Revoke the dead document immediately. Changing both keys disposes
+                            // this AndroidView and creates a fresh Chromium renderer + navigation
+                            // capability on the next committed composition.
+                            navigationGuard.invalidate(navigationSession)
+                            if (webView === goneView || goneView == null) webView = null
+                            rendererGeneration++
                             currentOnPlaybackError?.invoke(
                                 playbackKey,
                                 "Video server renderer stopped",
                                 navigationSession.request.streamUrl,
                                 currentPositionMs,
                             )
-                            if (webView === goneView) webView = null
                         },
                     )
                     web.webChromeClient = EmbedNavigationWebChromeClient(
@@ -758,18 +790,22 @@ fun EmbedWebView(
             },
             onRelease = { view ->
                 val web = view as? WebView ?: return@AndroidView
-                navigationGuard.invalidate(currentNavigationSession)
+                (web.tag as? EmbedNavigationSession)?.let(navigationGuard::invalidate)
                 if (webView === web) webView = null
-                DiagnosticsLog.event("EmbedWebView release url=${web.url ?: "none"} size=${web.width}x${web.height}")
+                val releasedUrl = runCatching { web.url }.getOrNull()
+                DiagnosticsLog.event(
+                    "EmbedWebView release url=${releasedUrl ?: "none"} size=${web.width}x${web.height}",
+                )
                 stopWebPlayback(web)
-                web.removeJavascriptInterface("AniliProgress")
-                web.clearHistory()
-                web.removeAllViews()
-                web.webChromeClient = null
-                web.webViewClient = WebViewClient()
-                web.destroy()
+                runCatching { web.removeJavascriptInterface("AniliProgress") }
+                runCatching { web.clearHistory() }
+                runCatching { web.removeAllViews() }
+                runCatching { web.webChromeClient = null }
+                runCatching { web.webViewClient = WebViewClient() }
+                runCatching { web.destroy() }
             },
-        )
+            )
+        }
 
         loadError?.let { message ->
             Column(
@@ -1367,38 +1403,6 @@ private fun REMOTE_TOGGLE_PLAYBACK_JS(navigationGeneration: Long): String = """
         }
       } catch (e) { /* ignored */ }
       return false;
-    })();
-""".trimIndent()
-
-private fun RESUME_WHEN_READY_JS(targetSec: Double, navigationGeneration: Long): String = """
-    (function() {
-      ${embedNavigationJsGuard(navigationGeneration)}
-      var attempts = 0;
-      var timer = setInterval(function() {
-        if (
-          window.__aniliNavigationToken !== '$navigationGeneration' ||
-          window.__aniliNavigationRevoked === true
-        ) {
-          clearInterval(timer);
-          return;
-        }
-        attempts++;
-        try {
-          var video = document.querySelector('video');
-          if (video && video.readyState >= 1) {
-            var target = $targetSec;
-            video.currentTime = isFinite(video.duration) && video.duration > 0
-              ? Math.min(target, video.duration)
-              : target;
-            video.play();
-            clearInterval(timer);
-          } else if (attempts >= 30) {
-            clearInterval(timer);
-          }
-        } catch (e) {
-          if (attempts >= 30) clearInterval(timer);
-        }
-      }, 250);
     })();
 """.trimIndent()
 
