@@ -563,10 +563,10 @@ private fun AppNavHost(
                     onAnimeClick = { id -> nav.navigate(Routes.detail(id)) },
                     onWatchNow = { id ->
                         val saved = com.miruronative.data.library.LibraryStore.historyFor(id)
-                        if (saved != null) nav.navigate(Routes.watch(id, saved.provider, saved.category, saved.episodeLabel))
+                        if (saved != null) nav.navigate(Routes.watch(id, saved.provider, saved.category, saved.continueEpisodeLabel))
                         else nav.navigate(Routes.watch(id, "auto", if (com.miruronative.data.settings.SettingsStore.preferDub.value) "dub" else "sub", "1"))
                     },
-                    onResume = { e -> nav.navigate(Routes.watch(e.anilistId, e.provider, e.category, e.episodeLabel)) },
+                    onResume = { e -> nav.navigate(Routes.watch(e.anilistId, e.provider, e.category, e.continueEpisodeLabel)) },
                     onSearchClick = { nav.navigateTab(Routes.SEARCH) },
                     onNotificationsClick = { nav.navigate(Routes.NOTIFICATIONS) { launchSingleTop = true } },
                 )
@@ -591,7 +591,7 @@ private fun AppNavHost(
                 ProfileScreen(
                     onAnimeClick = { id -> nav.navigate(Routes.detail(id)) },
                     onResume = { e ->
-                        nav.navigate(Routes.watch(e.anilistId, e.provider, e.category, e.episodeLabel))
+                        nav.navigate(Routes.watch(e.anilistId, e.provider, e.category, e.continueEpisodeLabel))
                     },
                 )
             }
@@ -628,7 +628,7 @@ private fun AppNavHost(
                     onSeasonWatch = { seasonId ->
                         val saved = com.miruronative.data.library.LibraryStore.historyFor(seasonId)
                         if (saved != null) {
-                            nav.navigate(Routes.episodes(seasonId, saved.provider, saved.category, saved.episodeLabel))
+                            nav.navigate(Routes.episodes(seasonId, saved.provider, saved.category, saved.continueEpisodeLabel))
                         } else {
                             nav.navigate(Routes.episodes(seasonId, "auto", if (com.miruronative.data.settings.SettingsStore.preferDub.value) "dub" else "sub", "1"))
                         }

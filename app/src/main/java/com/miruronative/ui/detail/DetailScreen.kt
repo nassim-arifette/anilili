@@ -182,7 +182,7 @@ private fun DetailContent(
     val canWatch = episodes.isNotEmpty()
     val playCurrent: () -> Unit = {
         when {
-            resume != null -> onPlay(info.id, resume.provider, resume.category, resume.episodeLabel)
+            resume != null -> onPlay(info.id, resume.provider, resume.category, resume.continueEpisodeLabel)
             canWatch -> onPlay(
                 data.selectedSeasonId,
                 "auto",
@@ -396,7 +396,7 @@ private fun DetailActions(
                 Icon(Icons.Default.PlayArrow, contentDescription = null, Modifier.size(19.dp))
             }
             Text(
-                text = if (resume != null) "Continue ${resume.episodeLabel}" else "Watch",
+                text = if (resume != null) "Continue ${resume.continueEpisodeLabel}" else "Watch",
                 modifier = Modifier.padding(start = 5.dp),
                 maxLines = 1,
             )

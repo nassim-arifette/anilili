@@ -2,7 +2,7 @@ package com.miruronative.data.library
 
 import kotlinx.serialization.Serializable
 
-/** One "continue watching" record per anime — the last episode watched + resume position. */
+/** One history record per anime: the last episode watched plus an optional continuation target. */
 @Serializable
 data class HistoryEntry(
     val anilistId: Int,
@@ -14,22 +14,58 @@ data class HistoryEntry(
     val category: String,
     val positionMs: Long = 0,
     val durationMs: Long = 0,
+    /**
+     * Episode to open after a naturally completed, non-final episode. The default keeps history
+     * written by older app versions compatible and represents ordinary in-progress playback.
+     */
+    val continuationEpisodeNumber: Double? = null,
     /** Completed final episodes stay in viewing history but are hidden from Continue Watching. */
     val completed: Boolean = false,
     val updatedAt: Long = 0,
 ) {
+    private val activeContinuationEpisodeNumber: Double?
+        get() = continuationEpisodeNumber?.takeIf {
+            !completed && it.isFinite() && it != episodeNumber
+        }
+
     val progressFraction: Float
         get() = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
 
     val episodeLabel: String
-        get() = if (episodeNumber % 1.0 == 0.0) episodeNumber.toInt().toString() else episodeNumber.toString()
+        get() = episodeNumber.toEpisodeLabel()
+
+    /** Episode and position represented by Continue Watching entry points. */
+    val continueEpisodeNumber: Double
+        get() = activeContinuationEpisodeNumber ?: episodeNumber
+
+    val continueEpisodeLabel: String
+        get() = continueEpisodeNumber.toEpisodeLabel()
+
+    val continuePositionMs: Long
+        get() = if (activeContinuationEpisodeNumber != null) 0L else positionMs
+
+    val continueDurationMs: Long
+        get() = if (activeContinuationEpisodeNumber != null) 0L else durationMs
+
+    val continueProgressFraction: Float
+        get() = if (activeContinuationEpisodeNumber != null) 0f else progressFraction
+
+    val hasContinuationTarget: Boolean
+        get() = activeContinuationEpisodeNumber != null
 
     val belongsInContinueWatching: Boolean
         get() = !completed
 
-    fun resumePositionFor(episode: Double): Long? =
-        positionMs.takeIf { !completed && episodeNumber == episode }
+    fun resumePositionFor(episode: Double): Long? = when {
+        completed -> null
+        activeContinuationEpisodeNumber == episode -> 0L
+        activeContinuationEpisodeNumber == null && episodeNumber == episode -> positionMs
+        else -> null
+    }
 }
+
+private fun Double.toEpisodeLabel(): String =
+    if (this % 1.0 == 0.0) toInt().toString() else toString()
 
 /** A saved series the user wants to watch. */
 @Serializable

@@ -110,12 +110,13 @@ object LibraryStore {
         upsertHistory(existing.copy(positionMs = positionMs, durationMs = durationMs))
     }
 
-    /** Atomically commits a terminal position and the final-series completion state. */
+    /** Atomically commits a terminal position, continuation target, and series completion state. */
     fun updateProgressDurably(
         anilistId: Int,
         episodeNumber: Double,
         positionMs: Long,
         durationMs: Long,
+        continuationEpisodeNumber: Double?,
         completed: Boolean,
     ): Boolean {
         val existing = _history.value.firstOrNull { it.anilistId == anilistId } ?: return false
@@ -124,6 +125,7 @@ object LibraryStore {
             existing.copy(
                 positionMs = positionMs,
                 durationMs = durationMs,
+                continuationEpisodeNumber = continuationEpisodeNumber.takeUnless { completed },
                 completed = completed,
             ),
             commitToDisk = true,
