@@ -40,6 +40,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -90,7 +91,11 @@ internal fun PlayerControlsScaffold(
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)),
     ) {
-        val chromeLayout = playerChromeLayout(maxWidth.value, maxHeight.value)
+        val chromeLayout = playerChromeLayout(
+            widthDp = maxWidth.value,
+            heightDp = maxHeight.value,
+            fontScale = LocalDensity.current.fontScale,
+        )
         val minimal = chromeLayout == PlayerChromeLayout.MINIMAL
         val compact = chromeLayout != PlayerChromeLayout.CINEMA
         val metrics = playerChromeVerticalMetrics(chromeLayout)
@@ -420,6 +425,7 @@ private fun FullscreenPlayerControlsPreview() {
 }
 
 @Preview(name = "Inline portrait", widthDp = 390, heightDp = 220, backgroundColor = 0xFF141217, showBackground = true)
+@Preview(name = "Inline large text", widthDp = 400, heightDp = 225, fontScale = 2f, backgroundColor = 0xFF141217, showBackground = true)
 @Preview(name = "Small inline 360", widthDp = 360, heightDp = 202, backgroundColor = 0xFF141217, showBackground = true)
 @Preview(name = "Small inline 320", widthDp = 320, heightDp = 180, backgroundColor = 0xFF141217, showBackground = true)
 @Composable
