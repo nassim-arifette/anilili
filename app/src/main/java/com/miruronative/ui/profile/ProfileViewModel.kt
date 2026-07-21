@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.miruronative.data.AppGraph
 import com.miruronative.data.auth.AccountService
 import com.miruronative.data.auth.AuthManager
+import com.miruronative.data.auth.MalAuthorizationCode
 import com.miruronative.data.auth.MalAuthManager
 import com.miruronative.data.model.MediaListEntry
 import com.miruronative.data.model.MediaListCollection
@@ -101,7 +102,7 @@ class ProfileViewModel : ViewModel() {
     }
 
     /** MAL redirect hands back a code; trade it for tokens before loading the profile. */
-    fun onMalCode(code: String) {
+    fun onMalCode(code: MalAuthorizationCode) {
         _profile.value = UiState.Loading
         viewModelScope.launch {
             try {
