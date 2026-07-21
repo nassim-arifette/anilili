@@ -7,18 +7,15 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import androidx.annotation.OptIn
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -27,10 +24,8 @@ import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -54,7 +49,6 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -1240,6 +1234,18 @@ internal fun PlayerSurface(
         }
     }
 
+    val primaryAction = skipPlan.actionAt(positionMs, currentHasNext)?.let { planned ->
+        PlayerChromeAction(planned.label) {
+            runIfPlaybackOwnerActive {
+                if (planned.advanceToNextEpisode) {
+                    currentOnNextEpisode()
+                } else {
+                    planned.seekTargetMs?.let { controller?.seekTo(it) }
+                }
+            }
+        }
+    }
+
     val remoteModifier = if (device.isTv && focusPlayerOnStart) {
         Modifier
             .focusRequester(tvPlayerFocus)
@@ -1378,14 +1384,21 @@ internal fun PlayerSurface(
             )
         }
 
-        // Phone controls, shown: the shared control bar (identical to the embed player) over a
-        // full-screen scrim that hides it again on a tap in empty space.
-        if (controller != null && !device.isTv && phoneControlsVisible) {
-            Box(
-                Modifier
-                    .matchParentSize()
-                    .pointerInput(Unit) { detectTapGestures { phoneControlsVisible = false } },
-            )
+        // Phone shared chrome: the full bar sits over a dismissible scrim while visible. After it
+        // auto-hides, only a contextual skip/next action remains mounted above GestureControls;
+        // taps elsewhere still reach the gesture layer and reveal the full chrome again.
+        if (
+            controller != null &&
+            !device.isTv &&
+            shouldComposePlayerChrome(phoneControlsVisible, primaryAction != null)
+        ) {
+            if (phoneControlsVisible) {
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .pointerInput(Unit) { detectTapGestures { phoneControlsVisible = false } },
+                )
+            }
             PlayerControlsScaffold(
                 isPlaying = playbackIsPlaying,
                 positionMs = positionMs,
@@ -1424,6 +1437,8 @@ internal fun PlayerSurface(
                 episodeTitle = episodeTitle,
                 onExitFullscreen = if (isFullscreen) onToggleFullscreen else null,
                 onInteract = { phoneControlsInteraction++ },
+                showChrome = phoneControlsVisible,
+                primaryAction = primaryAction,
             ) {
                 PlayerControlIconButton(
                     "Subtitles",
@@ -1660,54 +1675,9 @@ internal fun PlayerSurface(
                     settingsExpanded = true
                 },
                 onFullscreen = onToggleFullscreen,
+                primaryAction = primaryAction,
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
-        }
-
-        val action = skipPlan.actionAt(positionMs, hasNextEpisode)?.let { planned ->
-            planned.label to {
-                runIfPlaybackOwnerActive {
-                    if (planned.advanceToNextEpisode) {
-                        onNextEpisode()
-                    } else {
-                        planned.seekTargetMs?.let { controller?.seekTo(it) }
-                    }
-                }
-                Unit
-            }
-        }
-        LaunchedEffect(action?.first, playerView, device.isTv, focusPlayerOnStart) {
-            if (device.isTv && focusPlayerOnStart) {
-                // Compose may focus a newly inserted skip/next action before PlayerView can
-                // reclaim focus. Return remote input to the player once this frame settles.
-                delay(32)
-                runCatching { tvPlayerFocus.requestFocus() }
-            }
-        }
-        action?.let { (label, onClick) ->
-            val controlsVisible = if (device.isTv) tvControlsVisible else phoneControlsVisible
-            val actionModifier = if (controlsVisible) {
-                Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 16.dp)
-            } else {
-                Modifier.align(Alignment.BottomStart).padding(start = 24.dp, bottom = 24.dp)
-            }
-            OutlinedButton(
-                onClick = onClick,
-                shape = RoundedCornerShape(3.dp),
-                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.55f)),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = Color.Black.copy(alpha = 0.5f),
-                    contentColor = Color.White,
-                ),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                modifier = actionModifier,
-            ) {
-                Text(
-                    label.uppercase(),
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
         }
     }
 }

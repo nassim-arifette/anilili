@@ -88,6 +88,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | UI-001 | [x] | Make adaptive player chrome selection aware of Android font scale. Short inline players now omit metadata before enlarged two-line titles can overlap transport controls, while layouts with enough room retain their compact or cinema presentation. | `fix/player-large-font-overlap` |
 | UI-002 | [x] | Select cinema chrome only when its measured transport clears the footer. Wide players between 280 and 293 dp high now keep the compact layout instead of overlapping the timeline and controls. | `fix/cinema-footer-clearance` |
 | UI-003 | [x] | Gate Android TV embed transport, seeking, automation, and D-pad interception on authenticated bridge availability. Cross-origin providers now get an explicit focus handoff, receive D-pad/Select directly, and return to the app action bar on the first Back press without synthetic taps. | `fix/cross-origin-tv-handoff` |
+| UI-004 | [x] | Reserve one shared, chrome-aware skip/next action slot for native and managed-embed players, including an action-only state while transport chrome auto-hides. Minimal 320 x 180 chrome uses a 48 dp icon target with the full accessible label; compact and cinema chrome retain the full visible pure, mixed, recap, or next-episode label without covering metadata, transport, timeline, or footer controls. | `fix/player-skip-action-layout` |
 
 ## Follow-up issue checklist
 

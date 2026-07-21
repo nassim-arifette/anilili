@@ -1,21 +1,26 @@
 package com.miruronative.ui.watch
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Forward10
@@ -27,6 +32,8 @@ import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -55,6 +62,12 @@ import androidx.compose.foundation.layout.offset
 private val PlayerInk = Color(0xFFF4F1EA)
 private val PlayerMutedInk = Color(0xFFC8C4BC)
 
+/** A real playback action exposed by the current skip plan; no placeholder controls are created. */
+internal data class PlayerChromeAction(
+    val label: String,
+    val onClick: () -> Unit,
+)
+
 /**
  * Shared touch chrome for native and scriptable embed playback.
  *
@@ -81,6 +94,8 @@ internal fun PlayerControlsScaffold(
     episodeTitle: String? = null,
     onExitFullscreen: (() -> Unit)? = null,
     onInteract: () -> Unit = {},
+    showChrome: Boolean = true,
+    primaryAction: PlayerChromeAction? = null,
     bottomRightIcons: @Composable RowScope.() -> Unit = {},
 ) {
     // While the thumb is held, the slider follows the finger instead of the once-a-second tick.
@@ -105,30 +120,44 @@ internal fun PlayerControlsScaffold(
             PlayerChromeLayout.CINEMA -> 24.dp
         }
 
-        Box(
-            Modifier
-                .matchParentSize()
-                .background(
-                    Brush.verticalGradient(
-                        0f to Color.Black.copy(alpha = 0.56f),
-                        0.30f to Color.Transparent,
-                        0.58f to Color.Transparent,
-                        1f to Color.Black.copy(alpha = 0.88f),
+        if (showChrome) {
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .background(
+                        Brush.verticalGradient(
+                            0f to Color.Black.copy(alpha = 0.56f),
+                            0.30f to Color.Transparent,
+                            0.58f to Color.Transparent,
+                            1f to Color.Black.copy(alpha = 0.88f),
+                        ),
                     ),
-                ),
-        )
+            )
+        }
 
         PlayerChromeHeader(
-            seriesTitle = seriesTitle,
-            episodeTitle = episodeTitle,
+            seriesTitle = seriesTitle.takeIf { showChrome },
+            episodeTitle = episodeTitle.takeIf { showChrome },
             compact = compact,
-            showMetadata = !minimal,
-            onExitFullscreen = onExitFullscreen,
+            showMetadata = showChrome && !minimal,
+            onExitFullscreen = onExitFullscreen.takeIf { showChrome },
+            action = primaryAction,
+            actionPresentation = playerChromeActionPresentation(
+                widthDp = maxWidth.value,
+                heightDp = maxHeight.value,
+                fontScale = LocalDensity.current.fontScale,
+            ),
+            onActionClick = {
+                primaryAction?.onClick?.invoke()
+                onInteract()
+            },
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .fillMaxWidth()
                 .padding(start = horizontalPadding, end = horizontalPadding, top = if (compact) 4.dp else 12.dp),
         )
+
+        if (!showChrome) return@BoxWithConstraints
 
         Row(
             modifier = Modifier
@@ -321,9 +350,16 @@ private fun PlayerChromeHeader(
     compact: Boolean,
     showMetadata: Boolean,
     onExitFullscreen: (() -> Unit)?,
+    action: PlayerChromeAction?,
+    actionPresentation: PlayerChromeActionPresentation,
+    onActionClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    if ((!showMetadata || (seriesTitle.isNullOrBlank() && episodeTitle.isNullOrBlank())) && onExitFullscreen == null) {
+    if (
+        (!showMetadata || (seriesTitle.isNullOrBlank() && episodeTitle.isNullOrBlank())) &&
+        onExitFullscreen == null &&
+        action == null
+    ) {
         return
     }
     Row(
@@ -342,35 +378,110 @@ private fun PlayerChromeHeader(
             // title context out from under that 48 dp target without duplicating its action here.
             Box(Modifier.size(48.dp))
         }
-        if (showMetadata) Column(Modifier.weight(1f)) {
-            if (!compact && !seriesTitle.isNullOrBlank()) {
-                Text(
-                    "NOW PLAYING",
-                    color = PlayerMutedInk,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                )
+        if (showMetadata && (!seriesTitle.isNullOrBlank() || !episodeTitle.isNullOrBlank())) {
+            Column(Modifier.weight(1f)) {
+                if (!compact && !seriesTitle.isNullOrBlank()) {
+                    Text(
+                        "NOW PLAYING",
+                        color = PlayerMutedInk,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                val primary = if (compact) seriesTitle ?: episodeTitle else seriesTitle
+                if (!primary.isNullOrBlank()) {
+                    Text(
+                        primary,
+                        color = PlayerInk,
+                        style = if (compact) {
+                            MaterialTheme.typography.labelLarge
+                        } else {
+                            MaterialTheme.typography.titleMedium
+                        },
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (!episodeTitle.isNullOrBlank() && episodeTitle != primary) {
+                    Text(
+                        episodeTitle,
+                        color = PlayerMutedInk,
+                        style = if (compact) {
+                            MaterialTheme.typography.labelSmall
+                        } else {
+                            MaterialTheme.typography.bodyMedium
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
-            val primary = if (compact) seriesTitle ?: episodeTitle else seriesTitle
-            if (!primary.isNullOrBlank()) {
-                Text(
-                    primary,
-                    color = PlayerInk,
-                    style = if (compact) MaterialTheme.typography.labelLarge else MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            if (!episodeTitle.isNullOrBlank() && episodeTitle != primary) {
-                Text(
-                    episodeTitle,
-                    color = PlayerMutedInk,
-                    style = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodyMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+        } else if (action != null) {
+            // Keeps the action at the physical end when minimal chrome has no title metadata.
+            Spacer(Modifier.weight(1f))
+        }
+        action?.let { currentAction ->
+            PlayerChromeActionButton(
+                action = currentAction,
+                iconOnly = actionPresentation == PlayerChromeActionPresentation.ICON_ONLY,
+                onClick = onActionClick,
+            )
+        }
+    }
+}
+
+@Composable
+internal fun PlayerChromeActionButton(
+    action: PlayerChromeAction,
+    iconOnly: Boolean,
+    onClick: () -> Unit,
+) {
+    val content = playerChromeActionContent(
+        label = action.label,
+        presentation = if (iconOnly) {
+            PlayerChromeActionPresentation.ICON_ONLY
+        } else {
+            PlayerChromeActionPresentation.LABELED
+        },
+    )
+    if (iconOnly) {
+        IconButton(
+            onClick = onClick,
+            modifier = Modifier
+                .size(48.dp)
+                .clip(CircleShape)
+                .background(Color.Black.copy(alpha = 0.52f))
+                .border(1.dp, PlayerInk.copy(alpha = 0.55f), CircleShape)
+                .semantics { contentDescription = content.contentDescription },
+        ) {
+            Icon(
+                Icons.Default.SkipNext,
+                contentDescription = null,
+                tint = PlayerInk,
+                modifier = Modifier.size(26.dp),
+            )
+        }
+    } else {
+        OutlinedButton(
+            onClick = onClick,
+            shape = RoundedCornerShape(3.dp),
+            border = BorderStroke(1.dp, PlayerInk.copy(alpha = 0.55f)),
+            colors = ButtonDefaults.outlinedButtonColors(
+                containerColor = Color.Black.copy(alpha = 0.52f),
+                contentColor = PlayerInk,
+            ),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .semantics { contentDescription = content.contentDescription },
+        ) {
+            Text(
+                requireNotNull(content.visibleLabel),
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+            )
         }
     }
 }
@@ -451,6 +562,7 @@ private fun PlayerControlsPreviewContent(onExitFullscreen: (() -> Unit)?) {
             seriesTitle = "Hunter × Hunter",
             episodeTitle = "Episode 12 · Last Test × Of × Resolve",
             onExitFullscreen = onExitFullscreen,
+            primaryAction = PlayerChromeAction("Skip Mixed Opening", onClick = {}),
         )
     }
 }

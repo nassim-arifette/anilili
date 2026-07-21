@@ -20,23 +20,18 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -60,7 +55,6 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -842,6 +836,23 @@ fun EmbedWebView(
         }
     }
 
+    val primaryAction = if (!canAutomatePlayback) {
+        null
+    } else {
+        skipPlan.actionAt(
+            positionMs = positionMs,
+            hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
+        )?.let { planned ->
+            PlayerChromeAction(planned.label) {
+                if (planned.advanceToNextEpisode) {
+                    currentOnNextEpisode?.invoke(playbackKey)
+                } else {
+                    planned.seekTargetMs?.let { requestSeek(it, null) }
+                }
+            }
+        }
+    }
+
     val remoteModifier = if (device.isTv && tvControlPolicy.showsAppTransport) {
         Modifier
             .onPreviewKeyEvent { event ->
@@ -1318,7 +1329,13 @@ fun EmbedWebView(
                 },
         )
 
-        if (touchControlsActive && touchControlsVisible) {
+        // Keep the shared contextual action mounted after transport auto-hide. The transparent
+        // scaffold has no surface-wide pointer handler, so taps outside that button still reach
+        // PlayerGestureControls and reveal the complete embed chrome.
+        if (
+            touchControlsActive &&
+            shouldComposePlayerChrome(touchControlsVisible, primaryAction != null)
+        ) {
             EmbedTouchControls(
                 positionMs = positionMs,
                 durationMs = durationMs,
@@ -1350,6 +1367,8 @@ fun EmbedWebView(
                 isFullscreen = isFullscreen,
                 onFullscreen = onToggleFullscreen,
                 onInteract = { touchControlsInteraction++ },
+                showChrome = touchControlsVisible,
+                primaryAction = primaryAction,
             )
         }
 
@@ -1520,32 +1539,8 @@ fun EmbedWebView(
                     settingsSheetVisible = true
                 },
                 onFullscreen = onToggleFullscreen,
+                primaryAction = primaryAction,
                 modifier = Modifier.align(Alignment.BottomCenter),
-            )
-        }
-
-        val action = if (!canAutomatePlayback) {
-            null
-        } else {
-            skipPlan.actionAt(
-                positionMs = positionMs,
-                hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
-            )?.let { planned ->
-                planned.label to {
-                    if (planned.advanceToNextEpisode) {
-                        currentOnNextEpisode?.invoke(playbackKey)
-                    } else {
-                        planned.seekTargetMs?.let { requestSeek(it, null) }
-                    }
-                    Unit
-                }
-            }
-        }
-        action?.let { (label, onClick) ->
-            WebSkipButton(
-                label = label,
-                onClick = onClick,
-                modifier = Modifier.align(Alignment.BottomStart),
             )
         }
     }
@@ -1564,28 +1559,6 @@ private fun allAnimeIframeShell(url: String): String {
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     return """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;background:#000;overflow:hidden"><iframe src="$escaped" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer-when-downgrade" style="position:fixed;inset:0;width:100%;height:100%;border:0"></iframe></body></html>"""
-}
-
-@Composable
-private fun WebSkipButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    OutlinedButton(
-        onClick = onClick,
-        shape = RoundedCornerShape(3.dp),
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.55f)),
-        colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = Color.Black.copy(alpha = 0.5f),
-            contentColor = Color.White,
-        ),
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-        modifier = modifier
-            .padding(start = 24.dp, bottom = 24.dp),
-    ) {
-        Text(
-            label.uppercase(),
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Bold,
-        )
-    }
 }
 
 /**

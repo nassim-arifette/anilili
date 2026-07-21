@@ -106,6 +106,7 @@ internal fun TvPlayerControls(
     onVolumeUp: () -> Unit,
     onSettings: (() -> Unit)? = null,
     onFullscreen: (() -> Unit)? = null,
+    primaryAction: PlayerChromeAction? = null,
     modifier: Modifier = Modifier,
 ) {
     val progress = if (durationMs > 0L) {
@@ -134,6 +135,19 @@ internal fun TvPlayerControls(
                 style = MaterialTheme.typography.labelLarge,
                 color = Color.White,
             )
+            primaryAction?.let { action ->
+                PlayerChromeActionButton(
+                    action = action,
+                    iconOnly = false,
+                    onClick = action.onClick,
+                )
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
