@@ -1,6 +1,7 @@
 package com.miruronative.ui.watch
 
 import android.content.ComponentName
+import android.content.ContextWrapper
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
@@ -93,6 +94,9 @@ import androidx.media3.ui.DefaultTrackNameProvider
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.SubtitleView
 import com.miruronative.data.model.Category
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.model.SubtitleItem
@@ -101,6 +105,7 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.DefaultQuality
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.playback.LocalPlaybackOwnerToken
 import com.miruronative.playback.PlaybackService
 import com.miruronative.playback.SubtitleDelay
 import androidx.compose.ui.semantics.contentDescription
@@ -281,6 +286,39 @@ fun PlayerSurface(
     val context = LocalContext.current
     val device = LocalAppDeviceProfile.current
     DisposableEffect(Unit) { onDispose { resetPlayerBrightness(context) } }
+    val lifecycleOwner = remember(context) { context.findPlayerLifecycleOwner() }
+    DisposableEffect(lifecycleOwner) {
+        var playbackOwner: LocalPlaybackOwnerToken? = null
+
+        fun acquirePlaybackOwner() {
+            if (playbackOwner == null) {
+                playbackOwner = PlaybackService.acquireLocalPlaybackOwner()
+            }
+        }
+
+        fun releasePlaybackOwner() {
+            playbackOwner?.let { PlaybackService.releaseLocalPlaybackOwner(it) }
+            playbackOwner = null
+        }
+
+        val lifecycle = lifecycleOwner?.lifecycle
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> acquirePlaybackOwner()
+                Lifecycle.Event.ON_STOP,
+                Lifecycle.Event.ON_DESTROY -> releasePlaybackOwner()
+                else -> Unit
+            }
+        }
+        lifecycle?.addObserver(observer)
+        if (lifecycle == null || lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            acquirePlaybackOwner()
+        }
+        onDispose {
+            lifecycle?.removeObserver(observer)
+            releasePlaybackOwner()
+        }
+    }
     // Each episode starts from what the loader measured for this stream, so a shift the viewer
     // dialled in for a broken one never follows them into the next.
     LaunchedEffect(stream.url, subtitleOffsetMs) {
@@ -1108,6 +1146,12 @@ fun PlayerSurface(
 
 internal fun shouldRetryDecoderForMedia(lastRetriedMediaId: String?, failedMediaId: String?): Boolean =
     !failedMediaId.isNullOrBlank() && failedMediaId != lastRetriedMediaId
+
+private tailrec fun Context.findPlayerLifecycleOwner(): LifecycleOwner? = when (this) {
+    is LifecycleOwner -> this
+    is ContextWrapper -> baseContext.findPlayerLifecycleOwner()
+    else -> null
+}
 
 /** Quick subtitle on/off for the control bar's CC button; full track choice lives in the sheet. */
 @OptIn(UnstableApi::class)
