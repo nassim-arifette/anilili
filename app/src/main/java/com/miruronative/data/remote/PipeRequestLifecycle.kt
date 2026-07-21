@@ -13,7 +13,7 @@ internal class PipeRequestLifecycle<T> {
     internal class Session<T> internal constructor(
         val generation: Long,
     ) {
-        internal val readiness = CompletableDeferred<Boolean>()
+        internal var readiness = CompletableDeferred<Boolean>()
         internal var readinessState = Readiness.WAITING
         internal var readinessGeneration = 1L
     }
@@ -31,6 +31,17 @@ internal class PipeRequestLifecycle<T> {
         val displacedRequests: List<Request<T>>,
     )
 
+    internal data class Navigation<T>(
+        val readinessGeneration: Long,
+        val displacedRequests: List<Request<T>>,
+    )
+
+    internal data class ReadinessSignal<T>(
+        val session: Session<T>,
+        val generation: Long,
+        val result: CompletableDeferred<Boolean>,
+    )
+
     internal enum class Readiness {
         WAITING,
         READY,
@@ -40,6 +51,7 @@ internal class PipeRequestLifecycle<T> {
     private val lock = Any()
     private var nextGeneration = 0L
     private var activeSession: Session<T>? = null
+    private var nextAttachment = CompletableDeferred<Session<T>>()
     private val pendingRequests = mutableMapOf<String, Request<T>>()
 
     fun attach(): Attachment<T> = synchronized(lock) {
@@ -48,23 +60,42 @@ internal class PipeRequestLifecycle<T> {
         pendingRequests.clear()
         val session = Session<T>(generation = ++nextGeneration)
         activeSession = session
+        nextAttachment.complete(session)
         Attachment(session, session.readinessGeneration, displaced)
     }
 
     fun detach(session: Session<T>): List<Request<T>> = synchronized(lock) {
         if (activeSession !== session) return@synchronized emptyList()
         activeSession = null
+        nextAttachment = CompletableDeferred()
         session.failReadiness()
         val displaced = pendingRequests.values.toList()
         pendingRequests.clear()
         displaced
     }
 
-    fun advanceReadinessGeneration(session: Session<T>): Long? = synchronized(lock) {
-        if (activeSession !== session || session.readinessState != Readiness.WAITING) {
-            return@synchronized null
+    /** Waits for the current or next WebView attachment; caller timeout/cancellation owns the wait. */
+    suspend fun awaitSession(): Session<T> {
+        val signal = synchronized(lock) {
+            activeSession?.let { CompletableDeferred(it) } ?: nextAttachment
         }
-        ++session.readinessGeneration
+        return signal.await()
+    }
+
+    /** Starts a fresh main-document generation and drains JS requests owned by the old page. */
+    fun beginNavigation(session: Session<T>): Navigation<T>? = synchronized(lock) {
+        if (activeSession !== session) return@synchronized null
+        session.failReadiness()
+        session.readiness = CompletableDeferred()
+        session.readinessState = Readiness.WAITING
+        val displaced = pendingRequests.values.toList()
+        pendingRequests.clear()
+        Navigation(++session.readinessGeneration, displaced)
+    }
+
+    fun readinessSignal(session: Session<T>): ReadinessSignal<T>? = synchronized(lock) {
+        if (activeSession !== session) return@synchronized null
+        ReadinessSignal(session, session.readinessGeneration, session.readiness)
     }
 
     fun markReady(
@@ -88,8 +119,20 @@ internal class PipeRequestLifecycle<T> {
         activeSession === session
     }
 
-    fun register(session: Session<T>, id: String): Request<T>? = synchronized(lock) {
-        if (activeSession !== session || session.readinessState != Readiness.READY) {
+    fun isCurrent(signal: ReadinessSignal<T>): Boolean = synchronized(lock) {
+        activeSession === signal.session &&
+            signal.session.readinessGeneration == signal.generation &&
+            signal.session.readiness === signal.result
+    }
+
+    fun register(signal: ReadinessSignal<T>, id: String): Request<T>? = synchronized(lock) {
+        val session = signal.session
+        if (
+            activeSession !== session ||
+            session.readinessState != Readiness.READY ||
+            session.readinessGeneration != signal.generation ||
+            session.readiness !== signal.result
+        ) {
             return@synchronized null
         }
         Request<T>(id, session).also { pendingRequests[id] = it }

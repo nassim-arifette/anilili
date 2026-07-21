@@ -114,8 +114,9 @@ object PipeBridge {
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 DiagnosticsLog.event("PipeBridge page started: ${url ?: "unknown"}")
                 if (isCurrent(attached, view)) {
-                    lifecycle.advanceReadinessGeneration(attached.session)?.let {
-                        attached.readinessGeneration = it
+                    lifecycle.beginNavigation(attached.session)?.let { navigation ->
+                        attached.readinessGeneration = navigation.readinessGeneration
+                        failRequests(navigation.displacedRequests, "webview navigated")
                     }
                 }
             }
@@ -161,8 +162,9 @@ object PipeBridge {
                 // This mirror is unreachable (ISP block, DNS, site down): roll to the next one.
                 // Only once all mirrors fail do waiters unblock into the cache/error path.
                 if (attached.originIndex < ORIGINS.lastIndex) {
-                    lifecycle.advanceReadinessGeneration(attached.session)?.let {
-                        attached.readinessGeneration = it
+                    lifecycle.beginNavigation(attached.session)?.let { navigation ->
+                        attached.readinessGeneration = navigation.readinessGeneration
+                        failRequests(navigation.displacedRequests, "webview navigated")
                     }
                     attached.originIndex++
                     val nextOrigin = activeOrigin(attached)
@@ -230,23 +232,39 @@ object PipeBridge {
     }
 
     private suspend fun fetchWithinDeadline(e: String): String {
-        val attached = attachment ?: return errorPayload("webview not ready")
-        val readyResult = withTimeoutOrNull(READY_WAIT_TIMEOUT_MS) {
-            attached.session.readiness.await()
-        }
-        if (readyResult != true) {
-            val reason = if (readyResult == null) "webview readiness timeout" else "webview unavailable"
-            DiagnosticsLog.event("PipeBridge $reason generation=${attached.session.generation}")
-            return errorPayload(reason)
-        }
+        while (true) {
+            // The host intentionally creates resolver WebViews after a short startup delay. Wait
+            // for that attachment inside fetch()'s caller-owned total deadline instead of turning
+            // a fast deep link into a permanent provider failure.
+            val session = lifecycle.awaitSession()
+            val readiness = lifecycle.readinessSignal(session) ?: continue
+            val readyResult = withTimeoutOrNull(READY_WAIT_TIMEOUT_MS) {
+                readiness.result.await()
+            }
+            if (readyResult != true) {
+                // Replacement, detach, and navigation wake the old signal so we can follow the
+                // new owner. A failure that still owns the current document is terminal.
+                if (!lifecycle.isCurrent(readiness)) continue
+                val reason = if (readyResult == null) {
+                    "webview readiness timeout"
+                } else {
+                    "webview unavailable"
+                }
+                DiagnosticsLog.event("PipeBridge $reason generation=${session.generation}")
+                return errorPayload(reason)
+            }
 
-        // The request id doubles as an unguessable capability. The bridge is visible to every
-        // frame, but only the top-level injected script receives this value.
-        val id = UUID.randomUUID().toString()
-        val request = lifecycle.register(attached.session, id)
-            ?: return errorPayload("webview replaced")
+            if (!lifecycle.isCurrent(readiness)) continue
+            val attached = attachment
+                ?.takeIf { it.session === session && isCurrent(it) }
+                ?: continue
 
-        val js = """
+            // The request id doubles as an unguessable capability. The bridge is visible to every
+            // frame, but only the top-level injected script receives this value.
+            val id = UUID.randomUUID().toString()
+            val request = lifecycle.register(readiness, id) ?: continue
+
+            val js = """
             (function(){
               try {
                 fetch('/api/secure/pipe?e=$e', { headers: { 'Accept': '*/*' }, credentials: 'include' })
@@ -265,31 +283,32 @@ object PipeBridge {
                 AndroidPipe.onResult('$id', JSON.stringify({ ok:false, status:-1, error:String(err) }));
               }
             })();
-        """.trimIndent()
+            """.trimIndent()
 
-        main.post {
-            if (!lifecycle.isPending(request)) return@post
-            if (!isCurrent(attached)) {
-                failRequest(request, "webview replaced")
-            } else {
-                main.removeCallbacks(idleRunnable)
-                try {
-                    attached.view.onResume()
-                    attached.view.evaluateJavascript(js, null)
-                    scheduleIdle()
-                } catch (error: Throwable) {
-                    Log.w(TAG, "evaluateJavascript failed", error)
-                    failRequest(request, "webview request failed")
+            main.post {
+                if (!lifecycle.isPending(request)) return@post
+                if (!isCurrent(attached)) {
+                    failRequest(request, "webview replaced")
+                } else {
+                    main.removeCallbacks(idleRunnable)
+                    try {
+                        attached.view.onResume()
+                        attached.view.evaluateJavascript(js, null)
+                        scheduleIdle()
+                    } catch (error: Throwable) {
+                        Log.w(TAG, "evaluateJavascript failed", error)
+                        failRequest(request, "webview request failed")
+                    }
                 }
             }
-        }
 
-        return try {
-            request.result.await()
-        } finally {
-            // This also runs for caller cancellation and the outer request timeout. A posted main
-            // thread task checks this ownership before injecting JavaScript.
-            lifecycle.cancel(request)
+            return try {
+                request.result.await()
+            } finally {
+                // This also runs for caller cancellation and the outer request timeout. A posted
+                // main-thread task checks ownership before injecting JavaScript.
+                lifecycle.cancel(request)
+            }
         }
     }
 
