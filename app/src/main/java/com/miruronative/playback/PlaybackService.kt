@@ -360,10 +360,25 @@ class PlaybackService : MediaSessionService() {
         }
 
         internal fun activateWatchPlaybackOwner(): WatchPlaybackOwnerToken {
-            val token = watchPlaybackOwners.activate()
+            val token = watchPlaybackOwners.activate { error ->
+                DiagnosticsLog.throwable("PlaybackService outgoing watch handoff failed", error)
+            }
             DiagnosticsLog.event("PlaybackService watch playback owner activated generation=${token.generation}")
             return token
         }
+
+        /**
+         * Install the outgoing screen's synchronous barrier. Activation consumes this callback
+         * before invalidating [token], so its last progress snapshot and embed teardown cannot be
+         * overtaken by an incoming watch destination.
+         */
+        internal fun registerWatchPlaybackHandoff(
+            token: WatchPlaybackOwnerToken,
+            handoff: () -> Unit,
+        ): Boolean = watchPlaybackOwners.registerOutgoingHandoff(token, handoff)
+
+        internal fun clearWatchPlaybackHandoff(token: WatchPlaybackOwnerToken): Boolean =
+            watchPlaybackOwners.clearOutgoingHandoff(token)
 
         internal fun releaseWatchPlaybackOwner(token: WatchPlaybackOwnerToken) {
             val released = watchPlaybackOwners.runIfActive(token) {
