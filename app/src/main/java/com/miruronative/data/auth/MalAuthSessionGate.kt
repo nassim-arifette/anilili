@@ -65,6 +65,9 @@ internal class MalAuthSessionGate {
     fun commitIfCurrent(snapshot: SessionGate.Snapshot<*>, change: () -> Unit): Boolean =
         gate.commitIfCurrent(snapshot, change)
 
+    fun commitIfGenerationCurrent(generation: Long, change: () -> Unit): Boolean =
+        gate.commitIfGenerationCurrent(generation, change)
+
     fun invalidateIfCurrent(snapshot: SessionGate.Snapshot<*>, change: () -> Unit): Boolean =
         gate.invalidateIfCurrent(snapshot) {
             pendingLogin = null
