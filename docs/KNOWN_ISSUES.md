@@ -151,7 +151,8 @@ bugs that their replacements fixed:
 - [x] Focused unit tests for each topic branch passed before integration.
 - [x] Run the complete `testDebugUnitTest` suite on the final merged tree (`BUILD SUCCESSFUL`,
   July 21, 2026).
-- [ ] Build the final debug APK with SDK 36 and verify its output name.
+- [x] Build the final debug APK with SDK 36 (`assembleDebug`, `BUILD SUCCESSFUL`) and verify
+  `app/build/outputs/apk/debug/anilili.apk` with Android's APK signer.
 - [ ] Validate rapid Watch A -> B transitions, embed/native handoff, pause/seek/exit resume,
   intro/outro, an airing show's latest episode, the actual series finale, Cast, renderer loss,
   account replacement, and provider exhaustion on a real device or emulator.
