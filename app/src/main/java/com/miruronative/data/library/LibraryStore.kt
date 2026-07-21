@@ -74,10 +74,14 @@ object LibraryStore {
             _history.value = updated
             persist(KEY_HISTORY, updated, HistoryEntry.serializer())
         }
-        // TV launchers surface in-progress titles in their Continue Watching row; publishing is
-        // throttled inside the manager and a no-op off Android TV.
-        val watchNextRequest = WatchNextManager.preparePublish(stamped)
-        scope.launch { WatchNextManager.publish(appContext, watchNextRequest) }
+        // TV launchers surface only in-progress titles. remove() invalidates any older queued
+        // publish ticket, so an asynchronous progress write cannot resurrect a completed title.
+        if (stamped.completed) {
+            scope.launch { WatchNextManager.remove(appContext, stamped.anilistId) }
+        } else {
+            val watchNextRequest = WatchNextManager.preparePublish(stamped)
+            scope.launch { WatchNextManager.publish(appContext, watchNextRequest) }
+        }
         return true
     }
 
@@ -85,6 +89,26 @@ object LibraryStore {
         val existing = _history.value.firstOrNull { it.anilistId == anilistId } ?: return
         if (existing.episodeNumber != episodeNumber) return
         upsertHistory(existing.copy(positionMs = positionMs, durationMs = durationMs))
+    }
+
+    /** Atomically commits a terminal position and the final-series completion state. */
+    fun updateProgressDurably(
+        anilistId: Int,
+        episodeNumber: Double,
+        positionMs: Long,
+        durationMs: Long,
+        completed: Boolean,
+    ): Boolean {
+        val existing = _history.value.firstOrNull { it.anilistId == anilistId } ?: return false
+        if (existing.episodeNumber != episodeNumber) return false
+        return upsertHistoryInternal(
+            existing.copy(
+                positionMs = positionMs,
+                durationMs = durationMs,
+                completed = completed,
+            ),
+            commitToDisk = true,
+        )
     }
 
     fun historyFor(anilistId: Int): HistoryEntry? = _history.value.firstOrNull { it.anilistId == anilistId }

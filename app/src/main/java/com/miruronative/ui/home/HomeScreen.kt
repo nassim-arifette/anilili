@@ -104,6 +104,7 @@ fun HomeScreen(
     val state by vm.state.collectAsState()
     val isRefreshing by vm.isRefreshing.collectAsState()
     val history by LibraryStore.history.collectAsState()
+    val continueWatching = remember(history) { history.filter(HistoryEntry::belongsInContinueWatching) }
     val device = LocalAppDeviceProfile.current
     val context = androidx.compose.ui.platform.LocalContext.current
     var slowStartup by remember { mutableStateOf(false) }
@@ -191,7 +192,7 @@ fun HomeScreen(
                     data = s.data,
                     selectedTab = vm.selectedTab,
                     onSelectTab = vm::selectTab,
-                    history = history,
+                    history = continueWatching,
                     onAnimeClick = onAnimeClick,
                     onWatchNow = onWatchNow,
                     onResume = onResume,
