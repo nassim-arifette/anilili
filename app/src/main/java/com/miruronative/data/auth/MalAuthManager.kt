@@ -66,6 +66,24 @@ object MalAuthManager {
 
     val isLoggedIn: Boolean get() = _tokens.value != null
 
+    /** Stable for one login; ordinary access-token refreshes deliberately keep this identity. */
+    internal fun sessionGeneration(): Long? {
+        val session = sessionGate.snapshot { _tokens.value }
+        return session.generation.takeIf { session.value != null }
+    }
+
+    /** Checks the owning login and publishes under the same lock used by logout/re-login. */
+    internal fun commitIfSessionCurrent(generation: Long, change: () -> Unit): Boolean {
+        var committed = false
+        sessionGate.commitIfGenerationCurrent(generation) {
+            if (_tokens.value != null) {
+                change()
+                committed = true
+            }
+        }
+        return committed
+    }
+
     fun authorizeUrl(): String {
         val state = randomUrlSafe(24)
         // PKCE `plain`: the verifier IS the challenge. 32 random bytes → 43-char base64url,

@@ -143,7 +143,9 @@ fun ProfileScreen(
     var titleFilter by rememberSaveable { mutableStateOf("") }
     val loggedIn = token != null || malLoggedIn
 
-    LaunchedEffect(loggedIn) {
+    // The token itself is a key: replacing an AniList account while remaining logged in must
+    // invalidate the old profile just like a conventional logout/login sequence.
+    LaunchedEffect(token, malLoggedIn) {
         if (!loggedIn) selectedViewName = LibraryView.WATCHLIST.name
         vm.loadIfLoggedIn()
     }

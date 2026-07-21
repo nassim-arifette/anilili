@@ -5,6 +5,8 @@ import androidx.lifecycle.viewModelScope
 import com.miruronative.data.AppGraph
 import com.miruronative.data.auth.AccountService
 import com.miruronative.data.auth.AniListAuthorizationToken
+import com.miruronative.data.auth.commitIfCurrentAccountSession
+import com.miruronative.data.auth.currentAccountSession
 import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.auth.MalAuthorizationCode
 import com.miruronative.data.auth.MalAuthManager
@@ -21,6 +23,7 @@ import com.miruronative.data.settings.SettingsStore
 import com.miruronative.ui.UiState
 import com.miruronative.ui.rethrowIfCancellation
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
@@ -40,6 +43,9 @@ data class AniListProfile(
 
 class ProfileViewModel : ViewModel() {
     private val repo = AppGraph.repository
+    private val loadGate = ProfileLoadGate()
+    private var profileLoadJob: Job? = null
+    private var malLoginJob: Job? = null
 
     private val _profile = MutableStateFlow<UiState<AniListProfile>?>(null)
     val profile = _profile.asStateFlow()
@@ -47,13 +53,29 @@ class ProfileViewModel : ViewModel() {
     val isRefreshing = _isRefreshing.asStateFlow()
 
     fun loadIfLoggedIn(refresh: Boolean = false) {
-        val service = AccountService.active
-        if (service == null) {
+        // A profile load supersedes a pending login result. This also covers a login completed
+        // outside this ViewModel (for example an Activity OAuth redirect).
+        malLoginJob?.cancel()
+        malLoginJob = null
+        val session = currentAccountSession()
+        if (session == null) {
+            invalidateProfileLoad()
             _profile.value = null
             return
         }
-        viewModelScope.launch {
-            if (refresh && _profile.value is UiState.Success) _isRefreshing.value = true else _profile.value = UiState.Loading
+        profileLoadJob?.cancel()
+        val request = loadGate.begin(session)
+        val service = session.service
+        val started = commitProfileLoad(request) {
+            if (refresh && _profile.value is UiState.Success) {
+                _isRefreshing.value = true
+            } else {
+                _isRefreshing.value = false
+                _profile.value = UiState.Loading
+            }
+        }
+        if (!started) return
+        profileLoadJob = viewModelScope.launch {
             try {
                 val (viewer, entries) = when (service) {
                     AccountService.ANILIST -> {
@@ -68,28 +90,46 @@ class ProfileViewModel : ViewModel() {
                 val paused = entries.filter { it.status == "PAUSED" }
                 val completed = entries.filter { it.status == "COMPLETED" }
                 val dropped = entries.filter { it.status == "DROPPED" }
-                if (SettingsStore.syncSavedToAniList.value) {
-                    LibraryStore.hydrateWatchlistFromAniList(
-                        planning.mapNotNull { entry ->
-                            val media = entry.media ?: return@mapNotNull null
-                            WatchlistEntry(
-                                anilistId = media.id,
-                                title = media.title.preferred,
-                                cover = media.coverImage.best,
-                                format = media.format,
-                                averageScore = media.averageScore,
-                            )
-                        },
+                val planningWatchlist = planning.mapNotNull { entry ->
+                    val media = entry.media ?: return@mapNotNull null
+                    WatchlistEntry(
+                        anilistId = media.id,
+                        title = media.title.preferred,
+                        cover = media.coverImage.best,
+                        format = media.format,
+                        averageScore = media.averageScore,
                     )
                 }
-                _profile.value = UiState.Success(
-                    AniListProfile(viewer, watching, rewatching, planning, paused, completed, dropped, service),
+                val loadedProfile = AniListProfile(
+                    viewer,
+                    watching,
+                    rewatching,
+                    planning,
+                    paused,
+                    completed,
+                    dropped,
+                    service,
                 )
+
+                // Hydration and publication share the same ownership check. In particular, a
+                // non-cooperative network call returning after logout may mutate neither store.
+                commitProfileLoad(request) {
+                    if (SettingsStore.syncSavedToAniList.value) {
+                        LibraryStore.hydrateWatchlistFromAniList(
+                            planningWatchlist,
+                        )
+                    }
+                    _profile.value = UiState.Success(loadedProfile)
+                }
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
-                _profile.value = UiState.Error(e.message ?: "Failed to load ${service.label}")
+                commitProfileLoad(request) {
+                    _profile.value = UiState.Error(e.message ?: "Failed to load ${service.label}")
+                }
             } finally {
-                _isRefreshing.value = false
+                commitProfileLoad(request) {
+                    _isRefreshing.value = false
+                }
             }
         }
     }
@@ -98,17 +138,22 @@ class ProfileViewModel : ViewModel() {
 
     fun onLoggedIn(authorization: AniListAuthorizationToken) {
         if (!AuthManager.setToken(authorization)) return
+        invalidateProfileLoad()
+        malLoginJob?.cancel()
         LibraryStore.syncSavedToRemote()
         loadIfLoggedIn()
     }
 
     /** MAL redirect hands back a code; trade it for tokens before loading the profile. */
     fun onMalCode(code: MalAuthorizationCode) {
+        invalidateProfileLoad()
+        malLoginJob?.cancel()
         _profile.value = UiState.Loading
-        viewModelScope.launch {
+        malLoginJob = viewModelScope.launch {
             try {
                 MalAuthManager.exchangeCode(code)
                 LibraryStore.syncSavedToRemote()
+                malLoginJob = null
                 loadIfLoggedIn()
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
@@ -120,9 +165,27 @@ class ProfileViewModel : ViewModel() {
     }
 
     fun logout() {
+        invalidateProfileLoad()
+        malLoginJob?.cancel()
+        malLoginJob = null
         AuthManager.logout()
         MalAuthManager.logout()
         _profile.value = null
+    }
+
+    private fun invalidateProfileLoad() {
+        loadGate.invalidate()
+        profileLoadJob?.cancel()
+        profileLoadJob = null
+        _isRefreshing.value = false
+    }
+
+    /** Account validation is outermost so an auth mutation cannot interleave with publication. */
+    private fun commitProfileLoad(
+        request: ProfileLoadGate.Request,
+        change: () -> Unit,
+    ): Boolean = commitIfCurrentAccountSession(request.session) {
+        loadGate.commitIfCurrent(request, change)
     }
 
     suspend fun buildMalExport(
