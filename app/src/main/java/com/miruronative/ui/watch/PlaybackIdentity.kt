@@ -94,6 +94,25 @@ internal fun isNewConfirmedPlayback(
     callback: PlaybackIdentity,
 ): Boolean = previouslyConfirmed == null || !isSamePlaybackSession(previouslyConfirmed, callback)
 
+/** Selects the one identity-validated progress sample that a transition is allowed to bank. */
+internal fun confirmedProgressForFlush(
+    candidate: PlaybackProgressSnapshot?,
+    confirmedIdentity: PlaybackIdentity?,
+    activeTarget: ActivePlaybackTarget?,
+): PlaybackProgressSnapshot? = candidate?.takeIf { progress ->
+    progress.positionMs > 0L &&
+        activeTarget != null &&
+        acceptsPlaybackProgress(progress.identity, activeTarget) &&
+        confirmedIdentity != null &&
+        isSamePlaybackSession(confirmedIdentity, progress.identity)
+}
+
+/** Keeps player recreation aligned with the exact outgoing progress that was accepted for flush. */
+internal fun resumePositionAfterValidatedFlush(
+    currentPositionMs: Long,
+    flushedProgress: PlaybackProgressSnapshot?,
+): Long = flushedProgress?.positionMs ?: currentPositionMs
+
 /**
  * Banks the last confirmed, still-current native position before a caller invalidates that
  * playback session. Keeping the write and transition in one helper makes their ordering explicit:
@@ -111,13 +130,7 @@ internal fun <T> flushProgressBeforeTransition(
     persist: (PlaybackProgressSnapshot) -> Unit,
     transition: () -> T,
 ): T {
-    val current = candidate?.takeIf { progress ->
-        progress.positionMs > 0L &&
-            activeTarget != null &&
-            acceptsPlaybackProgress(progress.identity, activeTarget) &&
-            confirmedIdentity != null &&
-            isSamePlaybackSession(confirmedIdentity, progress.identity)
-    }
+    val current = confirmedProgressForFlush(candidate, confirmedIdentity, activeTarget)
     current?.let(persist)
     return transition()
 }

@@ -1054,19 +1054,19 @@ class WatchViewModel : ViewModel() {
             }
             EmbedMediaHandoffDecision.KEEP -> Unit
             EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP -> {
-                flushProgressBeforeEmbedMediaHandoff(data)
+                val handoffData = flushProgressBeforeEmbedMediaHandoff(data)
                 activeEmbedMediaIdentity = identity
                 activeNativePlaybackIdentity = null
                 cancelAniSkipWork()
-                if (
-                    data.aniSkipSegments.isNotEmpty() ||
-                    data.aniSkipLookupStatus != AniSkipLookupStatus.AWAITING_DURATION
-                ) {
+                val activatedData = handoffData.copy(
+                    aniSkipSegments = emptyList(),
+                    aniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
+                )
+                if (activatedData != data) {
+                    // Use handoffData, not the callback's earlier data snapshot: otherwise this
+                    // AniSkip reset would silently restore the stale pre-handoff resume position.
                     _state.value = UiState.Success(
-                        data.copy(
-                            aniSkipSegments = emptyList(),
-                            aniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
-                        ),
+                        activatedData,
                     )
                 }
                 DiagnosticsLog.event(
@@ -1319,18 +1319,23 @@ class WatchViewModel : ViewModel() {
      * snapshot so an exit between activation and the replacement's first tick cannot save it as
      * though it belonged to the new concrete video.
      */
-    private fun flushProgressBeforeEmbedMediaHandoff(data: WatchData) {
-        val outgoingInstanceId = activeEmbedMediaIdentity?.mediaInstanceId ?: return
-        flushProgressBeforeTransition(
+    private fun flushProgressBeforeEmbedMediaHandoff(data: WatchData): WatchData {
+        val outgoingInstanceId = activeEmbedMediaIdentity?.mediaInstanceId ?: return data
+        val outgoingProgress = confirmedProgressForFlush(
             candidate = lastKnownProgress,
             confirmedIdentity = confirmedHistoryIdentity,
             activeTarget = data.activePlaybackTarget(),
-            persist = ::persistTransitionProgress,
-            transition = {},
         )
+        outgoingProgress?.let(::persistTransitionProgress)
         lastKnownProgress = lastKnownProgress?.takeUnless { snapshot ->
             snapshot.identity.mediaInstanceId == outgoingInstanceId
         }
+        return data.copy(
+            startPositionMs = resumePositionAfterValidatedFlush(
+                currentPositionMs = data.startPositionMs,
+                flushedProgress = outgoingProgress,
+            ),
+        )
     }
 
     private fun persistTransitionProgress(progress: PlaybackProgressSnapshot) {
