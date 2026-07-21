@@ -435,7 +435,10 @@ fun SettingsScreen(
                     enabled = true,
                     onClick = {
                         runCatching {
-                            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/kompoti121/anilili"))
+                            val intent = android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse("https://github.com/nassim-arifette/anilili"),
+                            )
                             context.startActivity(intent)
                         }
                     },

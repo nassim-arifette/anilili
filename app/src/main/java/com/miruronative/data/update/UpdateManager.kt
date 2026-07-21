@@ -23,7 +23,7 @@ import okhttp3.Request
 
 /**
  * In-app updates for a sideloaded install: polls the rolling GitHub release
- * (`kompoti121/anilili`, tag `APK-release`), downloads the APK asset, and hands it
+ * (`nassim-arifette/anilili`, tag `APK-release`), downloads the APK asset, and hands it
  * to the system package installer. Android rejects the install unless the new APK
  * is signed with the same key, so a hijacked release can't replace the app.
  */
@@ -46,7 +46,8 @@ object UpdateManager {
         data class Failed(val message: String) : State
     }
 
-    private const val RELEASES_LATEST = "https://api.github.com/repos/kompoti121/anilili/releases/latest"
+    private const val RELEASES_LATEST =
+        "https://api.github.com/repos/nassim-arifette/anilili/releases/latest"
     private const val PREFS = "anilili_updates"
     private const val KEY_LAST_CHECK = "last_check_ms"
     private val CHECK_INTERVAL_MS = TimeUnit.HOURS.toMillis(12)
