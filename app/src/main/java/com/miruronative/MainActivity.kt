@@ -1,14 +1,17 @@
 package com.miruronative
 
 import android.Manifest
+import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
+import android.util.Rational
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.SystemBarStyle
@@ -77,6 +80,7 @@ import androidx.navigation.navArgument
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.miruronative.data.auth.AuthManager
+import com.miruronative.data.AppGraph
 import com.miruronative.data.library.LibraryStore
 import com.miruronative.data.reminder.AutomaticReleaseManager
 import com.miruronative.data.reminder.ReleaseSyncScheduler
@@ -105,6 +109,10 @@ import com.miruronative.ui.theme.MiruroTheme
 import com.miruronative.ui.watch.WatchScreen
 import com.miruronative.playback.PlaybackStatus
 import com.miruronative.playback.PlaybackService
+import com.miruronative.playback.PictureInPictureEntryMode
+import com.miruronative.playback.PictureInPicturePlaybackSnapshot
+import com.miruronative.playback.pictureInPictureEntryMode
+import com.miruronative.playback.shouldPausePlaybackOnActivityStop
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -112,6 +120,7 @@ import kotlinx.coroutines.launch
 class MainActivity : FragmentActivity() {
     private var inPictureInPicture by mutableStateOf(false)
     private var pendingRoute by mutableStateOf<String?>(null)
+    private var latestPictureInPictureSnapshot = PictureInPicturePlaybackSnapshot()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         DiagnosticsLog.event("MainActivity.onCreate start savedState=${savedInstanceState != null}")
@@ -167,13 +176,18 @@ class MainActivity : FragmentActivity() {
             )
         }
         lifecycleScope.launch {
-            PlaybackStatus.isPlaying.collect { playing ->
-                DiagnosticsLog.event("PlaybackStatus.isPlaying=$playing")
-                if (playing) {
+            PlaybackStatus.pictureInPictureSnapshot.collect { snapshot ->
+                latestPictureInPictureSnapshot = snapshot
+                DiagnosticsLog.event(
+                    "PlaybackStatus PiP playing=${snapshot.isPlaying} " +
+                        "native=${snapshot.hasNativeSurface} route=${snapshot.playbackRoute}",
+                )
+                if (snapshot.isPlaying) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 } else {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
+                updatePictureInPictureParams(snapshot)
             }
         }
     }
@@ -193,6 +207,23 @@ class MainActivity : FragmentActivity() {
     override fun onPause() {
         super.onPause()
         DiagnosticsLog.event("MainActivity.onPause")
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        val mode = currentPictureInPictureEntryMode(latestPictureInPictureSnapshot)
+        if (mode != PictureInPictureEntryMode.USER_LEAVE_HINT) {
+            DiagnosticsLog.event("PictureInPicture user leave ignored mode=$mode")
+            return
+        }
+        val entered = runCatching {
+            enterPictureInPictureMode(
+                buildPictureInPictureParams(latestPictureInPictureSnapshot, mode),
+            )
+        }.onFailure {
+            DiagnosticsLog.throwable("PictureInPicture legacy entry failed", it)
+        }.getOrDefault(false)
+        DiagnosticsLog.event("PictureInPicture legacy entry requested entered=$entered")
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -222,8 +253,14 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         super.onStop()
-        DiagnosticsLog.event("MainActivity.onStop")
-        PlaybackService.pauseActivePlayback()
+        val actuallyInPictureInPicture =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode
+        DiagnosticsLog.event("MainActivity.onStop pictureInPicture=$actuallyInPictureInPicture")
+        if (shouldPausePlaybackOnActivityStop(actuallyInPictureInPicture)) {
+            PlaybackService.pauseActivePlayback()
+        } else {
+            DiagnosticsLog.event("MainActivity.onStop kept native playback for PictureInPicture")
+        }
     }
 
     override fun onDestroy() {
@@ -253,7 +290,51 @@ class MainActivity : FragmentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         inPictureInPicture = isInPictureInPictureMode
+        updatePictureInPictureParams(latestPictureInPictureSnapshot)
         DiagnosticsLog.event("PictureInPicture changed active=$isInPictureInPictureMode")
+    }
+
+    private fun currentPictureInPictureEntryMode(
+        snapshot: PictureInPicturePlaybackSnapshot,
+    ): PictureInPictureEntryMode = pictureInPictureEntryMode(
+        snapshot = snapshot,
+        sdkInt = Build.VERSION.SDK_INT,
+        isTv = AppGraph.isTv,
+        isAlreadyInPictureInPicture =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode,
+    )
+
+    private fun updatePictureInPictureParams(snapshot: PictureInPicturePlaybackSnapshot) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val mode = currentPictureInPictureEntryMode(snapshot)
+        runCatching {
+            setPictureInPictureParams(buildPictureInPictureParams(snapshot, mode))
+        }.onFailure {
+            DiagnosticsLog.throwable("PictureInPicture params update failed", it)
+        }
+    }
+
+    private fun buildPictureInPictureParams(
+        snapshot: PictureInPicturePlaybackSnapshot,
+        mode: PictureInPictureEntryMode,
+    ): PictureInPictureParams {
+        val ratio = snapshot.aspectRatio
+        return PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(ratio.width, ratio.height))
+            .apply {
+                snapshot.sourceRect
+                    ?.takeIf { snapshot.hasNativeSurface && it.isUsable }
+                    ?.let { source ->
+                        setSourceRectHint(
+                            Rect(source.left, source.top, source.right, source.bottom),
+                        )
+                    }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    setAutoEnterEnabled(mode == PictureInPictureEntryMode.AUTO_ENTER)
+                    setSeamlessResizeEnabled(true)
+                }
+            }
+            .build()
     }
 
 }

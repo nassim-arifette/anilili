@@ -50,4 +50,8 @@ internal class LocalPlaybackOwnerRegistry {
 
     @Synchronized
     fun hasOwner(): Boolean = owners.isNotEmpty()
+
+    @Synchronized
+    fun isLatest(token: LocalPlaybackOwnerToken): Boolean =
+        owners.maxByOrNull(LocalPlaybackOwnerToken::id) === token
 }
