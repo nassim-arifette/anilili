@@ -166,6 +166,20 @@ class MiruroRepository(
         aniList.syncSavedAnime(mediaIds, viewerId)
     }
 
+    internal suspend fun syncSavedAnimeForSession(
+        mediaId: Int,
+        saved: Boolean,
+        authenticationToken: String,
+        shouldContinue: () -> Boolean,
+    ) = aniList.syncSavedAnime(mediaId, saved, authenticationToken, shouldContinue)
+
+    internal suspend fun syncSavedAnimeForSession(
+        mediaIds: Collection<Int>,
+        viewerId: Int,
+        authenticationToken: String,
+        shouldContinue: () -> Boolean,
+    ) = aniList.syncSavedAnime(mediaIds, viewerId, authenticationToken, shouldContinue)
+
     // ---- authenticated (MyAnimeList login) ----
 
     /** The MAL account shaped like an AniList [Viewer] so the profile UI stays shared. */
@@ -262,19 +276,39 @@ class MiruroRepository(
 
     /** Mirrors the device Save button on MAL without damaging an existing list state. */
     suspend fun malSyncSavedAnime(anilistId: Int, saved: Boolean) {
+        malSyncSavedAnimeInternal(anilistId, saved, accessToken = null, shouldContinue = { true })
+    }
+
+    internal suspend fun malSyncSavedAnimeForSession(
+        anilistId: Int,
+        saved: Boolean,
+        accessToken: String,
+        shouldContinue: () -> Boolean,
+    ) {
+        malSyncSavedAnimeInternal(anilistId, saved, accessToken, shouldContinue)
+    }
+
+    private suspend fun malSyncSavedAnimeInternal(
+        anilistId: Int,
+        saved: Boolean,
+        accessToken: String?,
+        shouldContinue: () -> Boolean,
+    ) {
         val malId = animeInfo(anilistId)?.idMal?.takeIf { it > 0 }
         if (malId == null) {
             DiagnosticsLog.event("MAL saved sync skipped id=$anilistId: no MAL id on AniList")
             return
         }
-        val current = mal.listStatus(malId)
+        if (!shouldContinue()) return
+        val current = mal.listStatus(malId, accessToken)
+        if (!shouldContinue()) return
         when {
             saved && current == null -> {
-                mal.updateListStatus(malId, status = "plan_to_watch")
+                mal.updateListStatus(malId, status = "plan_to_watch", accessToken = accessToken)
                 DiagnosticsLog.event("MAL saved sync added malId=$malId (id=$anilistId)")
             }
             !saved && current?.status == "plan_to_watch" -> {
-                mal.deleteListEntry(malId)
+                mal.deleteListEntry(malId, accessToken)
                 DiagnosticsLog.event("MAL saved sync removed malId=$malId (id=$anilistId)")
             }
             else -> DiagnosticsLog.event(
@@ -285,15 +319,34 @@ class MiruroRepository(
 
     /** Batch push: one list fetch, then add only the titles MAL doesn't have yet. */
     suspend fun malSyncSavedAnime(anilistIds: Collection<Int>) {
+        malSyncSavedAnimeInternal(anilistIds, accessToken = null, shouldContinue = { true })
+    }
+
+    internal suspend fun malSyncSavedAnimeForSession(
+        anilistIds: Collection<Int>,
+        accessToken: String,
+        shouldContinue: () -> Boolean,
+    ) {
+        malSyncSavedAnimeInternal(anilistIds, accessToken, shouldContinue)
+    }
+
+    private suspend fun malSyncSavedAnimeInternal(
+        anilistIds: Collection<Int>,
+        accessToken: String?,
+        shouldContinue: () -> Boolean,
+    ) {
         if (anilistIds.isEmpty()) return
-        val onMal = mal.animeList().map { it.malId }.toSet()
+        if (!shouldContinue()) return
+        val onMal = mal.animeList(accessToken).map { it.malId }.toSet()
         anilistIds.forEach { id ->
+            if (!shouldContinue()) return
             runCatching {
                 val malId = animeInfo(id)?.idMal?.takeIf { it > 0 }
                 when {
                     malId == null -> DiagnosticsLog.event("MAL saved sync skipped id=$id: no MAL id on AniList")
                     malId !in onMal -> {
-                        mal.updateListStatus(malId, status = "plan_to_watch")
+                        if (!shouldContinue()) return@runCatching
+                        mal.updateListStatus(malId, status = "plan_to_watch", accessToken = accessToken)
                         DiagnosticsLog.event("MAL saved sync added malId=$malId (id=$id)")
                     }
                 }

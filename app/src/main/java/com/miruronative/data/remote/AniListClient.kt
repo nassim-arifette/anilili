@@ -545,7 +545,10 @@ class AniListClient(
     }
 
     /** Authenticated: the user's anime lists (Watching + Planning) with per-entry progress. */
-    suspend fun userAnimeList(userId: Int): MediaListCollection? = withContext(Dispatchers.IO) {
+    suspend fun userAnimeList(
+        userId: Int,
+        authenticationToken: String? = null,
+    ): MediaListCollection? = withContext(Dispatchers.IO) {
         val gql = """
             query (${'$'}userId: Int) {
               MediaListCollection(userId: ${'$'}userId, type: ANIME, status_in: [CURRENT, REPEATING, PLANNING, PAUSED, COMPLETED, DROPPED]) {
@@ -559,7 +562,7 @@ class AniListClient(
             }
         """.trimIndent()
         val vars = buildJsonObject { put("userId", userId) }
-        val text = post(gql, vars, authenticated = true)
+        val text = post(gql, vars, authenticated = true, authenticationToken = authenticationToken)
         json.decodeFromString(GqlMediaListResponse.serializer(), text).data?.collection
     }
 
@@ -587,8 +590,14 @@ class AniListClient(
      * Mirrors the device Save button without damaging an existing AniList status/progress.
      * New saves become PLANNING; unsaving only removes entries that are still PLANNING.
      */
-    suspend fun syncSavedAnime(mediaId: Int, saved: Boolean) = withContext(Dispatchers.IO) {
-        val current = mediaListEntry(mediaId)
+    suspend fun syncSavedAnime(
+        mediaId: Int,
+        saved: Boolean,
+        authenticationToken: String? = null,
+        shouldContinue: () -> Boolean = { true },
+    ) = withContext(Dispatchers.IO) {
+        val current = mediaListEntry(mediaId, authenticationToken)
+        if (!shouldContinue()) return@withContext
         when {
             saved && current == null -> {
                 val mutation = """
@@ -596,7 +605,12 @@ class AniListClient(
                       SaveMediaListEntry(mediaId: ${'$'}mediaId, status: PLANNING) { id status }
                     }
                 """.trimIndent()
-                post(mutation, buildJsonObject { put("mediaId", mediaId) }, authenticated = true)
+                post(
+                    mutation,
+                    buildJsonObject { put("mediaId", mediaId) },
+                    authenticated = true,
+                    authenticationToken = authenticationToken,
+                )
             }
             !saved && current?.status == "PLANNING" -> {
                 val mutation = """
@@ -604,37 +618,61 @@ class AniListClient(
                       DeleteMediaListEntry(id: ${'$'}id) { deleted }
                     }
                 """.trimIndent()
-                post(mutation, buildJsonObject { put("id", current.id) }, authenticated = true)
+                post(
+                    mutation,
+                    buildJsonObject { put("id", current.id) },
+                    authenticated = true,
+                    authenticationToken = authenticationToken,
+                )
             }
         }
     }
 
     /** Reconcile all device saves in one list read plus small mutation batches. */
-    suspend fun syncSavedAnime(mediaIds: Collection<Int>, viewerId: Int) = withContext(Dispatchers.IO) {
+    suspend fun syncSavedAnime(
+        mediaIds: Collection<Int>,
+        viewerId: Int,
+        authenticationToken: String? = null,
+        shouldContinue: () -> Boolean = { true },
+    ) = withContext(Dispatchers.IO) {
         val requested = mediaIds.filter { it > 0 }.distinct()
         if (requested.isEmpty()) return@withContext
-        val existingIds = userAnimeList(viewerId)?.lists.orEmpty()
+        val existingIds = userAnimeList(viewerId, authenticationToken)?.lists.orEmpty()
             .flatMap { it.entries }
             .mapNotNull { it.media?.id }
             .toHashSet()
         requested.filterNot(existingIds::contains).chunked(SAVED_SYNC_BATCH_SIZE).forEach { batch ->
+            if (!shouldContinue()) return@withContext
             val declarations = batch.indices.joinToString { index -> "${'$'}id$index: Int" }
             val fields = batch.indices.joinToString("\n") { index ->
                 "save$index: SaveMediaListEntry(mediaId: ${'$'}id$index, status: PLANNING) { id status }"
             }
             val mutation = "mutation ($declarations) {\n$fields\n}"
             val variables = buildJsonObject { batch.forEachIndexed { index, id -> put("id$index", id) } }
-            post(mutation, variables, authenticated = true)
+            post(
+                mutation,
+                variables,
+                authenticated = true,
+                authenticationToken = authenticationToken,
+            )
         }
     }
 
-    private suspend fun mediaListEntry(mediaId: Int): MediaListProgressSnapshot? {
+    private suspend fun mediaListEntry(
+        mediaId: Int,
+        authenticationToken: String? = null,
+    ): MediaListProgressSnapshot? {
         val query = """
             query (${'$'}mediaId: Int) {
               Media(id: ${'$'}mediaId, type: ANIME) { mediaListEntry { id status progress } }
             }
         """.trimIndent()
-        val text = post(query, buildJsonObject { put("mediaId", mediaId) }, authenticated = true)
+        val text = post(
+            query,
+            buildJsonObject { put("mediaId", mediaId) },
+            authenticated = true,
+            authenticationToken = authenticationToken,
+        )
         val entry = json.parseToJsonElement(text).jsonObject["data"]?.jsonObject
             ?.get("Media")?.jsonObject
             ?.get("mediaListEntry") as? JsonObject ?: return null
@@ -649,7 +687,12 @@ class AniListClient(
      * the Retry-After header and retry instead of surfacing the error, so bursts (list sync,
      * fast browsing) and interactive saves recover on their own.
      */
-    private suspend fun post(query: String, variables: JsonObject, authenticated: Boolean = false): String {
+    private suspend fun post(
+        query: String,
+        variables: JsonObject,
+        authenticated: Boolean = false,
+        authenticationToken: String? = null,
+    ): String {
         val payload = json.encodeToString(GraphQLRequest.serializer(), GraphQLRequest(query, variables))
         var attempt = 0
         while (true) {
@@ -660,7 +703,8 @@ class AniListClient(
                 .header("Accept", "application/json")
                 .header("User-Agent", USER_AGENT)
             if (authenticated) {
-                val token = AuthManager.current() ?: throw IOException("Sign in to AniList again to continue")
+                val token = authenticationToken ?: AuthManager.current()
+                    ?: throw IOException("Sign in to AniList again to continue")
                 builder.header("Authorization", "Bearer $token")
             }
             var retryAfterMs = -1L
