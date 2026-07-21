@@ -27,6 +27,7 @@ object AuthManager {
     private lateinit var tokenStore: SecureTokenStore
     private lateinit var appContext: Context
     private var pendingOAuthState: String? = null
+    private val tokenSession = AuthTokenSession()
 
     private val _token = MutableStateFlow<String?>(null)
     val token = _token.asStateFlow()
@@ -34,16 +35,22 @@ object AuthManager {
     fun init(context: Context) {
         appContext = context.applicationContext
         tokenStore = SecureTokenStore(appContext)
-        _token.value = tokenStore.load()?.takeUnless(::isJwtExpired)
-        if (_token.value == null) tokenStore.clear()
+        val restoredToken = tokenStore.load()?.takeUnless(::isJwtExpired)
+        tokenSession.replace(restoredToken) {
+            _token.value = restoredToken
+            if (restoredToken == null) tokenStore.clear()
+        }
     }
 
-    fun current(): String? {
-        val value = _token.value ?: return null
-        if (!isJwtExpired(value)) return value
-        clearToken(scheduleSync = false)
-        return null
-    }
+    fun current(): String? = tokenSession.current(
+        isExpired = ::isJwtExpired,
+        clearExpired = {
+            tokenStore.clear()
+            _token.value = null
+            pendingOAuthState = null
+            AniListNotificationPushManager.clearDelivered(appContext)
+        },
+    )
 
     val isLoggedIn: Boolean get() = current() != null
     fun viewerId(): Int? = current()?.let(::jwtSubject)
@@ -65,9 +72,11 @@ object AuthManager {
     fun setToken(token: String) {
         val normalized = token.trim()
         require(normalized.isNotEmpty()) { "AniList returned an empty token" }
-        tokenStore.save(normalized)
-        _token.value = normalized
-        pendingOAuthState = null
+        tokenSession.replace(normalized) {
+            tokenStore.save(normalized)
+            _token.value = normalized
+            pendingOAuthState = null
+        }
         AniListNotificationPushManager.clearDelivered(appContext)
         ReleaseSyncScheduler.runNow(appContext)
     }
@@ -92,9 +101,11 @@ object AuthManager {
     }
 
     private fun clearToken(scheduleSync: Boolean) {
-        tokenStore.clear()
-        _token.value = null
-        pendingOAuthState = null
+        tokenSession.replace(null) {
+            tokenStore.clear()
+            _token.value = null
+            pendingOAuthState = null
+        }
         AniListNotificationPushManager.clearDelivered(appContext)
         if (scheduleSync) ReleaseSyncScheduler.runNow(appContext)
     }
