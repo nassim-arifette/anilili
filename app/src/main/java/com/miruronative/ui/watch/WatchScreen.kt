@@ -332,11 +332,19 @@ fun WatchScreen(
                 referer = "https://www.miruro.to/",
                 playbackKey = fallbackPlaybackKey,
                 modifier = Modifier.fillMaxSize(),
+                playbackMode = EmbedPlaybackMode.UNMANAGED,
                 onFullscreenChanged = { fullscreen = it },
-                onProgress = vm::onEmbedProgress,
-                onPlaybackEnded = vm::onEmbedPlaybackEnded,
-                onPlaybackError = vm::onEmbedPlaybackError,
                 onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
+            )
+            Text(
+                text = "Website playback is not tracked or resumed",
+                color = Color.White,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 16.dp)
+                    .background(Color.Black.copy(alpha = 0.78f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
             )
             BackButton(pauseAndBack, Modifier.align(Alignment.TopStart))
             return@Box
@@ -370,7 +378,7 @@ fun WatchScreen(
                         .align(Alignment.CenterHorizontally)
                         .padding(bottom = 24.dp)
                         .focusHighlight(RoundedCornerShape(20.dp)),
-                ) { Text("Open in web player") }
+                ) { Text("Open untracked website player") }
                 BackButton(pauseAndBack, Modifier.align(Alignment.Start))
             }
             is UiState.Success -> {
