@@ -10,6 +10,20 @@ internal data class EmbedEndSample(
     val observedPlayingSamples: Int,
 )
 
+/** A verified WebView end event, still tied to the logical playback that emitted it. */
+data class EmbedPlaybackCompletion(
+    val playbackKey: EmbedPlaybackKey,
+    val reportedPositionMs: Long,
+    val durationMs: Long,
+    val observedPlayingSamples: Int,
+)
+
+internal data class EmbedCompletionCommit(
+    val playbackKey: EmbedPlaybackKey,
+    val positionMs: Long,
+    val durationMs: Long,
+)
+
 internal fun embedEndSampleFromSeconds(
     positionSec: Double,
     durationSec: Double,
@@ -36,6 +50,43 @@ internal fun isLikelyEmbedContentEnd(sample: EmbedEndSample): Boolean =
         sample.observedPlayingSamples >= MIN_PLAYING_SAMPLES &&
         sample.positionMs >= sample.durationMs - END_TOLERANCE_MS &&
         sample.positionMs <= sample.durationMs + END_TOLERANCE_MS
+
+/**
+ * Revalidates a natural end at the state-owner boundary. The WebView navigation token protects
+ * the bridge, while the playback key protects WatchViewModel after an episode/source transition.
+ */
+internal fun planEmbedCompletionCommit(
+    completion: EmbedPlaybackCompletion,
+    currentPlaybackKey: EmbedPlaybackKey,
+    alreadyCommitted: Boolean,
+): EmbedCompletionCommit? {
+    if (alreadyCommitted || !acceptsEmbedPlaybackCallback(completion.playbackKey, currentPlaybackKey)) {
+        return null
+    }
+    val sample = EmbedEndSample(
+        positionMs = completion.reportedPositionMs,
+        durationMs = completion.durationMs,
+        observedPlayingSamples = completion.observedPlayingSamples,
+    )
+    if (!isLikelyEmbedContentEnd(sample)) return null
+    return EmbedCompletionCommit(
+        playbackKey = completion.playbackKey,
+        positionMs = completion.durationMs,
+        durationMs = completion.durationMs,
+    )
+}
+
+/** Runs autoplay only after the terminal write has synchronously succeeded. */
+internal fun finalizeEmbedCompletionThenNavigate(
+    completion: EmbedPlaybackCompletion,
+    shouldNavigate: Boolean,
+    commit: (EmbedPlaybackCompletion) -> Boolean,
+    navigate: () -> Unit,
+): Boolean {
+    val committed = commit(completion)
+    if (committed && shouldNavigate) navigate()
+    return committed
+}
 
 /** Exactly-once gate shared by metadata-driven outro and natural completion. */
 internal class EmbedAutoAdvanceGate {

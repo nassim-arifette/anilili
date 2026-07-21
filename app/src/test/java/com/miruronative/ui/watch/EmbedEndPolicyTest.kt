@@ -7,6 +7,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class EmbedEndPolicyTest {
+    private val playbackKey = EmbedPlaybackKey(
+        animeId = 42,
+        provider = "allanime",
+        category = "sub",
+        episodeNumber = 3.0,
+        sourceGeneration = 7,
+    )
+
     @Test
     fun `short preroll completion is not treated as episode completion`() {
         val preroll = EmbedEndSample(positionMs = 30_000L, durationMs = 30_000L, observedPlayingSamples = 20)
@@ -30,6 +38,105 @@ class EmbedEndPolicyTest {
             EmbedEndSample(1_439_500L, 1_440_000L, 20),
             embedEndSampleFromSeconds(1_439.5, 1_440.0, 20),
         )
+    }
+
+    @Test
+    fun `verified natural end plans an exact terminal commit`() {
+        val completion = EmbedPlaybackCompletion(
+            playbackKey = playbackKey,
+            reportedPositionMs = 1_439_500L,
+            durationMs = 1_440_000L,
+            observedPlayingSamples = 20,
+        )
+
+        assertEquals(
+            EmbedCompletionCommit(playbackKey, positionMs = 1_440_000L, durationMs = 1_440_000L),
+            planEmbedCompletionCommit(completion, playbackKey, alreadyCommitted = false),
+        )
+    }
+
+    @Test
+    fun `late embed end from a previous playback generation is rejected`() {
+        val completion = EmbedPlaybackCompletion(
+            playbackKey = playbackKey,
+            reportedPositionMs = 1_440_000L,
+            durationMs = 1_440_000L,
+            observedPlayingSamples = 20,
+        )
+        val replacementPlayback = playbackKey.copy(sourceGeneration = 8)
+
+        assertNull(planEmbedCompletionCommit(completion, replacementPlayback, alreadyCommitted = false))
+    }
+
+    @Test
+    fun `duplicate and unverified embed ends are rejected`() {
+        val completion = EmbedPlaybackCompletion(
+            playbackKey = playbackKey,
+            reportedPositionMs = 1_440_000L,
+            durationMs = 1_440_000L,
+            observedPlayingSamples = 20,
+        )
+
+        assertNull(planEmbedCompletionCommit(completion, playbackKey, alreadyCommitted = true))
+        assertNull(
+            planEmbedCompletionCommit(
+                completion.copy(reportedPositionMs = 1_300_000L),
+                playbackKey,
+                alreadyCommitted = false,
+            ),
+        )
+        assertNull(
+            planEmbedCompletionCommit(
+                completion.copy(observedPlayingSamples = 1),
+                playbackKey,
+                alreadyCommitted = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `terminal persistence completes before embed autoplay navigation`() {
+        val calls = mutableListOf<String>()
+        val completion = EmbedPlaybackCompletion(
+            playbackKey = playbackKey,
+            reportedPositionMs = 1_440_000L,
+            durationMs = 1_440_000L,
+            observedPlayingSamples = 20,
+        )
+
+        val committed = finalizeEmbedCompletionThenNavigate(
+            completion = completion,
+            shouldNavigate = true,
+            commit = {
+                calls += "commit"
+                true
+            },
+            navigate = { calls += "next" },
+        )
+
+        assertTrue(committed)
+        assertEquals(listOf("commit", "next"), calls)
+    }
+
+    @Test
+    fun `failed terminal persistence withholds embed autoplay`() {
+        var advances = 0
+        val completion = EmbedPlaybackCompletion(
+            playbackKey = playbackKey,
+            reportedPositionMs = 1_440_000L,
+            durationMs = 1_440_000L,
+            observedPlayingSamples = 20,
+        )
+
+        assertFalse(
+            finalizeEmbedCompletionThenNavigate(
+                completion = completion,
+                shouldNavigate = true,
+                commit = { false },
+                navigate = { advances++ },
+            ),
+        )
+        assertEquals(0, advances)
     }
 
     @Test
