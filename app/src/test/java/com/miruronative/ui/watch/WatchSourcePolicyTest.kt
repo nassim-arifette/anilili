@@ -9,6 +9,7 @@ import com.miruronative.data.model.ProviderData
 import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.StreamItem
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -273,6 +274,32 @@ class WatchSourcePolicyTest {
         assertTrue(shouldRetryAfterCatalogMerge(false, 2L, 3L))
         assertEquals(false, shouldRetryAfterCatalogMerge(false, 3L, 3L))
         assertEquals(false, shouldRetryAfterCatalogMerge(true, 2L, 3L))
+    }
+
+    @Test
+    fun `unresolved capped pass always gets one exhaustive fallback`() {
+        assertTrue(
+            shouldRunExhaustiveProviderFallback(
+                hasResolvedSource = false,
+                exhaustiveResolutionAttempted = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `resolved or already exhaustive pass is not repeated`() {
+        assertFalse(
+            shouldRunExhaustiveProviderFallback(
+                hasResolvedSource = true,
+                exhaustiveResolutionAttempted = false,
+            ),
+        )
+        assertFalse(
+            shouldRunExhaustiveProviderFallback(
+                hasResolvedSource = false,
+                exhaustiveResolutionAttempted = true,
+            ),
+        )
     }
 
     @Test

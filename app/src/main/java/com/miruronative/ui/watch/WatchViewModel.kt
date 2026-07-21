@@ -489,6 +489,7 @@ class WatchViewModel : ViewModel() {
         ensureCurrentRequest(request)
         val unavailableThisResolve = resolution.unavailableProviders.toMutableSet()
         var resolved = resolution.resolved
+        var exhaustiveResolutionAttempted = false
         suspend fun retryAfterCatalogMerge(label: String, mergeJob: Job?) {
             if (resolved != null || mergeJob == null) return
             if (mergeJob.isActive) {
@@ -509,6 +510,7 @@ class WatchViewModel : ViewModel() {
             // Once a late catalog adds providers, try all of them. The normal attempt cap bounds
             // mid-playback fallback latency, but it must not hide a directly requested episode.
             resolvedAgainstCatalogGeneration = catalogGeneration
+            exhaustiveResolutionAttempted = true
             resolution = repo.resolveSources(
                 anilistId = requestAnimeId,
                 number = number,
@@ -525,6 +527,26 @@ class WatchViewModel : ViewModel() {
 
         retryAfterCatalogMerge("anivexa", anivexaMergeJob)
         retryAfterCatalogMerge("miruro", miruroLateMergeJob)
+        if (shouldRunExhaustiveProviderFallback(resolved != null, exhaustiveResolutionAttempted)) {
+            DiagnosticsLog.event(
+                "Watch resolve exhaustive fallback id=$requestAnimeId episode=${fmt(number)}",
+            )
+            _loadingStatus.value = "Still looking — checking every available server…"
+            resolution = repo.resolveSources(
+                anilistId = requestAnimeId,
+                number = number,
+                preferred = requestedProvider,
+                category = requestedCategory,
+                episodes = mergedEpisodes,
+                // The capped pass already proved these providers unusable for this request. Skip
+                // them so the final pass reaches providers that were previously hidden by the cap.
+                excludedProviders = excludedProviders + unavailableThisResolve,
+                maxAttempts = Int.MAX_VALUE,
+            )
+            ensureCurrentRequest(request)
+            unavailableThisResolve += resolution.unavailableProviders
+            resolved = resolution.resolved
+        }
         if (resolved == null) {
             aniSkipFallback.cancel()
             ensureCurrentRequest(request)
@@ -1702,3 +1724,9 @@ internal fun shouldRetryAfterCatalogMerge(
     resolvedAgainstCatalogGeneration: Long,
     currentCatalogGeneration: Long,
 ): Boolean = !hasResolvedSource && resolvedAgainstCatalogGeneration != currentCatalogGeneration
+
+/** A capped fast pass must never become the final answer while unchecked providers remain. */
+internal fun shouldRunExhaustiveProviderFallback(
+    hasResolvedSource: Boolean,
+    exhaustiveResolutionAttempted: Boolean,
+): Boolean = !hasResolvedSource && !exhaustiveResolutionAttempted
