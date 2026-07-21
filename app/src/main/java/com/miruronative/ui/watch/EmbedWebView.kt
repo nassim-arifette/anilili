@@ -106,6 +106,7 @@ fun EmbedWebView(
     referer: String?,
     playbackKey: EmbedPlaybackKey,
     modifier: Modifier = Modifier,
+    playbackMode: EmbedPlaybackMode = EmbedPlaybackMode.MANAGED,
     qualityStreams: List<StreamItem> = emptyList(),
     startPositionMs: Long = 0L,
     skip: SkipTimes? = null,
@@ -164,7 +165,7 @@ fun EmbedWebView(
                 streamUrl = activeUrl,
                 documentUrl = requestedDocumentUrl,
                 allowedMainFrameHost = allowedHost,
-                resumePositionMs = pendingSeekMs,
+                resumePositionMs = if (playbackMode.restoresPosition) pendingSeekMs else 0L,
             ),
         )
     }
@@ -256,7 +257,9 @@ fun EmbedWebView(
                 durationMs = nextDurationMs
                 webIsPlaying = isPlaying
                 webVolume = if (muted) 0f else volume.toFloat().coerceIn(0f, 1f)
-                if (isPlaying) currentOnProgress?.invoke(playbackKey, nextPositionMs, nextDurationMs)
+                if (isPlaying && playbackMode.exposesNativeBridge) {
+                    currentOnProgress?.invoke(playbackKey, nextPositionMs, nextDurationMs)
+                }
             }
         },
     )
@@ -335,10 +338,12 @@ fun EmbedWebView(
     }
 
     // Full touch controls — seek bar and all — whenever the injected JS can reach the <video>.
-    val touchControlsActive = !device.isTv && webPlaybackAvailable && loadError == null
+    val touchControlsActive =
+        playbackMode.controlsPlayback && !device.isTv && webPlaybackAvailable && loadError == null
     // Everything else: the page is out of reach, so this bar carries only what the app itself can
     // answer — episode moves, settings, fullscreen — plus a play/pause relayed as a real touch.
-    val fallbackControlsActive = !device.isTv && !webPlaybackAvailable && loadError == null
+    val fallbackControlsActive =
+        playbackMode.controlsPlayback && !device.isTv && !webPlaybackAvailable && loadError == null
 
     LaunchedEffect(
         navigationSession.generation,
@@ -622,7 +627,7 @@ fun EmbedWebView(
         }
     }
 
-    val remoteModifier = if (device.isTv && focusPlayerOnStart) {
+    val remoteModifier = if (playbackMode.controlsPlayback && device.isTv && focusPlayerOnStart) {
         Modifier
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown || !opensTvPlayerControls(event.key)) {
@@ -651,7 +656,7 @@ fun EmbedWebView(
                 footnote = "This server renders its own subtitles, so it may ignore some of these.",
             )
         }
-        compositionKey(rendererGeneration) {
+        compositionKey(rendererGeneration, playbackMode) {
             AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
@@ -668,7 +673,11 @@ fun EmbedWebView(
                             // own page act on the remote; unhandled keys let the framework move
                             // focus out of the player and back to the list.
                             if (device.isTv && !currentPlayerOwnsRemote) return false
-                            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                            if (
+                                playbackMode.controlsPlayback &&
+                                event.action == KeyEvent.ACTION_DOWN &&
+                                event.repeatCount == 0
+                            ) {
                                 when {
                                     device.isTv && (
                                         event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
@@ -724,37 +733,39 @@ fun EmbedWebView(
                         }
                         // Construct the concrete bridge at registration so Android lint can
                         // verify its @JavascriptInterface methods through Kotlin's apply block.
-                        addJavascriptInterface(
-                            WebProgressBridge(
-                                expectedToken = progressBridgeToken,
-                                onTickCallback = { navigationToken, positionSec, durationSec, isPlaying, muted, volume ->
-                                    mainHandler.post {
-                                        currentWebTickHandler(
-                                            navigationToken,
-                                            positionSec,
-                                            durationSec,
-                                            isPlaying,
-                                            muted,
-                                            volume,
-                                        )
-                                    }
-                                },
-                                onVideoAvailableCallback = { navigationToken ->
-                                    mainHandler.post { currentWebVideoAvailableHandler(navigationToken) }
-                                },
-                                onEndedCallback = { navigationToken, positionSec, durationSec, playingSamples ->
-                                    mainHandler.post {
-                                        currentWebEndedHandler(
-                                            navigationToken,
-                                            positionSec,
-                                            durationSec,
-                                            playingSamples,
-                                        )
-                                    }
-                                },
-                            ),
-                            "AniliProgress",
-                        )
+                        if (playbackMode.exposesNativeBridge) {
+                            addJavascriptInterface(
+                                WebProgressBridge(
+                                    expectedToken = progressBridgeToken,
+                                    onTickCallback = { navigationToken, positionSec, durationSec, isPlaying, muted, volume ->
+                                        mainHandler.post {
+                                            currentWebTickHandler(
+                                                navigationToken,
+                                                positionSec,
+                                                durationSec,
+                                                isPlaying,
+                                                muted,
+                                                volume,
+                                            )
+                                        }
+                                    },
+                                    onVideoAvailableCallback = { navigationToken ->
+                                        mainHandler.post { currentWebVideoAvailableHandler(navigationToken) }
+                                    },
+                                    onEndedCallback = { navigationToken, positionSec, durationSec, playingSamples ->
+                                        mainHandler.post {
+                                            currentWebEndedHandler(
+                                                navigationToken,
+                                                positionSec,
+                                                durationSec,
+                                                playingSamples,
+                                            )
+                                        }
+                                    },
+                                ),
+                                "AniliProgress",
+                            )
+                        }
                         webViewClient = WebViewClient()
                         webChromeClient = WebChromeClient()
                         webView = this
@@ -799,25 +810,27 @@ fun EmbedWebView(
                                 "EmbedWebView page finished generation=${navigationSession.generation} " +
                                     "host=${loadedUrl.hostOrNone()} title=${finishedView.title ?: "none"}",
                             )
-                            val navigationSetupJs = buildString {
-                                appendLine(
-                                    authenticatedProgressPollJs(
-                                        navigationSession.generation,
-                                        progressBridgeToken,
-                                    ),
-                                )
-                                if (navigationSession.request.resumePositionMs > 0L) {
-                                    append(
-                                        embedResumeWhenReadyJs(
-                                            navigationSession.request.resumePositionMs / 1000.0,
+                            if (playbackMode.exposesNativeBridge) {
+                                val navigationSetupJs = buildString {
+                                    appendLine(
+                                        authenticatedProgressPollJs(
                                             navigationSession.generation,
+                                            progressBridgeToken,
                                         ),
                                     )
+                                    if (navigationSession.request.resumePositionMs > 0L) {
+                                        append(
+                                            embedResumeWhenReadyJs(
+                                                navigationSession.request.resumePositionMs / 1000.0,
+                                                navigationSession.generation,
+                                            ),
+                                        )
+                                    }
                                 }
+                                // One evaluation preserves setup order: the document receives its
+                                // capability before the capability-scoped resume timer starts.
+                                finishedView.evaluateJavascript(navigationSetupJs, null)
                             }
-                            // One evaluation preserves setup order: the document receives its
-                            // capability before the capability-scoped resume timer starts.
-                            finishedView.evaluateJavascript(navigationSetupJs, null)
                         },
                         onMainFrameErrorAccepted = { message ->
                             loadError = message
@@ -1120,7 +1133,7 @@ fun EmbedWebView(
             }
         }
 
-        if (device.isTv && focusPlayerOnStart && tvControlsVisible) {
+        if (playbackMode.controlsPlayback && device.isTv && focusPlayerOnStart && tvControlsVisible) {
             TvPlayerControls(
                 positionMs = positionMs,
                 durationMs = durationMs,
@@ -1205,6 +1218,7 @@ fun EmbedWebView(
         }
 
         val action: Pair<String, () -> Unit>? = when {
+            !playbackMode.automatesEpisode -> null
             introEndMs != null && isInSkipWindow(positionMs, introStartMs, introEndMs) ->
                 "Skip Intro" to {
                     seekWebVideo(webView, introEndMs, navigationSession, navigationGuard)
