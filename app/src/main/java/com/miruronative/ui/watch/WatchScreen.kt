@@ -301,6 +301,8 @@ fun WatchScreen(
                     onToggleFullscreen = { fullscreen = !fullscreen },
                     onFullscreenChanged = { fullscreen = it },
                     onProgress = vm::onProgress,
+                    onNativePlaybackIdentityChanged = vm::onNativePlaybackIdentityChanged,
+                    onNativePlaybackEnded = vm::onNativePlaybackEnded,
                     onPlaybackError = vm::onPlaybackError,
                     onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
                     onPlayerClosed = vm::commitPlaybackPosition,
@@ -328,6 +330,8 @@ private fun WatchContent(
     onToggleFullscreen: () -> Unit,
     onFullscreenChanged: (Boolean) -> Unit,
     onProgress: (Long, Long) -> Unit,
+    onNativePlaybackIdentityChanged: (NativePlaybackIdentity) -> Unit,
+    onNativePlaybackEnded: (NativePlaybackCompletion) -> Boolean,
     onPlaybackError: (String, String, Long) -> Unit,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
     onPlayerClosed: () -> Unit = {},
@@ -535,11 +539,17 @@ private fun WatchContent(
                         category = data.category.api,
                         episode = data.current.displayNumber,
                         playbackNavigationIdentity = playbackNavigation,
-                        onEnded = { endedBy ->
-                            if (com.miruronative.data.settings.SettingsStore.autoplay.value) {
-                                onPlayerNext(endedBy)
-                            }
+                        onEnded = { completion, endedBy ->
+                            finalizeNativeCompletionThenNavigate(
+                                completion = completion,
+                                shouldNavigate =
+                                data.hasNext &&
+                                        com.miruronative.data.settings.SettingsStore.autoplay.value,
+                                commit = onNativePlaybackEnded,
+                                navigate = { onPlayerNext(endedBy) },
+                            )
                         },
+                        onPlaybackIdentityChanged = onNativePlaybackIdentityChanged,
                         onNextEpisode = { onPlayerNext(playbackNavigation) },
                         onError = onPlaybackError,
                         modifier = Modifier.fillMaxSize(),

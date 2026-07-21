@@ -139,6 +139,8 @@ class WatchViewModel : ViewModel() {
         val request = requestGate.startSession()
         DiagnosticsLog.event("Watch start key=$key")
         startedKey = key
+        activeNativePlaybackIdentity = null
+        committedNativePlaybackIdentity = null
         anilistId = id
         category = Category.from(categoryApi)
         preferred = providerName
@@ -668,6 +670,91 @@ class WatchViewModel : ViewModel() {
     private var lastKnownPositionMs = 0L
     private var lastKnownDurationMs = 0L
     private var lastKnownNumber: Double? = null
+    private var activeNativePlaybackIdentity: NativePlaybackIdentity? = null
+    private var committedNativePlaybackIdentity: NativePlaybackIdentity? = null
+
+    fun onNativePlaybackIdentityChanged(identity: NativePlaybackIdentity) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (
+            data.isResolving ||
+            !isCurrentNativePlaybackIdentity(
+                identity = identity,
+                currentAnimeId = data.anilistId,
+                currentEpisodeNumber = data.current.number,
+                availableMediaIds = data.nativeMediaIds(),
+            )
+        ) {
+            DiagnosticsLog.event(
+                "Watch ignored native identity episode=${fmt(identity.episodeNumber)} " +
+                    "current=${data.current.displayNumber}",
+            )
+            return
+        }
+        activeNativePlaybackIdentity = identity
+        DiagnosticsLog.event(
+            "Watch native identity active episode=${fmt(identity.episodeNumber)} " +
+                "playbackId=${identity.playbackId.take(8)}",
+        )
+    }
+
+    /** Commits a natural end synchronously before the caller is allowed to autoplay Next. */
+    fun onNativePlaybackEnded(completion: NativePlaybackCompletion): Boolean {
+        val data = (_state.value as? UiState.Success)?.data ?: return false
+        if (data.isResolving) return false
+        val commit = planNativeCompletionCommit(
+            completion = completion,
+            activeIdentity = activeNativePlaybackIdentity,
+            currentAnimeId = data.anilistId,
+            currentEpisodeNumber = data.current.number,
+            availableMediaIds = data.nativeMediaIds(),
+            alreadyCommitted = committedNativePlaybackIdentity == completion.identity,
+        ) ?: run {
+            DiagnosticsLog.event(
+                "Watch ignored stale/invalid native end episode=${fmt(completion.identity.episodeNumber)} " +
+                    "current=${data.current.displayNumber} playbackId=${completion.identity.playbackId.take(8)}",
+            )
+            return false
+        }
+        val saved = LibraryStore.historyFor(anilistId)
+        if (saved?.episodeNumber != commit.identity.episodeNumber) {
+            DiagnosticsLog.event(
+                "Watch ignored native end without matching history episode=${fmt(commit.identity.episodeNumber)}",
+            )
+            return false
+        }
+        if (saved.positionMs != commit.positionMs || saved.durationMs != commit.durationMs) {
+            LibraryStore.updateProgress(
+                anilistId = anilistId,
+                episodeNumber = commit.identity.episodeNumber,
+                positionMs = commit.positionMs,
+                durationMs = commit.durationMs,
+            )
+        }
+        val persisted = LibraryStore.historyFor(anilistId)
+        if (
+            persisted == null ||
+            persisted.episodeNumber != commit.identity.episodeNumber ||
+            persisted.positionMs != commit.positionMs ||
+            persisted.durationMs != commit.durationMs
+        ) {
+            DiagnosticsLog.event(
+                "Watch native end persistence failed episode=${fmt(commit.identity.episodeNumber)}",
+            )
+            return false
+        }
+        committedNativePlaybackIdentity = commit.identity
+        lastKnownPositionMs = commit.positionMs
+        lastKnownDurationMs = commit.durationMs
+        lastKnownNumber = commit.identity.episodeNumber
+        lastProgressSave = System.currentTimeMillis()
+        maybeSyncAniListProgress(commit.identity.episodeNumber, commit.positionMs, commit.durationMs)
+        DiagnosticsLog.event(
+            "Watch native end committed episode=${fmt(commit.identity.episodeNumber)} " +
+                "positionMs=${commit.positionMs} playbackId=${commit.identity.playbackId.take(8)}",
+        )
+        _state.value = UiState.Success(data.copy(startPositionMs = commit.positionMs))
+        return true
+    }
 
     fun onProgress(positionMs: Long, durationMs: Long) {
         val data = (_state.value as? UiState.Success)?.data ?: return
@@ -789,6 +876,8 @@ class WatchViewModel : ViewModel() {
             DiagnosticsLog.event("Watch ignored duplicate resolve episode=${fmt(number)}")
             return
         }
+        // Reject ENDED from the item being replaced during asynchronous source resolution.
+        activeNativePlaybackIdentity = null
         val request = requestGate.nextRequest()
         val pending = PendingResolution(request, key)
         pendingResolution = pending
@@ -832,6 +921,7 @@ class WatchViewModel : ViewModel() {
     fun onPlaybackError(message: String, streamUrl: String, positionMs: Long) {
         val data = (_state.value as? UiState.Success)?.data ?: return
         if (data.isResolving) return
+        activeNativePlaybackIdentity = null
         DiagnosticsLog.event(
             "Watch playback error provider=${data.provider} episode=${data.current.displayNumber} " +
                 "streamHost=${runCatching { Uri.parse(streamUrl).host }.getOrNull() ?: "unknown"} " +
@@ -995,6 +1085,15 @@ class WatchViewModel : ViewModel() {
         }
         return "$type label=${label.take(48)} audio=${audio ?: "unknown"} " +
             "height=${height ?: "auto"} host=${runCatching { Uri.parse(url).host }.getOrNull() ?: "unknown"}"
+    }
+}
+
+private fun WatchData.nativeMediaIds(): Set<String> {
+    val active = chosenStream ?: return emptySet()
+    if (active.isEmbed || ProviderCatalog.isEmbed(provider)) return emptySet()
+    return buildSet {
+        add(active.url)
+        sources.streams.filterNot(StreamItem::isEmbed).forEach { add(it.url) }
     }
 }
 

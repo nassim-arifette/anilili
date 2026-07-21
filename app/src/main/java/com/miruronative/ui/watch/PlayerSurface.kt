@@ -117,6 +117,11 @@ import com.miruronative.ui.components.CaptionAppearanceDialog
 import com.miruronative.ui.nav.Routes
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import java.util.UUID
+
+private const val EXTRA_NATIVE_PLAYBACK_ID = "com.miruronative.extra.NATIVE_PLAYBACK_ID"
+private const val EXTRA_NATIVE_ANIME_ID = "com.miruronative.extra.NATIVE_ANIME_ID"
+private const val EXTRA_NATIVE_EPISODE_NUMBER = "com.miruronative.extra.NATIVE_EPISODE_NUMBER"
 
 /**
  * Same as media3's MediaRouteButtonViewProvider, but inflates the MediaRouteButton with an
@@ -269,8 +274,9 @@ fun PlayerSurface(
     category: String,
     episode: String,
     playbackNavigationIdentity: PlaybackNavigationIdentity,
-    onEnded: (PlaybackNavigationIdentity) -> Unit,
+    onEnded: (NativePlaybackCompletion, PlaybackNavigationIdentity) -> Unit,
     onNextEpisode: () -> Unit,
+    onPlaybackIdentityChanged: (NativePlaybackIdentity) -> Unit,
     onError: (String, String, Long) -> Unit,
     modifier: Modifier = Modifier,
     onToggleFullscreen: (() -> Unit)? = null,
@@ -333,6 +339,8 @@ fun PlayerSurface(
     val currentProvider by rememberUpdatedState(provider)
     val currentCategory by rememberUpdatedState(category)
     val currentOnError by rememberUpdatedState(onError)
+    val currentOnEnded by rememberUpdatedState(onEnded)
+    val currentOnPlaybackIdentityChanged by rememberUpdatedState(onPlaybackIdentityChanged)
     var activeStream by remember(stream.url) { mutableStateOf(stream) }
     var nextStartPositionMs by remember(stream.url) { mutableLongStateOf(startPositionMs) }
     var playbackIsPlaying by remember { mutableStateOf(false) }
@@ -396,7 +404,21 @@ fun PlayerSurface(
                     // The default-quality effect waits for READY; re-trigger it when we get there.
                     if (playbackState == Player.STATE_READY) tracksRevision++
                     if (playbackState == Player.STATE_ENDED) {
-                        activeController.currentMediaItem?.playbackNavigationIdentityOrNull()?.let(onEnded)
+                        val item = activeController.currentMediaItem
+                        val identity = item?.nativePlaybackIdentity()
+                        val navigationIdentity = item?.playbackNavigationIdentityOrNull()
+                        if (identity == null || navigationIdentity == null) {
+                            DiagnosticsLog.event("PlayerSurface ignored end without playback identity")
+                        } else {
+                            currentOnEnded(
+                                NativePlaybackCompletion(
+                                    identity = identity,
+                                    reportedPositionMs = activeController.currentPosition,
+                                    durationMs = activeController.duration,
+                                ),
+                                navigationIdentity,
+                            )
+                        }
                     }
                 }
 
@@ -460,10 +482,15 @@ fun PlayerSurface(
     LaunchedEffect(controller, activeStream.url, subtitles, playbackNavigationIdentity) {
         val activeController = controller ?: return@LaunchedEffect
         val currentItem = activeController.currentMediaItem
+        val currentIdentity = currentItem?.nativePlaybackIdentity()
         if (
             currentItem?.mediaId == activeStream.url &&
-            currentItem?.playbackNavigationIdentityOrNull() == playbackNavigationIdentity
+            currentItem.playbackNavigationIdentityOrNull() == playbackNavigationIdentity &&
+            currentIdentity != null &&
+            currentIdentity.animeId == playbackNavigationIdentity.animeId &&
+            currentIdentity.episodeNumber == playbackNavigationIdentity.episodeNumber
         ) {
+            currentOnPlaybackIdentityChanged(currentIdentity)
             DiagnosticsLog.event(
                 "PlayerSurface media item already active " +
                     "host=${activeStream.host()} type=${activeStream.typeLabel()}",
@@ -478,6 +505,12 @@ fun PlayerSurface(
         )
         PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
         val watchRoute = Routes.watch(animeId, provider, category, episode)
+        val playbackIdentity = NativePlaybackIdentity(
+            playbackId = UUID.randomUUID().toString(),
+            animeId = playbackNavigationIdentity.animeId,
+            mediaId = activeStream.url,
+            episodeNumber = playbackNavigationIdentity.episodeNumber,
+        )
         val metadata = MediaMetadata.Builder()
             .setTitle(episodeTitle)
             .setArtist(seriesTitle)
@@ -491,6 +524,9 @@ fun PlayerSurface(
                 putInt(EXTRA_NAV_GENERATION, playbackNavigationIdentity.playbackGeneration)
                 putString(EXTRA_NAV_STREAM_URL, playbackNavigationIdentity.streamUrl)
                 putString(EXTRA_NAV_MEDIA_ID, activeStream.url)
+                putString(EXTRA_NATIVE_PLAYBACK_ID, playbackIdentity.playbackId)
+                putInt(EXTRA_NATIVE_ANIME_ID, playbackIdentity.animeId)
+                putDouble(EXTRA_NATIVE_EPISODE_NUMBER, playbackIdentity.episodeNumber)
             })
             .build()
         val item = MediaItem.Builder()
@@ -516,6 +552,7 @@ fun PlayerSurface(
                 },
             )
             .build()
+        currentOnPlaybackIdentityChanged(playbackIdentity)
         activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
         activeController.prepare()
         activeController.playWhenReady = true
@@ -1489,6 +1526,26 @@ internal val PlaybackSpeeds = listOf(
     1.75f,
     2f,
 )
+
+private fun MediaItem.nativePlaybackIdentity(): NativePlaybackIdentity? {
+    val extras = mediaMetadata.extras ?: return null
+    val playbackId = extras.getString(EXTRA_NATIVE_PLAYBACK_ID)?.takeIf(String::isNotBlank) ?: return null
+    if (
+        !extras.containsKey(EXTRA_NATIVE_ANIME_ID) ||
+        !extras.containsKey(EXTRA_NATIVE_EPISODE_NUMBER) ||
+        mediaId.isBlank()
+    ) {
+        return null
+    }
+    val episodeNumber = extras.getDouble(EXTRA_NATIVE_EPISODE_NUMBER)
+    if (!episodeNumber.isFinite()) return null
+    return NativePlaybackIdentity(
+        playbackId = playbackId,
+        animeId = extras.getInt(EXTRA_NATIVE_ANIME_ID),
+        mediaId = mediaId,
+        episodeNumber = episodeNumber,
+    )
+}
 
 private fun Int.stateName(): String = when (this) {
     Player.STATE_IDLE -> "IDLE"
