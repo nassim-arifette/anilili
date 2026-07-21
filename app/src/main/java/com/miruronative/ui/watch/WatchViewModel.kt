@@ -893,7 +893,7 @@ class WatchViewModel : ViewModel() {
         )
         committedEmbedPlaybackKey = commit.playbackKey
         confirmedHistoryIdentity = progressIdentity
-        lastKnownProgress = PlaybackProgress(progressIdentity, commit.positionMs, commit.durationMs)
+        lastKnownProgress = PlaybackProgressSnapshot(progressIdentity, commit.positionMs, commit.durationMs)
         lastProgressSaveIdentity = progressIdentity
         lastProgressSave = SystemClock.elapsedRealtime()
         maybeSyncAniListProgress(progressIdentity, commit.positionMs, commit.durationMs, totalEpisodes)
