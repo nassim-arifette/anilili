@@ -27,4 +27,21 @@ class WebProgressBridgeTest {
         assertEquals(1, ticks)
         assertEquals(1, videos)
     }
+
+    @Test
+    fun `command acknowledgements require the bridge capability`() {
+        val acknowledged = mutableListOf<String>()
+        val bridge = WebProgressBridge(
+            expectedToken = "trusted-capability",
+            onTickCallback = { _, _, _, _, _, _, _ -> },
+            onVideoAvailableCallback = {},
+            onEndedCallback = { _, _, _, _ -> },
+            onCommandResultCallback = { _, commandId, _, _, _, _ -> acknowledged += commandId },
+        )
+
+        bridge.onCommandResult("forged", "7", "11", true, 42.0, true, "episode")
+        bridge.onCommandResult("trusted-capability", "7", "12", true, 42.0, true, "episode")
+
+        assertEquals(listOf("12"), acknowledged)
+    }
 }
