@@ -1,11 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Adaptive-icon foreground: a play glyph inside the 72dp safe zone of the 108dp canvas. -->
+<!-- Monochrome AniLili+ orbit and plus, kept inside the adaptive-icon safe zone. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
     <path
-        android:fillColor="#E83A82"
-        android:pathData="M44,38 L44,70 L72,54 Z" />
+        android:fillColor="@android:color/transparent"
+        android:pathData="M47,27 C54,19 63,21 69,29 C80,42 91,59 87,70 C82,84 65,84 54,78 C41,86 25,81 23,67 C21,55 33,36 47,27"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="7" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M54,43 L54,65 M43,54 L65,54"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="7" />
 </vector>

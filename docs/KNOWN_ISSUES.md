@@ -70,6 +70,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | UPDATE-003 | [x] | Restore the Gradle wrapper executable bit so the Linux GitHub Actions runner can build releases. | `fix/gradlew-executable` |
 | UPDATE-004 | [x] | Recompute deterministic asset names in the publish job instead of passing outputs that GitHub redacts after a secret-bearing signing job. | `fix/release-output-taint` |
 | UPDATE-005 | [x] | Distinguish the workflow's no-replacement policy from GitHub's separate repository-enforced immutable-release feature. | `fix/release-immutability-claim` |
+| BRAND-001 | [x] | Replace the inherited anime-head launcher artwork, monochrome icon, and TV banner mark with a fork-specific AniLili+ orbit-and-plus identity. | `fix/distinct-rebrand-artwork` |
 
 ## Remaining issues
 
@@ -140,9 +141,9 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   have automated coverage, but a complete older-APK to newer-APK install should still be verified
   on at least one phone and one Android TV device before treating the distribution path as proven.
 
-- [ ] **OPEN-018 - Rebrand artwork and screenshots.** The installed label and TV banner use
-  AniLili+, but the inherited phone launcher artwork and repository screenshots still resemble or
-  display the original brand. Add a distinct launcher badge and refresh all device captures.
+- [ ] **OPEN-018 - Rebrand screenshots.** Launcher, monochrome, and TV artwork are now distinct,
+  but the repository's six device captures still show the pre-rebrand interface. Replace them with
+  captures from the final build after physical-device validation.
 
 - [ ] **OPEN-019 - Independent OAuth registrations.** AniLili+ still uses the inherited AniList and
   MyAnimeList client registrations. Register and test fork-owned clients so login does not depend on
