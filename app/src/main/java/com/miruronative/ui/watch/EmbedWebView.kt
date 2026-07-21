@@ -203,6 +203,9 @@ fun EmbedWebView(
     var durationMs by remember(playbackKey, url) { mutableLongStateOf(0L) }
     var webIsPlaying by remember(playbackKey, url) { mutableStateOf(false) }
     var webMediaIdentity by remember(playbackKey, url) { mutableStateOf<EmbedVideoIdentity?>(null) }
+    var confirmedMediaInstanceId by remember(navigationSession.generation) {
+        mutableStateOf<String?>(null)
+    }
     var webVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     var lastAudibleVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     // Cross-origin embeds (some Kiwi mirrors) put the video out of the injected JS's reach, so
@@ -350,6 +353,7 @@ fun EmbedWebView(
                 webMediaIdentity = concreteIdentity.videoIdentity
                 webVolume = if (muted) 0f else volume.toFloat().coerceIn(0f, 1f)
                 if (playbackMode.exposesNativeBridge && isPlaying && nextPositionMs > 0L) {
+                    confirmedMediaInstanceId = concreteIdentity.mediaInstanceId
                     currentOnProgress?.invoke(
                         concreteIdentity,
                         nextPositionMs,
@@ -508,7 +512,24 @@ fun EmbedWebView(
                 val acknowledgement = (resolution as? EmbedCommandResolution.Confirmed)
                     ?.acknowledgement
                 val confirmed = acknowledgement?.succeeded == true
-                if (confirmed) positionMs = acknowledgement.positionMs
+                if (confirmed) {
+                    positionMs = acknowledgement.positionMs
+                    if (playbackMode.exposesNativeBridge) {
+                        confirmedProgressAfterEmbedSeek(
+                            resolution = resolution,
+                            activeMediaIdentity = activeConcreteMediaIdentity,
+                            currentPlaybackKey = currentPlaybackKey,
+                            confirmedMediaInstanceId = confirmedMediaInstanceId,
+                            durationMs = durationMs,
+                        )?.let { progress ->
+                            currentOnProgress?.invoke(
+                                progress.identity,
+                                progress.positionMs,
+                                progress.durationMs,
+                            )
+                        }
+                    }
+                }
                 onResult?.invoke(confirmed)
             },
         )
