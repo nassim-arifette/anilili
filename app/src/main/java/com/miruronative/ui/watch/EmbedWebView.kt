@@ -168,12 +168,15 @@ fun EmbedWebView(
             ),
         )
     }
-    val activeMediaIdentity = remember(navigationIdentity, navigationSession.generation) {
+    val activeDocumentMediaIdentity = remember(navigationIdentity, navigationSession.generation) {
         EmbedMediaIdentity(
             playbackKey = playbackKey,
             navigationGeneration = navigationSession.generation,
-            mediaId = activeUrl,
+            documentMediaId = activeUrl,
         )
+    }
+    var activeConcreteMediaIdentity by remember(navigationSession.generation) {
+        mutableStateOf<EmbedMediaIdentity?>(null)
     }
     var webPlaybackAvailable by remember(navigationSession.generation) { mutableStateOf(false) }
     var loadError by remember(navigationSession.generation) { mutableStateOf<String?>(null) }
@@ -193,7 +196,7 @@ fun EmbedWebView(
     // third-party iframe from forging callbacks; the navigation token rejects superseded pages.
     val progressBridgeToken = remember { UUID.randomUUID().toString() }
     val currentNavigationSession by rememberUpdatedState(navigationSession)
-    val currentActiveMediaIdentity by rememberUpdatedState(activeMediaIdentity)
+    val currentDocumentMediaIdentity by rememberUpdatedState(activeDocumentMediaIdentity)
     // The WebView is built once, so the remote handler below has to read this live rather than
     // capture the value it was created with.
     val currentPlayerOwnsRemote by rememberUpdatedState(focusPlayerOnStart)
@@ -205,7 +208,7 @@ fun EmbedWebView(
     var positionMs by remember(playbackKey, url) { mutableLongStateOf(startPositionMs) }
     var durationMs by remember(playbackKey, url) { mutableLongStateOf(0L) }
     var webIsPlaying by remember(playbackKey, url) { mutableStateOf(false) }
-    var webMediaIdentity by remember(playbackKey, url) { mutableStateOf<String?>(null) }
+    var webMediaIdentity by remember(playbackKey, url) { mutableStateOf<EmbedVideoIdentity?>(null) }
     var webVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     var lastAudibleVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     // Cross-origin embeds (some Kiwi mirrors) put the video out of the injected JS's reach, so
@@ -230,9 +233,9 @@ fun EmbedWebView(
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
     val autoplay by SettingsStore.autoplay.collectAsState()
     val captionStyle by SettingsStore.captionStyle.collectAsState()
-    LaunchedEffect(activeMediaIdentity, playbackMode.exposesNativeBridge) {
+    LaunchedEffect(activeDocumentMediaIdentity, playbackMode.exposesNativeBridge) {
         if (playbackMode.exposesNativeBridge) {
-            currentOnActiveMediaChanged?.invoke(activeMediaIdentity)
+            currentOnActiveMediaChanged?.invoke(activeDocumentMediaIdentity)
         }
     }
     val skipPlan = remember(skip, aniSkipSegments, aniSkipLookupStatus) {
@@ -244,46 +247,115 @@ fun EmbedWebView(
     val introEndMs = automaticOpening?.endMs
     val outroStartMs = automaticEnding?.startMs
     val outroEndMs = automaticEnding?.endMs
-    var introAutoSkipped by remember(navigationSession.generation, introStartMs, introEndMs) {
+    val concreteVideoGeneration = activeConcreteMediaIdentity?.videoIdentity?.generation ?: 0L
+    var introAutoSkipped by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        introStartMs,
+        introEndMs,
+    ) {
         mutableStateOf(false)
     }
-    var introAutoSkipPending by remember(navigationSession.generation, introStartMs, introEndMs) {
+    var introAutoSkipPending by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        introStartMs,
+        introEndMs,
+    ) {
         mutableStateOf(false)
     }
-    var introAutoSkipAttempt by remember(navigationSession.generation, introStartMs, introEndMs) {
+    var introAutoSkipAttempt by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        introStartMs,
+        introEndMs,
+    ) {
         mutableIntStateOf(0)
     }
-    var outroAutoHandled by remember(navigationSession.generation, outroStartMs, outroEndMs) {
+    var outroAutoHandled by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        outroStartMs,
+        outroEndMs,
+    ) {
         mutableStateOf(false)
     }
-    var outroAutoSkipPending by remember(navigationSession.generation, outroStartMs, outroEndMs) {
+    var outroAutoSkipPending by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        outroStartMs,
+        outroEndMs,
+    ) {
         mutableStateOf(false)
     }
-    var outroAutoSkipAttempt by remember(navigationSession.generation, outroStartMs, outroEndMs) {
+    var outroAutoSkipAttempt by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        outroStartMs,
+        outroEndMs,
+    ) {
         mutableIntStateOf(0)
     }
     val autoAdvanceGate = remember { EmbedAutoAdvanceGate() }
     // The concrete WebView and Java bridge live across URL changes. Updated handlers make their
     // callbacks target the current navigation's state, while the bridge token rejects old pages.
     val currentWebTickHandler by rememberUpdatedState<(
-        String, Double, Double, Boolean, Boolean, Double, String,
+        String, Double, Double, Boolean, Boolean, Double, String, Long,
     ) -> Unit>(
-        newValue = { navigationToken, positionSec, durationSec, isPlaying, muted, volume, mediaIdentity ->
+        newValue = tick@{
+                navigationToken,
+                positionSec,
+                durationSec,
+                isPlaying,
+                muted,
+                volume,
+                mediaIdentity,
+                mediaGeneration,
+            ->
             if (
                 navigationGuard.acceptsBridgeToken(navigationToken) &&
                 positionSec >= 0 &&
                 durationSec > 0
             ) {
+                val concreteIdentity = currentDocumentMediaIdentity.copy(
+                    videoIdentity = EmbedVideoIdentity(mediaIdentity, mediaGeneration),
+                )
+                when (
+                    planEmbedMediaHandoff(
+                        active = activeConcreteMediaIdentity,
+                        reported = concreteIdentity,
+                        currentPlaybackKey = currentPlaybackKey,
+                    )
+                ) {
+                    EmbedMediaHandoffDecision.REJECT -> {
+                        DiagnosticsLog.event(
+                            "EmbedWebView ignored stale video tick " +
+                                "navigation=$navigationToken videoGeneration=$mediaGeneration",
+                        )
+                        return@tick
+                    }
+                    EmbedMediaHandoffDecision.KEEP -> Unit
+                    EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP -> {
+                        // The ViewModel handoff is deliberately synchronous and precedes every
+                        // state/progress write. This clears markers and cancels the former lookup
+                        // before the replacement video's first duration can schedule another one.
+                        activeConcreteMediaIdentity = concreteIdentity
+                        webMediaIdentity = concreteIdentity.videoIdentity
+                        if (playbackMode.exposesNativeBridge) {
+                            currentOnActiveMediaChanged?.invoke(concreteIdentity)
+                        }
+                    }
+                }
                 val nextPositionMs = (positionSec * 1000).toLong()
                 val nextDurationMs = (durationSec * 1000).toLong()
                 positionMs = nextPositionMs
                 durationMs = nextDurationMs
                 webIsPlaying = isPlaying
-                webMediaIdentity = mediaIdentity.takeIf(String::isNotBlank)
+                webMediaIdentity = concreteIdentity.videoIdentity
                 webVolume = if (muted) 0f else volume.toFloat().coerceIn(0f, 1f)
                 if (playbackMode.exposesNativeBridge && isPlaying && nextPositionMs > 0L) {
                     currentOnProgress?.invoke(
-                        currentActiveMediaIdentity,
+                        concreteIdentity,
                         nextPositionMs,
                         nextDurationMs,
                     )
@@ -294,11 +366,36 @@ fun EmbedWebView(
     val currentWebVideoAvailableHandler by rememberUpdatedState<(String) -> Unit> { navigationToken ->
         if (navigationGuard.acceptsBridgeToken(navigationToken)) webPlaybackAvailable = true
     }
-    val currentWebEndedHandler by rememberUpdatedState<(String, Double, Double, Int) -> Unit>(
-        newValue = { navigationToken, positionSec, durationSec, observedPlayingSamples ->
+    val currentWebEndedHandler by rememberUpdatedState<(
+        String, Double, Double, Int, String, Long,
+    ) -> Unit>(
+        newValue = ended@{
+                navigationToken,
+                positionSec,
+                durationSec,
+                observedPlayingSamples,
+                mediaIdentity,
+                mediaGeneration,
+            ->
             if (!navigationGuard.acceptsBridgeToken(navigationToken)) {
                 DiagnosticsLog.event("EmbedWebView ignored stale ended token=$navigationToken")
             } else {
+                val reportedIdentity = currentDocumentMediaIdentity.copy(
+                    videoIdentity = EmbedVideoIdentity(mediaIdentity, mediaGeneration),
+                )
+                if (
+                    !acceptsEmbedMediaCallback(
+                        reported = reportedIdentity,
+                        active = activeConcreteMediaIdentity,
+                        currentPlaybackKey = currentPlaybackKey,
+                    )
+                ) {
+                    DiagnosticsLog.event(
+                        "EmbedWebView ignored stale video end token=$navigationToken " +
+                            "videoGeneration=$mediaGeneration",
+                    )
+                    return@ended
+                }
                 val sample = embedEndSampleFromSeconds(positionSec, durationSec, observedPlayingSamples)
                 if (sample == null || !isLikelyEmbedContentEnd(sample)) {
                     DiagnosticsLog.event(
@@ -351,14 +448,27 @@ fun EmbedWebView(
         Double,
         Boolean,
         String,
+        Long,
     ) -> Unit>(
-        newValue = { navigationToken, commandId, succeeded, positionSec, isPlaying, mediaIdentity ->
+        newValue = {
+                navigationToken,
+                commandId,
+                succeeded,
+                positionSec,
+                isPlaying,
+                mediaIdentity,
+                mediaGeneration,
+            ->
             if (!navigationGuard.acceptsBridgeToken(navigationToken)) {
                 DiagnosticsLog.event("EmbedWebView ignored stale command ack token=$navigationToken")
             } else {
                 val id = commandId.toLongOrNull()
                 val generation = navigationToken.toLongOrNull()
                 if (id != null && generation != null) {
+                    val acknowledgedMediaIdentity = EmbedVideoIdentity(
+                        mediaId = mediaIdentity,
+                        generation = mediaGeneration,
+                    ).takeIf { it.isValid }
                     val resolution = commandCoordinator.acknowledge(
                         EmbedCommandAcknowledgement(
                             commandId = id,
@@ -366,9 +476,10 @@ fun EmbedWebView(
                             succeeded = succeeded,
                             positionMs = (positionSec * 1_000.0).toLong().coerceAtLeast(0L),
                             isPlaying = isPlaying,
-                            mediaIdentity = mediaIdentity,
+                            mediaIdentity = acknowledgedMediaIdentity,
                         ),
                         nowMs = SystemClock.uptimeMillis(),
+                        activeMediaIdentity = webMediaIdentity,
                     )
                     if (resolution !is EmbedCommandResolution.Ignored) {
                         pendingCommandCallbacks.remove(id)?.invoke(resolution)
@@ -393,7 +504,8 @@ fun EmbedWebView(
                     navigationGeneration = navigationSession.generation,
                     capabilityToken = progressBridgeToken,
                     commandId = commandId,
-                    expectedMediaIdentity = webMediaIdentity,
+                    expectedMediaIdentity = webMediaIdentity?.mediaId,
+                    expectedMediaGeneration = webMediaIdentity?.generation,
                 )
             },
             onResolved = { resolution ->
@@ -420,7 +532,8 @@ fun EmbedWebView(
                     navigationGeneration = navigationSession.generation,
                     capabilityToken = progressBridgeToken,
                     commandId = commandId,
-                    expectedMediaIdentity = webMediaIdentity,
+                    expectedMediaIdentity = webMediaIdentity?.mediaId,
+                    expectedMediaGeneration = webMediaIdentity?.generation,
                 )
             },
             onResolved = { resolution ->
@@ -636,6 +749,7 @@ fun EmbedWebView(
         outroStartMs,
         outroEndMs,
         navigationSession.generation,
+        concreteVideoGeneration,
         hasNextEpisode,
         introAutoSkipAttempt,
         outroAutoSkipAttempt,
@@ -874,6 +988,7 @@ fun EmbedWebView(
                                             muted,
                                             volume,
                                             mediaIdentity,
+                                            mediaGeneration,
                                         ->
                                         mainHandler.post {
                                             currentWebTickHandler(
@@ -884,19 +999,29 @@ fun EmbedWebView(
                                                 muted,
                                                 volume,
                                                 mediaIdentity,
+                                                mediaGeneration,
                                             )
                                         }
                                     },
                                     onVideoAvailableCallback = { navigationToken ->
                                         mainHandler.post { currentWebVideoAvailableHandler(navigationToken) }
                                     },
-                                    onEndedCallback = { navigationToken, positionSec, durationSec, playingSamples ->
+                                    onEndedCallback = {
+                                            navigationToken,
+                                            positionSec,
+                                            durationSec,
+                                            playingSamples,
+                                            mediaIdentity,
+                                            mediaGeneration,
+                                        ->
                                         mainHandler.post {
                                             currentWebEndedHandler(
                                                 navigationToken,
                                                 positionSec,
                                                 durationSec,
                                                 playingSamples,
+                                                mediaIdentity,
+                                                mediaGeneration,
                                             )
                                         }
                                     },
@@ -907,6 +1032,7 @@ fun EmbedWebView(
                                             positionSec,
                                             isPlaying,
                                             mediaIdentity,
+                                            mediaGeneration,
                                         ->
                                         mainHandler.post {
                                             currentWebCommandHandler(
@@ -916,6 +1042,7 @@ fun EmbedWebView(
                                                 positionSec,
                                                 isPlaying,
                                                 mediaIdentity,
+                                                mediaGeneration,
                                             )
                                         }
                                     },
@@ -1436,6 +1563,7 @@ private fun authenticatedProgressPollJs(
       ${embedContentVideoSelectorJs()}
       var observedVideo = null;
       var observedMediaKey = null;
+      var observedMediaGeneration = 0;
       var observedPlayingSamples = 0;
       var endedHandler = null;
       var endedReportedMediaKey = null;
@@ -1453,7 +1581,9 @@ private fun authenticatedProgressPollJs(
             navigationToken,
             video.currentTime,
             video.duration,
-            observedPlayingSamples
+            observedPlayingSamples,
+            key,
+            observedMediaGeneration
           );
         } catch (e) { /* bridge detached */ }
       }
@@ -1469,6 +1599,7 @@ private fun authenticatedProgressPollJs(
         }
         observedVideo = video;
         observedMediaKey = key;
+        observedMediaGeneration = __aniliBindMediaGeneration(video);
         observedPlayingSamples = 0;
         endedReportedMediaKey = null;
       }
@@ -1497,7 +1628,8 @@ private fun authenticatedProgressPollJs(
               !v.paused,
               v.muted,
               v.volume,
-              mediaKey(v)
+              mediaKey(v),
+              observedMediaGeneration
             );
             if (v.ended) reportEnded(v);
           }
@@ -1645,11 +1777,13 @@ internal fun togglePlaybackCommandJs(
     capabilityToken: String,
     commandId: Long,
     expectedMediaIdentity: String? = null,
+    expectedMediaGeneration: Long? = null,
 ): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
       ${embedContentVideoSelectorJs()}
       var expectedMediaIdentity = ${expectedMediaIdentity?.toJsStringLiteral() ?: "null"};
+      var expectedMediaGeneration = ${expectedMediaGeneration ?: "null"};
       var reported = false;
       function report(success, video) {
         if (reported) return;
@@ -1657,19 +1791,23 @@ internal fun togglePlaybackCommandJs(
         var position = video && isFinite(video.currentTime) ? video.currentTime : 0;
         var playing = !!video && !video.paused && !video.ended;
         var mediaIdentity = __aniliMediaIdentity(video);
+        var mediaGeneration = __aniliMediaGeneration(video);
         success = success && !!video && findContentVideo() === video &&
-          (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity);
+          (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity) &&
+          (expectedMediaGeneration === null || mediaGeneration === expectedMediaGeneration);
         try {
           AniliProgress.onCommandResult(
             '$capabilityToken', '$navigationGeneration', '$commandId', success, position, playing,
-            mediaIdentity
+            mediaIdentity, mediaGeneration
           );
         } catch (e) { /* bridge detached */ }
       }
       try {
         var video = findContentVideo();
         if (!video) { report(false, null); return; }
-        if (expectedMediaIdentity && __aniliMediaIdentity(video) !== expectedMediaIdentity) {
+        if ((expectedMediaIdentity && __aniliMediaIdentity(video) !== expectedMediaIdentity) ||
+            (expectedMediaGeneration !== null &&
+              __aniliMediaGeneration(video) !== expectedMediaGeneration)) {
           report(false, video); return;
         }
         if (video.paused || video.ended) {
@@ -1696,11 +1834,13 @@ internal fun seekVideoCommandJs(
     capabilityToken: String,
     commandId: Long,
     expectedMediaIdentity: String? = null,
+    expectedMediaGeneration: Long? = null,
 ): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
       ${embedContentVideoSelectorJs()}
       var expectedMediaIdentity = ${expectedMediaIdentity?.toJsStringLiteral() ?: "null"};
+      var expectedMediaGeneration = ${expectedMediaGeneration ?: "null"};
       var reported = false;
       function report(success, video) {
         if (reported) return;
@@ -1708,19 +1848,23 @@ internal fun seekVideoCommandJs(
         var position = video && isFinite(video.currentTime) ? video.currentTime : 0;
         var playing = !!video && !video.paused && !video.ended;
         var mediaIdentity = __aniliMediaIdentity(video);
+        var mediaGeneration = __aniliMediaGeneration(video);
         success = success && !!video && findContentVideo() === video &&
-          (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity);
+          (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity) &&
+          (expectedMediaGeneration === null || mediaGeneration === expectedMediaGeneration);
         try {
           AniliProgress.onCommandResult(
             '$capabilityToken', '$navigationGeneration', '$commandId', success, position, playing,
-            mediaIdentity
+            mediaIdentity, mediaGeneration
           );
         } catch (e) { /* bridge detached */ }
       }
       try {
         var video = findContentVideo();
         if (!video) { report(false, null); return; }
-        if (expectedMediaIdentity && __aniliMediaIdentity(video) !== expectedMediaIdentity) {
+        if ((expectedMediaIdentity && __aniliMediaIdentity(video) !== expectedMediaIdentity) ||
+            (expectedMediaGeneration !== null &&
+              __aniliMediaGeneration(video) !== expectedMediaGeneration)) {
           report(false, video); return;
         }
         var target = $targetSec;
@@ -1746,7 +1890,7 @@ private fun dispatchWebCommand(
     callbacks: MutableMap<Long, (EmbedCommandResolution) -> Unit>,
     handler: Handler,
     kind: EmbedCommandKind,
-    mediaIdentity: String?,
+    mediaIdentity: EmbedVideoIdentity?,
     script: (Long) -> String,
     onResolved: (EmbedCommandResolution) -> Unit,
 ): Boolean {
@@ -2175,10 +2319,10 @@ private class EmbedNavigationWebViewClient(
 
 internal class WebProgressBridge(
     private val expectedToken: String,
-    private val onTickCallback: (String, Double, Double, Boolean, Boolean, Double, String) -> Unit,
+    private val onTickCallback: (String, Double, Double, Boolean, Boolean, Double, String, Long) -> Unit,
     private val onVideoAvailableCallback: (String) -> Unit,
-    private val onEndedCallback: (String, Double, Double, Int) -> Unit,
-    private val onCommandResultCallback: (String, String, Boolean, Double, Boolean, String) -> Unit,
+    private val onEndedCallback: (String, Double, Double, Int, String, Long) -> Unit,
+    private val onCommandResultCallback: (String, String, Boolean, Double, Boolean, String, Long) -> Unit,
 ) {
     /** Compatibility constructor for callers that do not need navigation identity. */
     constructor(
@@ -2187,12 +2331,12 @@ internal class WebProgressBridge(
         onVideoAvailableCallback: () -> Unit,
     ) : this(
         expectedToken = expectedToken,
-        onTickCallback = { _, positionSec, durationSec, isPlaying, muted, volume, _ ->
+        onTickCallback = { _, positionSec, durationSec, isPlaying, muted, volume, _, _ ->
             onTickCallback(positionSec, durationSec, isPlaying, muted, volume)
         },
         onVideoAvailableCallback = { onVideoAvailableCallback() },
-        onEndedCallback = { _, _, _, _ -> },
-        onCommandResultCallback = { _, _, _, _, _, _ -> },
+        onEndedCallback = { _, _, _, _, _, _ -> },
+        onCommandResultCallback = { _, _, _, _, _, _, _ -> },
     )
 
     @JavascriptInterface
@@ -2205,9 +2349,19 @@ internal class WebProgressBridge(
         muted: Boolean,
         volume: Double,
         mediaIdentity: String,
+        mediaGeneration: Long,
     ) {
         if (capabilityToken != expectedToken) return
-        onTickCallback(navigationToken, positionSec, durationSec, isPlaying, muted, volume, mediaIdentity)
+        onTickCallback(
+            navigationToken,
+            positionSec,
+            durationSec,
+            isPlaying,
+            muted,
+            volume,
+            mediaIdentity,
+            mediaGeneration,
+        )
     }
 
     fun onTick(
@@ -2226,6 +2380,7 @@ internal class WebProgressBridge(
         muted,
         volume,
         "",
+        0L,
     )
 
     @JavascriptInterface
@@ -2244,9 +2399,18 @@ internal class WebProgressBridge(
         positionSec: Double,
         durationSec: Double,
         observedPlayingSamples: Int,
+        mediaIdentity: String,
+        mediaGeneration: Long,
     ) {
         if (capabilityToken != expectedToken) return
-        onEndedCallback(navigationToken, positionSec, durationSec, observedPlayingSamples)
+        onEndedCallback(
+            navigationToken,
+            positionSec,
+            durationSec,
+            observedPlayingSamples,
+            mediaIdentity,
+            mediaGeneration,
+        )
     }
 
     @JavascriptInterface
@@ -2258,8 +2422,17 @@ internal class WebProgressBridge(
         positionSec: Double,
         isPlaying: Boolean,
         mediaIdentity: String,
+        mediaGeneration: Long,
     ) {
         if (capabilityToken != expectedToken) return
-        onCommandResultCallback(navigationToken, commandId, succeeded, positionSec, isPlaying, mediaIdentity)
+        onCommandResultCallback(
+            navigationToken,
+            commandId,
+            succeeded,
+            positionSec,
+            isPlaying,
+            mediaIdentity,
+            mediaGeneration,
+        )
     }
 }

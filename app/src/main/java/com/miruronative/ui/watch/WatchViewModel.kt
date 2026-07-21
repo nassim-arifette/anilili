@@ -1094,13 +1094,24 @@ class WatchViewModel : ViewModel() {
             return
         }
         val key = identity.playbackKey
+        val sourceIdentity = identity.aniSkipSourceIdentity()
+        val mediaInstanceId = identity.mediaInstanceId
+        if (sourceIdentity == null || mediaInstanceId == null) {
+            DiagnosticsLog.event(
+                "Watch ignored embed progress without concrete video identity " +
+                    "episode=${fmt(key.episodeNumber)} generation=${key.sourceGeneration} " +
+                    "navigation=${identity.navigationGeneration}",
+            )
+            return
+        }
         acceptProgress(
             data = data,
             identity = PlaybackIdentity(
                 animeId = key.animeId,
                 episodeNumber = key.episodeNumber,
                 generation = key.sourceGeneration,
-                mediaId = identity.mediaId,
+                mediaId = sourceIdentity,
+                mediaInstanceId = mediaInstanceId,
             ),
             positionMs = positionMs,
             durationMs = durationMs,
@@ -1680,7 +1691,7 @@ class WatchViewModel : ViewModel() {
         val durationBucketMs = aniSkipDurationBucketMs(actualDurationMs) ?: return
         val expected = data.aniSkipLookupIdentity(
             request = requestGate.currentRequest(),
-            mediaId = playbackIdentity.mediaId,
+            playbackIdentity = playbackIdentity,
             durationBucketMs = durationBucketMs,
         )
         if (aniSkipLookupIdentity == expected) return
@@ -1725,7 +1736,7 @@ class WatchViewModel : ViewModel() {
             val currentDurationBucket = aniSkipDurationBucketMs(currentProgress.durationMs) ?: return@launch
             val current = currentData.aniSkipLookupIdentity(
                 request = requestGate.currentRequest(),
-                mediaId = currentProgress.identity.mediaId,
+                playbackIdentity = currentProgress.identity,
                 durationBucketMs = currentDurationBucket,
             )
             if (!canPublishAniSkipSegments(expected, current)) return@launch
@@ -1965,7 +1976,7 @@ class WatchViewModel : ViewModel() {
 
 private fun WatchData.aniSkipLookupIdentity(
     request: PlaybackRequestToken,
-    mediaId: String,
+    playbackIdentity: PlaybackIdentity,
     durationBucketMs: Long,
 ): AniSkipLookupIdentity = AniSkipLookupIdentity(
     request = request,
@@ -1974,8 +1985,9 @@ private fun WatchData.aniSkipLookupIdentity(
     provider = provider,
     category = category,
     sourceGeneration = playbackGeneration,
-    mediaId = mediaId,
+    mediaId = playbackIdentity.mediaId,
     durationBucketMs = durationBucketMs,
+    mediaInstanceId = playbackIdentity.mediaInstanceId,
 )
 
 private fun WatchData.nativeMediaIds(): Set<String> {

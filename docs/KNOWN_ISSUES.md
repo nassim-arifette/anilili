@@ -1,6 +1,6 @@
 # Known Issues and Fix Tracker
 
-Last updated: July 21, 2026.
+Last updated: July 22, 2026.
 
 This is the canonical audit tracker for the current repository tree. A checked item is implemented
 and merged into the integration history. An unchecked item is still open, even when the limitation
@@ -59,6 +59,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | SKIP-007 | [x] | Auto-skip only pure openings/endings. Mixed openings, mixed endings, and recaps have explicit manual actions; mixed typed markers suppress untyped provider auto-skip for the same family, including late responses. | `feature/aniskip-segments` |
 | SKIP-008 | [x] | Retain the last measured duration across transient zero-duration callbacks for the exact same media identity, so an in-flight AniSkip response cannot strand the player in `LOADING`. Default skip policy inputs now fail safe and keep provider auto-skip disabled until the typed lookup completes. | `fix/aniskip-zero-duration-loading` |
 | SKIP-009 | [x] | Hand the exact active embed navigation and quality URL to the ViewModel. A quality change immediately clears duration-adjusted markers, rejects callbacks from the replaced document, and reloads AniSkip only after the replacement reports its own duration. Signed URLs remain absent from logs and are SHA-256 scoped in cache keys. | `fix/aniskip-embed-media-identity` |
+| SKIP-010 | [x] | Bind same-origin embed progress to the actual selected video as well as its document and navigation. A same-document CDN/track replacement synchronously clears AniSkip, rejects callbacks and command acknowledgements from the former video, and waits for the replacement's own duration-bearing sample even when both videos round to the same duration. Raw document/video identities are redacted from diagnostics and combined into an opaque SHA-256 source fingerprint before the repository's SHA-256-scoped persistent cache. | `fix/embed-active-video-identity` |
 | EMBED-001 | [x] | Authenticate bridge callbacks and isolate every embed navigation so an old page cannot update the new episode. | `fix/webview-bridge-capabilities`, `fix/embed-navigation-generation` |
 | EMBED-002 | [x] | Retry resume until a same-origin video is ready, including accessible iframes, and preserve pause state during seeks. | `fix/embed-resume-readiness`, `fix/embed-seek-preserves-pause` |
 | EMBED-003 | [x] | Accept natural embed completion only after content-like playback samples, commit it before autoplay, and advance at most once. | `fix/embed-safe-natural-end-autoplay`, `fix/embed-terminal-progress-commit` |
@@ -261,6 +262,10 @@ replacements:
 - [x] Compile the active-embed media handoff and run 31 focused JVM tests covering quality URL
   activation, stale navigation rejection, marker reset/reload, duration-bound publication, mixed
   segment policy, and hashed cache scope (July 21, 2026).
+- [x] Compile the concrete embed-video handoff and run 62 focused JVM tests covering first-video
+  activation, same-document replacement at equal rounded duration, stale former-video callbacks,
+  navigation/quality changes, command acknowledgement identity, AniSkip publication scope, and raw
+  identity redaction (July 22, 2026).
 - [x] Publish and download GitHub Release `v0.2.0`, then independently verify its sidecar and API
   SHA-256 (`3c0897f11fb5763cf5eb71d51043321fb56b11835d8a5a719ed7e9fd9b45f6ad`),
   package metadata, 16 KiB alignment, and pinned signer (July 21, 2026).

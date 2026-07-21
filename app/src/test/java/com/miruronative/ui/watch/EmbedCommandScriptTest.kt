@@ -6,7 +6,14 @@ import org.junit.Test
 class EmbedCommandScriptTest {
     @Test
     fun `seek reports asynchronous command acknowledgement for selected content`() {
-        val script = seekVideoCommandJs(42.5, 17, "capability", 9, "episode|1440000")
+        val script = seekVideoCommandJs(
+            targetSec = 42.5,
+            navigationGeneration = 17,
+            capabilityToken = "capability",
+            commandId = 9,
+            expectedMediaIdentity = "episode|1440000",
+            expectedMediaGeneration = 3,
+        )
 
         assertTrue(script.contains("findContentVideo()"))
         assertTrue(script.contains("addEventListener('seeked'"))
@@ -14,6 +21,8 @@ class EmbedCommandScriptTest {
         assertTrue(script.contains("'capability', '17', '9'"))
         assertTrue(script.contains("Math.abs(video.currentTime - bounded) <= 1.5"))
         assertTrue(script.contains("expectedMediaIdentity = 'episode|1440000'"))
+        assertTrue(script.contains("expectedMediaGeneration = 3"))
+        assertTrue(script.contains("__aniliMediaGeneration(video)"))
         assertTrue(script.contains("findContentVideo() === video"))
     }
 

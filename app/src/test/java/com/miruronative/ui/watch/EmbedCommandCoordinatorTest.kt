@@ -90,11 +90,13 @@ class EmbedCommandCoordinatorTest {
     @Test
     fun `acknowledgement from replaced media is rejected`() {
         val coordinator = EmbedCommandCoordinator(timeoutMs = 100)
+        val episodeA = EmbedVideoIdentity("episode-a?signed=secret", generation = 1)
+        val prerollB = EmbedVideoIdentity("preroll-b", generation = 2)
         val command = coordinator.issue(
             navigationGeneration = 7,
             kind = EmbedCommandKind.SEEK,
             nowMs = 10,
-            mediaIdentity = "episode-a",
+            mediaIdentity = episodeA,
         )
 
         assertTrue(
@@ -105,9 +107,40 @@ class EmbedCommandCoordinatorTest {
                     true,
                     42_000,
                     true,
-                    mediaIdentity = "preroll-b",
+                    mediaIdentity = prerollB,
                 ),
                 nowMs = 20,
+                activeMediaIdentity = prerollB,
+            ) is EmbedCommandResolution.Rejected,
+        )
+        assertTrue(command.toString().contains("<redacted>"))
+        assertTrue(!command.toString().contains("signed=secret"))
+    }
+
+    @Test
+    fun `same raw media id from an older generation cannot acknowledge after replacement`() {
+        val coordinator = EmbedCommandCoordinator(timeoutMs = 100)
+        val oldVideo = EmbedVideoIdentity("blob:https://embed.example/video", generation = 1)
+        val replacement = oldVideo.copy(generation = 2)
+        val command = coordinator.issue(
+            navigationGeneration = 7,
+            kind = EmbedCommandKind.TOGGLE_PLAYBACK,
+            nowMs = 10,
+            mediaIdentity = oldVideo,
+        )
+
+        assertTrue(
+            coordinator.acknowledge(
+                EmbedCommandAcknowledgement(
+                    command.id,
+                    7,
+                    true,
+                    42_000,
+                    true,
+                    mediaIdentity = oldVideo,
+                ),
+                nowMs = 20,
+                activeMediaIdentity = replacement,
             ) is EmbedCommandResolution.Rejected,
         )
     }

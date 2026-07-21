@@ -12,7 +12,14 @@ internal data class AniSkipLookupIdentity(
     val sourceGeneration: Int,
     val mediaId: String,
     val durationBucketMs: Long,
-)
+    val mediaInstanceId: String? = null,
+) {
+    override fun toString(): String =
+        "AniSkipLookupIdentity(request=$request, animeId=$animeId, " +
+            "episodeNumber=$episodeNumber, provider=$provider, category=$category, " +
+            "sourceGeneration=$sourceGeneration, mediaId=<redacted>, " +
+            "durationBucketMs=$durationBucketMs, mediaInstanceId=$mediaInstanceId)"
+}
 
 /**
  * AniSkip works in seconds; grouping stable player duration callbacks to one-second precision
