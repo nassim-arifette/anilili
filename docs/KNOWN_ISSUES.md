@@ -68,6 +68,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | UPDATE-001 | [x] | Point release checks and repository links to `nassim-arifette/anilili`. | `fix/fork-update-source` |
 | UPDATE-002 | [x] | Give the fork its own Android identity and add a stable-key GitHub Release workflow so future AniLili+ APKs can update existing installations. | `feature/anilili-plus-auto-updates` |
 | UPDATE-003 | [x] | Restore the Gradle wrapper executable bit so the Linux GitHub Actions runner can build releases. | `fix/gradlew-executable` |
+| UPDATE-004 | [x] | Recompute deterministic asset names in the publish job instead of passing outputs that GitHub redacts after a secret-bearing signing job. | `fix/release-output-taint` |
 
 ## Remaining issues
 
