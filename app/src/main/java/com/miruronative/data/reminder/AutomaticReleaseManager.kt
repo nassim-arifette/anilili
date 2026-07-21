@@ -29,6 +29,8 @@ import com.miruronative.data.AppGraph
 import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.library.LibraryStore
 import com.miruronative.data.model.Media
+import com.miruronative.data.model.IncompleteSourceException
+import com.miruronative.data.model.SourceCompleteness
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.nav.Routes
@@ -378,7 +380,7 @@ class ReleaseSyncWorker(
             // Reconciliation removes alarms that are absent from this list, so never feed it a
             // partial snapshot after a transient metadata failure.
             val localSaved = fetchCompleteSnapshot(LibraryStore.watchlist.value) { saved ->
-                repo.animeInfo(saved.anilistId)
+                repo.releaseMetadataCompleteness(saved.anilistId)
             }
             // Capture one account generation. Network results from this worker may only affect
             // notifications and alarms while that exact account still owns the session.
@@ -397,12 +399,12 @@ class ReleaseSyncWorker(
                 // AniList notifications are now the canonical push source for logged-in users.
                 // Keep local alarms only for device-only saves that AniList cannot notify about.
                 AuthManager.commitIfSessionCurrent(accountGeneration) {
-                    AutomaticReleaseManager.sync(localSaved.filterNot { it.id in aniListIds })
+                    AutomaticReleaseManager.sync(localSaved.present.filterNot { it.id in aniListIds })
                 }
             } else {
                 AuthManager.commitIfLoggedOut {
                     NotificationCenter.setUnread(0)
-                    AutomaticReleaseManager.sync(localSaved.distinctBy { it.id })
+                    AutomaticReleaseManager.sync(localSaved.present.distinctBy { it.id })
                 }
             }
             Result.success()
@@ -413,12 +415,17 @@ class ReleaseSyncWorker(
     }
 
     private suspend fun anilistTrackedMedia(repo: com.miruronative.data.MiruroRepository): List<Media> {
-        val viewerId = AuthManager.viewerId() ?: runCatching { repo.viewer() }.getOrNull()?.id ?: return emptyList()
+        val viewerId = AuthManager.viewerId() ?: repo.viewer()?.id
+            ?: throw IncompleteSourceException("AniList viewer identity is missing")
         // AniList's airing pushes cover shows the user is actively watching/rewatching. Planning,
         // paused, and favourite-only titles still need the app's local release alarm.
         val activeStatuses = setOf("CURRENT", "REPEATING")
-        val listMedia = runCatching { repo.userAnimeList(viewerId) }.getOrNull()
-            ?.lists.orEmpty()
+        val collection = when (val signal = repo.userAnimeListCompleteness(viewerId)) {
+            is SourceCompleteness.Present -> signal.value
+            SourceCompleteness.DefinitiveAbsence -> return emptyList()
+            is SourceCompleteness.Incomplete -> throw IncompleteSourceException(signal.reason, signal.cause)
+        }
+        val listMedia = collection.lists
             .flatMap { it.entries }
             .distinctBy { it.id }
             .filter { it.status in activeStatuses }

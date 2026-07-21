@@ -6,6 +6,8 @@ import com.miruronative.data.model.EpisodeItem
 import com.miruronative.data.model.EpisodesResult
 import com.miruronative.data.model.DiscoverFilters
 import com.miruronative.data.model.Media
+import com.miruronative.data.model.MediaListCollection
+import com.miruronative.data.model.SourceCompleteness
 import com.miruronative.data.model.MediaPage
 import com.miruronative.data.model.HomeCollections
 import com.miruronative.data.model.SourcesResult
@@ -158,6 +160,10 @@ class MiruroRepository(
     suspend fun notifications(markAllRead: Boolean = false) = aniList.notifications(markAllRead)
     suspend fun favouriteAnime() = aniList.favouriteAnime()
     suspend fun userAnimeList(userId: Int) = aniList.userAnimeList(userId)
+
+    suspend fun userAnimeListCompleteness(
+        userId: Int,
+    ): SourceCompleteness<MediaListCollection> = aniList.userAnimeListCompleteness(userId)
     suspend fun saveAniListProgress(mediaId: Int, progress: Int, totalEpisodes: Int?) =
         aniList.syncMediaListProgress(mediaId, progress, totalEpisodes)
     suspend fun syncSavedAnime(mediaId: Int, saved: Boolean) = aniList.syncSavedAnime(mediaId, saved)
@@ -398,6 +404,10 @@ class MiruroRepository(
         ttlMs = INFO_TTL,
         forceRefresh = force,
     ) { aniList.animeInfo(id) }
+
+    /** Uncached completeness-sensitive metadata for destructive release-alarm reconciliation. */
+    suspend fun releaseMetadataCompleteness(id: Int): SourceCompleteness<Media> =
+        aniList.animeInfoCompleteness(id)
 
     /** Konoha CDN episode metadata (titles, thumbnails); empty when unknown or on failure. */
     suspend fun konohaEpisodes(anilistId: Int): List<KonohaEpisode> =
