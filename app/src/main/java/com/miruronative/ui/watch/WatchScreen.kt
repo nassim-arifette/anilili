@@ -195,7 +195,8 @@ fun WatchScreen(
     // Embeds still stop — their WebView dies with this screen, so there is nothing to resume.
     val pauseAndBack = remember {
         {
-            currentEmbeddedPlaybackStopper?.invoke()
+            runCatching { currentEmbeddedPlaybackStopper?.invoke() }
+                .onFailure { DiagnosticsLog.throwable("WatchScreen embed stop on back failed", it) }
             currentPlaybackOwner?.let { owner ->
                 PlaybackService.runIfWatchPlaybackOwnerActive(owner) {
                     vm.commitPlaybackPosition()
@@ -279,13 +280,30 @@ fun WatchScreen(
     // and background media-button events are suppressed so it can't restart by itself.
     DisposableEffect(playbackOwner) {
         val owner = playbackOwner
+        val handoffRegistered = owner != null && PlaybackService.registerWatchPlaybackHandoff(owner) {
+            // A newer WatchScreen may be composed before this one is disposed. Stop the outgoing
+            // WebView and bank the latest identity-checked VM snapshot while this token is still
+            // active; the incoming token is published only after this callback returns.
+            runCatching { currentEmbeddedPlaybackStopper?.invoke() }
+                .onFailure { DiagnosticsLog.throwable("WatchScreen outgoing embed stop failed", it) }
+            runCatching { vm.commitPlaybackPosition() }
+                .onFailure { DiagnosticsLog.throwable("WatchScreen outgoing progress flush failed", it) }
+        }
+        if (owner != null) {
+            DiagnosticsLog.event(
+                "WatchScreen outgoing handoff registered=$handoffRegistered " +
+                    "generation=${owner.generation}",
+            )
+        }
         onDispose {
-            currentEmbeddedPlaybackStopper?.invoke()
+            runCatching { currentEmbeddedPlaybackStopper?.invoke() }
+                .onFailure { DiagnosticsLog.throwable("WatchScreen embed stop on dispose failed", it) }
             if (owner != null) {
                 PlaybackService.runIfWatchPlaybackOwnerActive(owner) {
                     vm.commitPlaybackPosition()
                 }
                 PlaybackService.pauseActivePlayback(owner)
+                PlaybackService.clearWatchPlaybackHandoff(owner)
                 PlaybackService.releaseWatchPlaybackOwner(owner)
             }
         }
