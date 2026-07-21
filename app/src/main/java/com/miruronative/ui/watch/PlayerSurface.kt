@@ -95,6 +95,7 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.DefaultQuality
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.playerErrorDiagnosticCategory
 import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import com.miruronative.playback.LocalPlaybackOwnerToken
 import com.miruronative.playback.CastSourceDecision

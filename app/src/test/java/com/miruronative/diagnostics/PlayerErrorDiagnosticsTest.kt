@@ -1,4 +1,4 @@
-package com.miruronative.ui.watch
+package com.miruronative.diagnostics
 
 import org.junit.Assert.assertEquals
 import org.junit.Test

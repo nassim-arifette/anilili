@@ -1,4 +1,4 @@
-package com.miruronative.ui.watch
+package com.miruronative.diagnostics
 
 /** Stable categories for diagnostics; never derived from exception messages or remote content. */
 internal fun playerErrorDiagnosticCategory(errorCode: Int): String = when {
