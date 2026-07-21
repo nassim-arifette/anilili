@@ -209,12 +209,14 @@ class MainActivity : FragmentActivity() {
         val url = intent?.dataString ?: return
         if (!AuthManager.isRedirect(url)) return
         DiagnosticsLog.event("Auth redirect received")
-        AuthManager.extractToken(url)?.let { token ->
-            AuthManager.setToken(token)
-            LibraryStore.syncSavedToRemote()
-            pendingRoute = Routes.MORE
-            DiagnosticsLog.event("Auth redirect accepted")
+        val authorization = AuthManager.extractToken(url) ?: return
+        if (!AuthManager.setToken(authorization)) {
+            DiagnosticsLog.event("Auth redirect ignored: login was superseded")
+            return
         }
+        LibraryStore.syncSavedToRemote()
+        pendingRoute = Routes.MORE
+        DiagnosticsLog.event("Auth redirect accepted")
     }
 
     override fun onStop() {

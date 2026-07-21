@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.miruronative.data.AppGraph
 import com.miruronative.data.auth.AccountService
+import com.miruronative.data.auth.AniListAuthorizationToken
 import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.auth.MalAuthorizationCode
 import com.miruronative.data.auth.MalAuthManager
@@ -95,8 +96,8 @@ class ProfileViewModel : ViewModel() {
 
     fun refresh() = loadIfLoggedIn(refresh = true)
 
-    fun onLoggedIn(token: String) {
-        AuthManager.setToken(token)
+    fun onLoggedIn(authorization: AniListAuthorizationToken) {
+        if (!AuthManager.setToken(authorization)) return
         LibraryStore.syncSavedToRemote()
         loadIfLoggedIn()
     }

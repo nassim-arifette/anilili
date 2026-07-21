@@ -26,7 +26,6 @@ object AuthManager {
 
     private lateinit var tokenStore: SecureTokenStore
     private lateinit var appContext: Context
-    private var pendingOAuthState: String? = null
     private val tokenSession = AuthTokenSession()
 
     private val _token = MutableStateFlow<String?>(null)
@@ -36,9 +35,9 @@ object AuthManager {
         appContext = context.applicationContext
         tokenStore = SecureTokenStore(appContext)
         val restoredToken = tokenStore.load()?.takeUnless(::isJwtExpired)
-        tokenSession.replace(restoredToken) {
-            _token.value = restoredToken
-            if (restoredToken == null) tokenStore.clear()
+        tokenSession.replace(restoredToken) { token ->
+            _token.value = token
+            if (token == null) tokenStore.clear()
         }
     }
 
@@ -47,7 +46,6 @@ object AuthManager {
         clearExpired = {
             tokenStore.clear()
             _token.value = null
-            pendingOAuthState = null
             AniListNotificationPushManager.clearDelivered(appContext)
         },
     )
@@ -58,7 +56,7 @@ object AuthManager {
     fun authorizeUrl(): String {
         val state = ByteArray(24).also(SecureRandom()::nextBytes)
             .let { Base64.encodeToString(it, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING) }
-        pendingOAuthState = state
+        tokenSession.beginLogin(state)
         // AniList's implicit flow uses the redirect registered for the client. Supplying the same
         // redirect explicitly currently makes its post-login grant step fail with unsupported_grant_type.
         return Uri.parse(AUTHORIZE_ENDPOINT).buildUpon()
@@ -69,16 +67,16 @@ object AuthManager {
             .toString()
     }
 
-    fun setToken(token: String) {
-        val normalized = token.trim()
-        require(normalized.isNotEmpty()) { "AniList returned an empty token" }
-        tokenSession.replace(normalized) {
-            tokenStore.save(normalized)
-            _token.value = normalized
-            pendingOAuthState = null
+    /** Persists a callback only if no newer login/session mutation superseded it. */
+    fun setToken(authorization: AniListAuthorizationToken): Boolean {
+        val committed = tokenSession.replaceLoginIfCurrent(authorization) { token ->
+            tokenStore.save(token)
+            _token.value = token
         }
+        if (!committed) return false
         AniListNotificationPushManager.clearDelivered(appContext)
         ReleaseSyncScheduler.runNow(appContext)
+        return true
     }
 
     fun logout() {
@@ -91,24 +89,35 @@ object AuthManager {
         return uri.scheme == "http" && uri.host == "localhost" && uri.fragment?.contains("access_token=") == true
     }
 
-    fun extractToken(url: String): String? {
+    fun extractToken(url: String): AniListAuthorizationToken? {
         if (!isRedirect(url)) return null
         val uri = Uri.parse(url)
         val fragment = Uri.parse("$REDIRECT/?${uri.fragment.orEmpty()}")
-        val expectedState = pendingOAuthState ?: return null
-        if (fragment.getQueryParameter("state") != expectedState) return null
-        return fragment.getQueryParameter("access_token")?.takeIf { it.isNotBlank() }
+        return tokenSession.claimToken(
+            state = fragment.getQueryParameter("state"),
+            token = fragment.getQueryParameter("access_token"),
+        )
     }
 
     private fun clearToken(scheduleSync: Boolean) {
         tokenSession.replace(null) {
             tokenStore.clear()
             _token.value = null
-            pendingOAuthState = null
         }
         AniListNotificationPushManager.clearDelivered(appContext)
         if (scheduleSync) ReleaseSyncScheduler.runNow(appContext)
     }
+
+    /** Auth generation used to reject UI results loaded for a replaced account. */
+    internal fun sessionGeneration(): Long? = tokenSession.authenticatedGeneration()
+
+    /** Compares the generation and publishes [change] under the auth-session lock. */
+    internal fun commitIfSessionCurrent(generation: Long, change: () -> Unit): Boolean =
+        tokenSession.commitIfGenerationCurrent(generation, change)
+
+    /** Publishes [change] atomically only while AniList remains logged out. */
+    internal fun commitIfLoggedOut(change: () -> Unit): Boolean =
+        tokenSession.commitIfLoggedOut(change)
 }
 
 private val jwtJson = Json { ignoreUnknownKeys = true }

@@ -69,4 +69,17 @@ class SessionGateTest {
         assertTrue(gate.isCurrent(refresh))
         assertEquals("fresh", token)
     }
+
+    @Test
+    fun `raw generation commit has the same atomic invalidation semantics`() {
+        val gate = SessionGate()
+        var published = "none"
+        val generation = gate.generationSnapshot()
+
+        assertTrue(gate.commitIfGenerationCurrent(generation) { published = "current" })
+        gate.invalidate {}
+        assertFalse(gate.commitIfGenerationCurrent(generation) { published = "stale" })
+
+        assertEquals("current", published)
+    }
 }
