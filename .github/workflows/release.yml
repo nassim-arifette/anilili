@@ -259,7 +259,7 @@ jobs:
           apk_name="anilili-plus-v${{ needs.build.outputs.version }}.apk"
           sha256sum --check "${apk_name}.sha256"
 
-      - name: Create GitHub Release without replacing an existing tag
+      - name: Publish a fully populated immutable GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -269,6 +269,19 @@ jobs:
           CHECKSUM_NAME: anilili-plus-v${{ needs.build.outputs.version }}.apk.sha256
         run: |
           set -euo pipefail
+          api_version="2026-03-10"
+
+          immutable_enabled="$(
+            gh api \
+              -H "X-GitHub-Api-Version: $api_version" \
+              "repos/$GITHUB_REPOSITORY/immutable-releases" \
+              --jq '.enabled' 2>/dev/null || true
+          )"
+          if [ "$immutable_enabled" != "true" ]; then
+            echo "Repository release immutability must be enabled before publishing" >&2
+            exit 1
+          fi
+
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG already exists and will not be replaced" >&2
             exit 1
@@ -277,11 +290,109 @@ jobs:
             echo "Tag $TAG already exists and will not be moved" >&2
             exit 1
           fi
-          gh release create "$TAG" \
+
+          release_id=""
+          published=false
+          cleanup_draft() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ] && [ "$published" != "true" ] && [ -n "$release_id" ]; then
+              gh api --method DELETE \
+                -H "X-GitHub-Api-Version: $api_version" \
+                "repos/$GITHUB_REPOSITORY/releases/$release_id" >/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup_draft EXIT
+
+          release_json="$(
+            gh api --method POST \
+              -H "X-GitHub-Api-Version: $api_version" \
+              "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$TAG" \
+              -f target_commitish="$GITHUB_SHA" \
+              -f name="AniLili+ v$VERSION" \
+              -F draft=true \
+              -F generate_release_notes=true
+          )"
+          release_id="$(jq -er '.id' <<< "$release_json")"
+          jq -e \
+            --arg tag "$TAG" \
+            --arg target "$GITHUB_SHA" \
+            '.draft == true and .immutable == false and .tag_name == $tag and .target_commitish == $target' \
+            <<< "$release_json" >/dev/null
+
+          gh release upload "$TAG" \
             "dist/$APK_NAME" \
             "dist/$CHECKSUM_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "AniLili+ v$VERSION" \
-            --generate-notes \
-            --latest
+            --repo "$GITHUB_REPOSITORY"
+
+          draft_json=""
+          for attempt in $(seq 1 15); do
+            draft_json="$(
+              gh api \
+                -H "X-GitHub-Api-Version: $api_version" \
+                "repos/$GITHUB_REPOSITORY/releases/$release_id"
+            )"
+            if jq -e \
+              --arg apk "$APK_NAME" \
+              --arg checksum "$CHECKSUM_NAME" \
+              '.draft == true and
+               ([.assets[] | select(.state == "uploaded") | .name] | sort) == ([$apk, $checksum] | sort) and
+               all(.assets[].digest; if type == "string" then startswith("sha256:") else false end)' \
+              <<< "$draft_json" >/dev/null
+            then
+              break
+            fi
+            if [ "$attempt" -eq 15 ]; then
+              echo "Uploaded assets did not become verifiable in time" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          jq -e \
+            --arg apk "$APK_NAME" \
+            --arg checksum "$CHECKSUM_NAME" \
+            '.draft == true and
+             ([.assets[] | select(.state == "uploaded") | .name] | sort) == ([$apk, $checksum] | sort) and
+             all(.assets[].digest; if type == "string" then startswith("sha256:") else false end)' \
+            <<< "$draft_json" >/dev/null
+
+          for path in "dist/$APK_NAME" "dist/$CHECKSUM_NAME"; do
+            name="$(basename "$path")"
+            expected="sha256:$(sha256sum "$path" | awk '{print $1}')"
+            actual="$(jq -er --arg name "$name" '.assets[] | select(.name == $name) | .digest' <<< "$draft_json")"
+            if [ "$actual" != "$expected" ]; then
+              echo "Uploaded asset digest mismatch for $name" >&2
+              exit 1
+            fi
+          done
+
+          published_json="$(
+            gh api --method PATCH \
+              -H "X-GitHub-Api-Version: $api_version" \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -F draft=false \
+              -f make_latest=true
+          )"
+          published=true
+          jq -e \
+            --arg tag "$TAG" \
+            --arg target "$GITHUB_SHA" \
+            --arg apk "$APK_NAME" \
+            --arg checksum "$CHECKSUM_NAME" \
+            '.draft == false and .immutable == true and .tag_name == $tag and
+             .target_commitish == $target and
+             ([.assets[] | select(.state == "uploaded") | .name] | sort) == ([$apk, $checksum] | sort)' \
+            <<< "$published_json" >/dev/null
+
+          tag_target="$(
+            gh api \
+              -H "X-GitHub-Api-Version: $api_version" \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+              --jq '.object.sha'
+          )"
+          if [ "$tag_target" != "$GITHUB_SHA" ]; then
+            echo "Published immutable tag does not point to the reviewed main commit" >&2
+            exit 1
+          fi
