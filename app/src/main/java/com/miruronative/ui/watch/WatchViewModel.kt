@@ -766,7 +766,11 @@ class WatchViewModel : ViewModel() {
             )
             return false
         }
-        val completedFinalEpisode = !data.hasNext
+        val completedFinalEpisode = isConfirmedFinalSeriesEpisode(
+            episodeNumber = commit.identity.episodeNumber,
+            totalEpisodes = totalEpisodes,
+            hasNextEpisode = data.hasNext,
+        )
         if (
             !LibraryStore.updateProgressDurably(
                 anilistId = progressIdentity.animeId,
@@ -852,6 +856,11 @@ class WatchViewModel : ViewModel() {
             )
             return false
         }
+        val completedFinalEpisode = isConfirmedFinalSeriesEpisode(
+            episodeNumber = commit.playbackKey.episodeNumber,
+            totalEpisodes = totalEpisodes,
+            hasNextEpisode = data.hasNext,
+        )
         val entry = HistoryEntry(
             anilistId = commit.playbackKey.animeId,
             title = data.seriesTitle,
@@ -862,7 +871,7 @@ class WatchViewModel : ViewModel() {
             category = commit.playbackKey.category,
             positionMs = commit.positionMs,
             durationMs = commit.durationMs,
-            completed = !data.hasNext,
+            completed = completedFinalEpisode,
         )
         if (!LibraryStore.upsertHistoryDurably(entry)) {
             DiagnosticsLog.event(
@@ -876,7 +885,7 @@ class WatchViewModel : ViewModel() {
             persisted.episodeNumber != commit.playbackKey.episodeNumber ||
             persisted.positionMs != commit.positionMs ||
             persisted.durationMs != commit.durationMs ||
-            persisted.completed != !data.hasNext
+            persisted.completed != completedFinalEpisode
         ) {
             DiagnosticsLog.event(
                 "Watch embed end persistence verification failed " +
