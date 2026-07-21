@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "MiruroNative"
+rootProject.name = "AniLiliPlus"
 include(":app")

@@ -30,8 +30,7 @@ impact, with playback reliability and continuity first. Bugs and technical defec
 - [ ] Add library filters for status, format, genre, release season, dubbed/subbed availability,
   and unwatched episodes.
 - [ ] Add a release calendar with timezone-aware airing times and per-series notification rules.
-- [ ] Add user profiles with independent history, watchlists, subtitle defaults, and parental
-  controls.
+- [ ] Add user profiles with independent history, watchlists, subtitle defaults
 - [ ] Add related-season navigation and an ordered franchise view for sequels, prequels, specials,
   and movies.
 - [ ] Add smart search suggestions, recent searches, typo tolerance, and provider availability in

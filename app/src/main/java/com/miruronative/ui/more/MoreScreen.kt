@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.miruronative.BuildConfig
 import com.miruronative.R
 import com.miruronative.ui.components.ScrollAwareTopBar
 
@@ -61,7 +62,11 @@ fun MoreScreen(modifier: Modifier = Modifier) {
                 style = MaterialTheme.typography.bodyMedium,
             )
             Spacer(Modifier.height(24.dp))
-            Text("Version 0.1.0", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
+            Text(
+                "Version ${BuildConfig.VERSION_NAME}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
         }
     }
 }

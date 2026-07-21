@@ -3,6 +3,7 @@
 
 # Android and Gradle output
 .gradle/
+.gradle-*/
 .kotlin/
 build/
 app/build/

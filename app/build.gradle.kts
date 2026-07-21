@@ -13,22 +13,54 @@ val keystoreProperties = Properties().apply {
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
+val forkApplicationId = "com.nassimarifette.anililiplus"
+val requiredReleaseSigningProperties = listOf(
+    "storeFile",
+    "storePassword",
+    "keyAlias",
+    "keyPassword",
+)
+val releaseSigningConfigured = requiredReleaseSigningProperties.all {
+    !keystoreProperties.getProperty(it).isNullOrBlank()
+}
+val allowUnsignedRelease = providers.gradleProperty("allowUnsignedRelease").orNull == "true"
+val useReleaseSigning = releaseSigningConfigured && !allowUnsignedRelease
+val releaseTaskRequested = gradle.startParameter.taskNames.any { requestedTask ->
+    val taskName = requestedTask.substringAfterLast(':')
+    taskName.contains("release", ignoreCase = true) &&
+        listOf("assemble", "bundle", "package", "install", "publish").any {
+            taskName.startsWith(it, ignoreCase = true)
+        }
+}
+if (releaseTaskRequested && !releaseSigningConfigured && !allowUnsignedRelease) {
+    val missing = requiredReleaseSigningProperties.filter { keystoreProperties.getProperty(it).isNullOrBlank() }
+    if (missing.isNotEmpty()) {
+        throw GradleException(
+            "Release signing is not configured. Missing keystore.properties values: ${missing.joinToString()}",
+        )
+    }
+}
+
 android {
     namespace = "com.miruronative"
     compileSdk = 36
     buildToolsVersion = "35.0.1"
 
     defaultConfig {
-        applicationId = "com.miruronative"
+        // The fork has its own application id because it cannot use the original author's
+        // signing key. This lets AniLili+ coexist with the original app; every AniLili+ release
+        // must keep this id and the same release key so Android accepts in-app updates.
+        applicationId = forkApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 28
-        versionName = "0.1.27"
+        versionCode = 29
+        versionName = "0.2.0"
+        resValue("string", "application_id", forkApplicationId)
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
-        create("release") {
+        if (useReleaseSigning) create("release") {
             val storePath = keystoreProperties.getProperty("storeFile")
             if (storePath != null) {
                 storeFile = rootProject.file(storePath)
@@ -42,15 +74,20 @@ android {
     buildTypes {
         debug {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
-            // TEMP: install alongside the release build as com.miruronative.debug so testing
-            // never collides with (and forces an uninstall of) the release's LibraryStore data.
+            // Install debug builds alongside the signed release so testing never collides with
+            // (and forces an uninstall of) the release's LibraryStore data.
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            resValue("string", "application_id", "$forkApplicationId.debug")
+            buildConfigField("boolean", "UPDATE_ENABLED", "false")
         }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("release")
+            if (useReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+            buildConfigField("boolean", "UPDATE_ENABLED", "true")
             manifestPlaceholders["usesCleartextTraffic"] = "false"
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -76,7 +113,8 @@ android {
 
     applicationVariants.all {
         outputs.all {
-            (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl).outputFileName = "anilili.apk"
+            (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl).outputFileName =
+                if (buildType.name == "release") "anilili-plus.apk" else "anilili-plus-debug.apk"
         }
     }
 }

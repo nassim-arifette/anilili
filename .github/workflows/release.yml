@@ -1,0 +1,300 @@
+name: Publish signed APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build unsigned APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_code: ${{ steps.version.outputs.version_code }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d # v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+
+      - name: Install required Android SDK packages
+        shell: bash
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.1"
+
+      - name: Validate source and release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --no-tags
+          main_sha="$(git rev-parse origin/main)"
+          if [ "$GITHUB_SHA" != "$main_sha" ]; then
+            echo "Releases must be built from the exact current main commit ($main_sha)" >&2
+            exit 1
+          fi
+
+          version="$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p' app/build.gradle.kts | head -n 1)"
+          version_code="$(sed -n 's/^[[:space:]]*versionCode = \([0-9][0-9]*\)/\1/p' app/build.gradle.kts | head -n 1)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "versionName must contain exactly three numeric components" >&2
+            exit 1
+          fi
+          if [[ ! "$version_code" =~ ^[1-9][0-9]*$ ]]; then
+            echo "versionCode must be a positive integer" >&2
+            exit 1
+          fi
+
+          tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Gradle version $tag" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests, lint, and unsigned release build
+        shell: bash
+        run: ./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease -PallowUnsignedRelease=true
+
+      - name: Upload unsigned APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-release-${{ github.sha }}
+          path: app/build/outputs/apk/release/anilili-plus.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign and verify APK
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      apk_name: ${{ steps.package.outputs.apk_name }}
+      checksum_name: ${{ steps.package.outputs.checksum_name }}
+
+    steps:
+      - name: Download unsigned APK
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-release-${{ github.sha }}
+          path: unsigned
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+
+      - name: Install Android build tools
+        shell: bash
+        run: sdkmanager "build-tools;35.0.1"
+
+      - name: Sign with the protected release identity
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for value in \
+            ANDROID_KEYSTORE_BASE64 \
+            ANDROID_KEYSTORE_PASSWORD \
+            ANDROID_KEY_ALIAS \
+            ANDROID_KEY_PASSWORD
+          do
+            if [ -z "${!value:-}" ]; then
+              echo "Missing protected release secret: $value" >&2
+              exit 1
+            fi
+          done
+
+          keystore="$RUNNER_TEMP/anilili-plus-release.jks"
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          mkdir -p dist
+          apk="dist/anilili-plus-v${{ needs.build.outputs.version }}.apk"
+          "$ANDROID_HOME/build-tools/35.0.1/zipalign" \
+            -P 16 -f 4 \
+            unsigned/anilili-plus.apk \
+            "$RUNNER_TEMP/anilili-plus-aligned.apk"
+          "$ANDROID_HOME/build-tools/35.0.1/apksigner" sign \
+            --ks "$keystore" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "$apk" \
+            "$RUNNER_TEMP/anilili-plus-aligned.apk"
+
+      - name: Verify package, version, signer, and monotonic version code
+        id: package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SIGNING_CERT_SHA256: 8e6074abb7c1ff62ffd288ac273690fcaa0423ef6fd4098ca4246bb6b80b4044
+        run: |
+          set -euo pipefail
+          version="${{ needs.build.outputs.version }}"
+          version_code="${{ needs.build.outputs.version_code }}"
+          apk_name="anilili-plus-v${version}.apk"
+          checksum_name="${apk_name}.sha256"
+          apk="dist/$apk_name"
+
+          badging="$("$ANDROID_HOME/build-tools/35.0.1/aapt" dump badging "$apk" | head -n 1)"
+          grep -Fq "package: name='com.nassimarifette.anililiplus'" <<< "$badging"
+          grep -Fq "versionCode='$version_code'" <<< "$badging"
+          grep -Fq "versionName='$version'" <<< "$badging"
+          "$ANDROID_HOME/build-tools/35.0.1/zipalign" -c -P 16 -v 4 "$apk"
+
+          signature="$("$ANDROID_HOME/build-tools/35.0.1/apksigner" verify --verbose --print-certs "$apk")"
+          printf '%s\n' "$signature"
+          grep -Fq "Number of signers: 1" <<< "$signature"
+          actual_cert="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' <<< "$signature" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+          if [ "$actual_cert" != "$EXPECTED_SIGNING_CERT_SHA256" ]; then
+            echo "Release APK signing certificate does not match the pinned identity" >&2
+            exit 1
+          fi
+
+          latest_path="$RUNNER_TEMP/latest-release.json"
+          latest_status="$(curl --silent --show-error --location \
+            --output "$latest_path" \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/latest")"
+          if [ "$latest_status" = "200" ]; then
+            latest="$(cat "$latest_path")"
+            mapfile -t previous_urls < <(
+              jq -r '.assets[] | select(.state == "uploaded") | select((.name | startswith("anilili-plus-v")) and (.name | endswith(".apk"))) | .browser_download_url' <<< "$latest"
+            )
+            if [ "${#previous_urls[@]}" -ne 1 ]; then
+              echo "Previous latest release does not contain exactly one AniLili+ APK" >&2
+              exit 1
+            fi
+            curl --fail --location --silent --show-error \
+              --output "$RUNNER_TEMP/previous.apk" "${previous_urls[0]}"
+            previous_badging="$("$ANDROID_HOME/build-tools/35.0.1/aapt" dump badging "$RUNNER_TEMP/previous.apk" | head -n 1)"
+            grep -Fq "package: name='com.nassimarifette.anililiplus'" <<< "$previous_badging"
+            previous_code="$(sed -n "s/.*versionCode='\([0-9][0-9]*\)'.*/\1/p" <<< "$previous_badging")"
+            previous_version="$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<< "$previous_badging")"
+            if [ -z "$previous_code" ] || [ "$version_code" -le "$previous_code" ]; then
+              echo "versionCode $version_code must exceed previous release code $previous_code" >&2
+              exit 1
+            fi
+            if [[ ! "$previous_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Previous release has an unsupported versionName: $previous_version" >&2
+              exit 1
+            fi
+            IFS=. read -r previous_major previous_minor previous_patch <<< "$previous_version"
+            IFS=. read -r current_major current_minor current_patch <<< "$version"
+            if ! ((
+              10#$current_major > 10#$previous_major ||
+              (10#$current_major == 10#$previous_major && 10#$current_minor > 10#$previous_minor) ||
+              (10#$current_major == 10#$previous_major && 10#$current_minor == 10#$previous_minor && 10#$current_patch > 10#$previous_patch)
+            )); then
+              echo "versionName $version must be newer than previous release $previous_version" >&2
+              exit 1
+            fi
+            previous_signature="$("$ANDROID_HOME/build-tools/35.0.1/apksigner" verify --verbose --print-certs "$RUNNER_TEMP/previous.apk")"
+            grep -Fq "Number of signers: 1" <<< "$previous_signature"
+            previous_cert="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' <<< "$previous_signature" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+            if [ "$previous_cert" != "$EXPECTED_SIGNING_CERT_SHA256" ]; then
+              echo "Previous release does not use the pinned signing identity" >&2
+              exit 1
+            fi
+          elif [ "$latest_status" != "404" ]; then
+            echo "GitHub latest-release lookup failed with HTTP $latest_status" >&2
+            exit 1
+          fi
+
+          (cd dist && sha256sum "$apk_name" > "$checksum_name")
+          echo "apk_name=$apk_name" >> "$GITHUB_OUTPUT"
+          echo "checksum_name=$checksum_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified signed APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-release-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish immutable GitHub Release
+    needs:
+      - build
+      - sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified signed APK
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed-release-${{ github.sha }}
+          path: dist
+
+      - name: Verify downloaded workflow artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check "${{ needs.sign.outputs.checksum_name }}"
+
+      - name: Create immutable GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          APK_NAME: ${{ needs.sign.outputs.apk_name }}
+          CHECKSUM_NAME: ${{ needs.sign.outputs.checksum_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists and will not be replaced" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]] && \
+             gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists and will not be moved" >&2
+            exit 1
+          fi
+          gh release create "$TAG" \
+            "dist/$APK_NAME" \
+            "dist/$CHECKSUM_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "AniLili+ v$VERSION" \
+            --generate-notes \
+            --latest

@@ -1,6 +1,6 @@
-# Anilili
+# AniLili+
 
-Anilili is a native Android anime streaming client built with Kotlin, Jetpack Compose, and
+AniLili+ is a native Android anime streaming client built with Kotlin, Jetpack Compose, and
 Media3. Metadata, login, library lists, and progress sync are powered by AniList, while
 episodes and stream sources are resolved from multiple providers: Miruro, AniKoto,
 ReAnime, AniZone, AnimeGG, AniNeko, and 2DHive.
@@ -14,8 +14,11 @@ streams play with ExoPlayer; embed providers and fallback playback use WebView.
 
 ## Screenshots
 
+These screenshots predate the AniLili+ rebrand; refreshed launcher and in-app captures remain on the
+documentation backlog.
+
 <p align="center">
-  <a href="showcase/mobile/01-home.webp"><img src="showcase/mobile/01-home.webp" width="180" alt="Anilili home screen" /></a>
+  <a href="showcase/mobile/01-home.webp"><img src="showcase/mobile/01-home.webp" width="180" alt="AniLili+ home screen" /></a>
   <a href="showcase/mobile/02-browse.webp"><img src="showcase/mobile/02-browse.webp" width="180" alt="Anime browse screen" /></a>
   <a href="showcase/mobile/03-filters.webp"><img src="showcase/mobile/03-filters.webp" width="180" alt="Catalog filters" /></a>
 </p>
@@ -49,6 +52,7 @@ streams play with ExoPlayer; embed providers and fallback playback use WebView.
 | `docs/PIPE_PROTOCOL.md` | Notes about the Miruro pipe format |
 | `docs/KNOWN_ISSUES.md` | Checklist of fixed and remaining issues from code review |
 | `docs/FEATURE_IDEAS.md` | Prioritized product and playback feature backlog |
+| `docs/RELEASING.md` | Signed GitHub Release and in-app update procedure |
 | `showcase/mobile` | Six optimized 540×1170 WebP screenshots |
 
 ## Build
@@ -78,7 +82,21 @@ On Windows, use:
 gradlew.bat assembleDebug
 ```
 
-The debug APK is generated at `app/build/outputs/apk/debug/anilili.apk`.
+The debug APK is generated at `app/build/outputs/apk/debug/anilili-plus-debug.apk`.
+
+## Updates
+
+AniLili+ checks this fork's latest GitHub Release on launch; successful automatic checks are
+throttled to once every 12 hours by default. When a newer signed APK exists, the app prompts the
+user to download it and then to open Android's package installer. Android requires user approval
+for both steps; only the update check is automatic. See `docs/RELEASING.md` for the stable
+signing-key and publication workflow.
+
+AniLili+ installs beside the original Anilili application. Android does not transfer data between
+different application ids, so the first AniLili+ install starts with fresh settings, history, local
+watchlist, and login sessions. After moving over, disable reminders in or uninstall the original app
+to avoid duplicate notifications and Android TV Watch Next rows. Later AniLili+ updates preserve
+AniLili+ data normally.
 
 ## Notes
 
