@@ -79,6 +79,76 @@ class WatchPlaybackPolicyTest {
     }
 
     @Test
+    fun `pending teardown forces a surface free player mode`() {
+        WatchPlayerMode.entries
+            .filterNot { it == WatchPlayerMode.INACTIVE }
+            .forEach { desired ->
+                assertEquals(
+                    WatchPlayerMode.INACTIVE,
+                    playerModeForPlaybackTransition(
+                        desiredMode = desired,
+                        isResolving = false,
+                        teardownGeneration = 42,
+                    ),
+                )
+            }
+    }
+
+    @Test
+    fun `stable playback keeps the desired player mode`() {
+        WatchPlayerMode.entries.forEach { desired ->
+            assertEquals(
+                desired,
+                playerModeForPlaybackTransition(
+                    desiredMode = desired,
+                    isResolving = false,
+                    teardownGeneration = null,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `teardown acknowledgement waits for inactive mode to be committed`() {
+        assertFalse(
+            canAcknowledgePlaybackTeardown(
+                teardownGeneration = 42,
+                requestedMode = WatchPlayerMode.INACTIVE,
+                renderedMode = WatchPlayerMode.EMBED,
+            ),
+        )
+        assertTrue(
+            canAcknowledgePlaybackTeardown(
+                teardownGeneration = 42,
+                requestedMode = WatchPlayerMode.INACTIVE,
+                renderedMode = WatchPlayerMode.INACTIVE,
+            ),
+        )
+    }
+
+    @Test
+    fun `route start cannot expose retained success before replacement state is observed`() {
+        assertFalse(
+            canAuthorizeStartedRoute(
+                previousStateWasSuccess = true,
+                replacementStateObserved = false,
+            ),
+        )
+        assertTrue(
+            canAuthorizeStartedRoute(
+                previousStateWasSuccess = true,
+                replacementStateObserved = true,
+            ),
+        )
+        assertTrue(
+            canAuthorizeStartedRoute(
+                previousStateWasSuccess = false,
+                replacementStateObserved = false,
+            ),
+        )
+    }
+
+    @Test
     fun `surface lease accepts work while active`() {
         val lease = NativePlaybackSurfaceLease()
         var calls = 0

@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.miruronative.data.AppGraph
 import com.miruronative.data.ProviderCatalog
+import com.miruronative.data.SourceResolutionMode
 import com.miruronative.data.library.HistoryEntry
 import com.miruronative.data.library.LibraryStore
 import com.miruronative.data.auth.AccountService
@@ -66,6 +67,8 @@ data class WatchData(
     val playbackGeneration: Int = 0,
     val preferredProvider: String = DEFAULT_PREFERRED_PROVIDER,
     val isResolving: Boolean = false,
+    /** Non-null while source resolution is waiting for WatchScreen to tear down the old player. */
+    val playbackTeardownGeneration: Int? = null,
     /** The fast Miruro sources are shown; the slower Anivexa servers are still loading in. */
     val isLoadingMoreSources: Boolean = false,
     val notice: String? = null,
@@ -81,6 +84,102 @@ data class WatchSourceOption(
     val hasCurrentEpisode: Boolean,
     val episodeCount: Int,
 )
+
+internal enum class ResolutionFailurePolicy {
+    /** A user-requested Next/source/audio transition may return to the previously healthy media. */
+    RESTORE_PREVIOUS,
+
+    /** Playback-error recovery must never recreate the stream that just failed. */
+    TERMINAL,
+}
+
+/**
+ * Once natural completion has advanced history from A toward B, A is no longer a safe rollback.
+ * Recreating it at its terminal position would emit ENDED again and loop A -> missing B forever.
+ */
+internal fun effectiveResolutionFailurePolicy(
+    requestedPolicy: ResolutionFailurePolicy,
+    previousEpisodeNumber: Double?,
+    requestedEpisodeNumber: Double,
+    historyEpisodeNumber: Double?,
+    historyContinuationEpisodeNumber: Double?,
+    historyCompleted: Boolean,
+): ResolutionFailurePolicy {
+    if (requestedPolicy == ResolutionFailurePolicy.TERMINAL) return requestedPolicy
+    val continuation = historyContinuationEpisodeNumber
+    val followsCompletedPrevious = previousEpisodeNumber != null &&
+        historyEpisodeNumber == previousEpisodeNumber &&
+        !historyCompleted &&
+        continuation != null &&
+        continuation.isFinite() &&
+        continuation != historyEpisodeNumber &&
+        continuation == requestedEpisodeNumber
+    return if (followsCompletedPrevious) ResolutionFailurePolicy.TERMINAL else requestedPolicy
+}
+
+internal data class PlaybackRoutingState(
+    val preferred: String,
+    val category: Category,
+    val spine: List<EpisodeItem>,
+    val globalPreferredProvider: String,
+    val failedProviders: Set<String>,
+)
+
+internal fun routingAfterResolutionFailure(
+    policy: ResolutionFailurePolicy,
+    rollback: PlaybackRoutingState?,
+    current: PlaybackRoutingState,
+): PlaybackRoutingState = if (policy == ResolutionFailurePolicy.RESTORE_PREVIOUS && rollback != null) {
+    rollback
+} else {
+    current
+}
+
+/** Persist a user-selected provider only if that provider was the one that actually resolved. */
+internal fun preferredProviderCommitAfterResolution(
+    requestedCommit: String?,
+    resolvedProvider: String,
+): String? = requestedCommit?.takeIf { it == resolvedProvider }
+
+/** Every concrete media id that the currently visible native or embed session may report. */
+internal fun WatchData.playbackTarget(): ActivePlaybackTarget = ActivePlaybackTarget(
+    animeId = anilistId,
+    episodeNumber = current.number,
+    generation = playbackGeneration,
+    mediaIds = buildSet {
+        chosenStream?.url?.let(::add)
+        sources.streams.forEach { add(it.url) }
+    },
+)
+
+/**
+ * A failed replacement explicitly recreates the retained stream under the fresh transition
+ * generation. Clearing the ticket without changing the generation could revive callbacks from
+ * the player that was just destroyed.
+ */
+internal fun WatchData.rollbackAfterFailedResolution(
+    refreshedSourceOptions: List<WatchSourceOption>,
+    resumePositionMs: Long,
+    failureNotice: String,
+): WatchData = copy(
+    sourceOptions = refreshedSourceOptions,
+    isResolving = false,
+    playbackTeardownGeneration = null,
+    startPositionMs = resumePositionMs,
+    notice = failureNotice,
+)
+
+internal fun WatchData?.watchDataAfterFailedResolution(
+    policy: ResolutionFailurePolicy,
+    refreshedSourceOptions: List<WatchSourceOption>,
+    resumePositionMs: Long,
+    failureNotice: String,
+): WatchData? = takeIf { policy == ResolutionFailurePolicy.RESTORE_PREVIOUS }
+    ?.rollbackAfterFailedResolution(
+        refreshedSourceOptions = refreshedSourceOptions,
+        resumePositionMs = resumePositionMs,
+        failureNotice = failureNotice,
+    )
 
 private data class EpisodeSourceKey(
     val episode: Double,
@@ -149,8 +248,32 @@ class WatchViewModel : ViewModel() {
     private var mergedEpisodes = EpisodesResult(emptyList())
     private var catalogGeneration = 0L
     private val requestGate = PlaybackRequestGate()
+    private val playbackTransitionBarrier = PlaybackTransitionBarrier()
     private var pendingResolution: PendingResolution? = null
     private var playbackGenerationCounter = 0
+
+    private fun playbackRoutingState(): PlaybackRoutingState = PlaybackRoutingState(
+        preferred = preferred,
+        category = category,
+        spine = spine,
+        globalPreferredProvider = globalPreferredProvider,
+        failedProviders = failedProviders.toSet(),
+    )
+
+    private fun restorePlaybackRouting(snapshot: PlaybackRoutingState) {
+        preferred = snapshot.preferred
+        category = snapshot.category
+        spine = snapshot.spine
+        globalPreferredProvider = snapshot.globalPreferredProvider
+        failedProviders = snapshot.failedProviders.toMutableSet()
+    }
+
+    internal fun isStartedFor(
+        id: Int,
+        providerName: String,
+        categoryApi: String,
+        episodeNumber: String,
+    ): Boolean = startedKey == "$id/$providerName/$categoryApi/$episodeNumber"
 
     fun start(id: Int, providerName: String, categoryApi: String, episodeNumber: String) {
         val key = "$id/$providerName/$categoryApi/$episodeNumber"
@@ -159,7 +282,7 @@ class WatchViewModel : ViewModel() {
             return
         }
         val previous = (_state.value as? UiState.Success)?.data
-        val request = withNativeProgressFlushedBeforeTransition(previous) {
+        val request = withProgressFlushedBeforeTransition(previous) {
             requestGate.startSession()
         }
         DiagnosticsLog.event("Watch start key=$key")
@@ -192,12 +315,14 @@ class WatchViewModel : ViewModel() {
         anivexaMergeJob?.cancel()
         miruroLateMergeJob?.cancel()
         sourceValidationJob?.cancel()
+        // WatchScreen has already committed a surface-free frame. Publish Loading synchronously
+        // before returning so authorizing this route cannot recompose the retained old WatchData.
+        _state.value = UiState.Loading
+        _loadingStatus.value = null
         // Runs beside source resolution: providers hand back bare numbered lists, so without this
         // the episode list here reads "Episode 5" where the Anime page shows the real title.
         episodeMetaJob = viewModelScope.launch { loadEpisodeMetadata(id, request) }
         resolveJob = viewModelScope.launch {
-            _state.value = UiState.Loading
-            _loadingStatus.value = null
             try {
                 SettingsStore.awaitLoaded()
                 ensureCurrentRequest(request)
@@ -466,6 +591,9 @@ class WatchViewModel : ViewModel() {
     private suspend fun resolveAndPlay(
         number: Double,
         request: PlaybackRequestToken,
+        failurePolicy: ResolutionFailurePolicy = ResolutionFailurePolicy.RESTORE_PREVIOUS,
+        rollbackRouting: PlaybackRoutingState? = null,
+        preferredProviderToCommit: String? = null,
     ): Unit = coroutineScope {
         ensureCurrentRequest(request)
         _loadingStatus.value = null
@@ -575,13 +703,36 @@ class WatchViewModel : ViewModel() {
             val message = "No playable source for episode ${fmt(number)} on any server"
             DiagnosticsLog.event("Watch resolve no source id=$requestAnimeId episode=${fmt(number)}")
             requestGate.finishRequest(request)
-            _state.value = previous?.let {
+            val history = LibraryStore.historyFor(requestAnimeId)
+            val effectiveFailurePolicy = effectiveResolutionFailurePolicy(
+                requestedPolicy = failurePolicy,
+                previousEpisodeNumber = previous?.current?.number,
+                requestedEpisodeNumber = number,
+                historyEpisodeNumber = history?.episodeNumber,
+                historyContinuationEpisodeNumber = history?.continuationEpisodeNumber,
+                historyCompleted = history?.completed == true,
+            )
+            val currentRouting = playbackRoutingState()
+            restorePlaybackRouting(
+                routingAfterResolutionFailure(
+                    policy = effectiveFailurePolicy,
+                    rollback = rollbackRouting,
+                    current = currentRouting,
+                ),
+            )
+            val rollbackPosition = previous?.let {
+                history?.resumePositionFor(it.current.number)
+                    ?: it.startPositionMs
+            } ?: 0L
+            val rollbackData = previous.watchDataAfterFailedResolution(
+                policy = effectiveFailurePolicy,
+                refreshedSourceOptions = previous?.let { sourceOptions(it.current.number) }.orEmpty(),
+                resumePositionMs = rollbackPosition,
+                failureNotice = message,
+            )
+            _state.value = rollbackData?.let {
                 UiState.Success(
-                    it.copy(
-                        sourceOptions = sourceOptions(number),
-                        isResolving = false,
-                        notice = message,
-                    ),
+                    it,
                 )
             } ?: UiState.Error(message)
             return@coroutineScope
@@ -633,6 +784,14 @@ class WatchViewModel : ViewModel() {
             ?: error("Resolved episode ${fmt(number)} is missing from the navigation catalog")
         val resume = LibraryStore.historyFor(requestAnimeId)?.resumePositionFor(number) ?: 0L
         val chosen = pickProviderStream(playable.provider, sources)
+        preferred = playable.provider
+        preferredProviderCommitAfterResolution(
+            requestedCommit = preferredProviderToCommit,
+            resolvedProvider = playable.provider,
+        )?.let { committedProvider ->
+            globalPreferredProvider = committedProvider
+            SettingsStore.setPreferredProvider(committedProvider)
+        }
         DiagnosticsLog.event(
             "Watch resolve success provider=${playable.provider} episode=${fmt(number)} index=$index " +
                 "hls=${playable.sources.hlsStreams.size} total=${playable.sources.streams.size} " +
@@ -723,30 +882,20 @@ class WatchViewModel : ViewModel() {
             }
             return
         }
-        withNativeProgressFlushedBeforeTransition(current) {
+        val rollbackRouting = playbackRoutingState()
+        withProgressFlushedBeforeTransition(current) {
             preferred = providerName
-            if (rememberProvider) {
-                globalPreferredProvider = providerName
-                SettingsStore.setPreferredProvider(providerName)
-            }
             category = nextCategory
             // Selecting a server changes metadata priority, not which episodes are navigable. Keep
             // the category-wide union so switching source cannot silently shrink the season again.
             spine = pickNavigationSpine(mergedEpisodes, providerName, nextCategory)
             failedProviders.clear()
-            if (current != null) {
-                _state.value = UiState.Success(
-                    current.copy(
-                        preferredProvider = globalPreferredProvider,
-                        notice = if (rememberProvider) {
-                            "${ProviderCatalog.label(providerName)} is now your preferred server."
-                        } else {
-                            current.notice
-                        },
-                    ),
-                )
-            }
-            launchResolve(currentNumber, progressAlreadyFlushed = true)
+            launchResolve(
+                number = currentNumber,
+                progressAlreadyFlushed = true,
+                rollbackRouting = rollbackRouting,
+                preferredProviderToCommit = providerName.takeIf { rememberProvider },
+            )
         }
     }
 
@@ -1090,7 +1239,7 @@ class WatchViewModel : ViewModel() {
         LibraryStore.updateProgress(identity.animeId, identity.episodeNumber, positionMs, durationMs)
     }
 
-    private fun <T> withNativeProgressFlushedBeforeTransition(
+    private fun <T> withProgressFlushedBeforeTransition(
         data: WatchData?,
         transition: () -> T,
     ): T {
@@ -1109,7 +1258,7 @@ class WatchViewModel : ViewModel() {
         return flushProgressBeforeTransition(
             candidate = lastKnownProgress,
             confirmedIdentity = confirmedHistoryIdentity,
-            activeTarget = data?.nativePlaybackTarget(),
+            activeTarget = data?.playbackTarget(),
             persist = ::persistTransitionProgress,
             transition = transition,
         )
@@ -1176,16 +1325,6 @@ class WatchViewModel : ViewModel() {
         confirmedHistoryIdentity = null
         committedEmbedPlaybackKey = null
     }
-
-    private fun WatchData.playbackTarget(): ActivePlaybackTarget = ActivePlaybackTarget(
-        animeId = anilistId,
-        episodeNumber = current.number,
-        generation = playbackGeneration,
-        mediaIds = buildSet {
-            chosenStream?.url?.let { add(it) }
-            sources.streams.forEach { add(it.url) }
-        },
-    )
 
     private fun WatchData.nativePlaybackTarget(): ActivePlaybackTarget? {
         if (isResolving) return null
@@ -1315,6 +1454,13 @@ class WatchViewModel : ViewModel() {
         launchResolve(spine[index].number)
     }
 
+    fun onPlaybackTeardownComplete(generation: Int) {
+        val accepted = playbackTransitionBarrier.acknowledge(generation)
+        DiagnosticsLog.event(
+            "Watch player teardown completion generation=$generation accepted=$accepted",
+        )
+    }
+
     fun next() {
         DiagnosticsLog.event("Watch next requested")
         val cur = (_state.value as? UiState.Success)?.data?.currentIndex ?: return
@@ -1361,8 +1507,11 @@ class WatchViewModel : ViewModel() {
     /** All episode resolution goes through here so a failure becomes an error state, not a crash. */
     private fun launchResolve(
         number: Double,
-        before: (suspend () -> Unit)? = null,
+        resolvingNotice: String? = null,
         progressAlreadyFlushed: Boolean = false,
+        failurePolicy: ResolutionFailurePolicy = ResolutionFailurePolicy.RESTORE_PREVIOUS,
+        rollbackRouting: PlaybackRoutingState? = null,
+        preferredProviderToCommit: String? = null,
     ) {
         val key = EpisodeResolutionKey(
             animeId = anilistId,
@@ -1376,37 +1525,61 @@ class WatchViewModel : ViewModel() {
             return
         }
         val current = (_state.value as? UiState.Success)?.data
-        // Bank the last accepted native tick before invalidating ENDED/progress callbacks from
-        // the MediaItem being replaced. Source/category selection already did this before it
-        // changed its routing fields, hence the explicit hand-off flag.
+        // Bank the last accepted native or embed tick before invalidating callbacks from the media
+        // being replaced. Source/category selection already did this before it changed its routing
+        // fields, hence the explicit hand-off flag.
         val request = if (progressAlreadyFlushed) {
             activeNativePlaybackIdentity = null
             requestGate.nextRequest()
         } else {
-            withNativeProgressFlushedBeforeTransition(current) {
+            withProgressFlushedBeforeTransition(current) {
                 activeNativePlaybackIdentity = null
                 requestGate.nextRequest()
             }
         }
         val pending = PendingResolution(request, key)
         pendingResolution = pending
+        val teardownGeneration = current?.let { nextPlaybackGeneration() }
+        val teardownTicket = teardownGeneration?.let(playbackTransitionBarrier::begin)
         DiagnosticsLog.event(
             "Watch launchResolve episode=${fmt(number)} " +
-                "request=${request.sessionGeneration}/${request.requestGeneration}",
+                "request=${request.sessionGeneration}/${request.requestGeneration} " +
+                "teardown=${teardownGeneration ?: "none"}",
         )
-        // Publish the invalidation synchronously. PlayerSurface is reused, so its old controller
-        // can emit another tick before the resolver coroutine gets its first dispatch otherwise.
-        if (current != null && !current.isResolving) {
-            _state.value = UiState.Success(current.copy(isResolving = true, notice = null))
+        // Publish the invalidation synchronously. WatchScreen removes/stops the outgoing surface
+        // and acknowledges this generation before the resolver is allowed to make its first call.
+        if (current != null) {
+            _state.value = UiState.Success(
+                current.copy(
+                    isResolving = true,
+                    playbackGeneration = checkNotNull(teardownGeneration),
+                    playbackTeardownGeneration = teardownGeneration,
+                    notice = resolvingNotice,
+                ),
+            )
         }
         resolveJob?.cancel()
         cancelAniSkipWork()
         sourceValidationJob?.cancel()
         resolveJob = viewModelScope.launch {
             try {
-                before?.invoke()
+                teardownTicket?.let { ticket ->
+                    DiagnosticsLog.event(
+                        "Watch waiting for player teardown generation=${ticket.generation}",
+                    )
+                    playbackTransitionBarrier.await(ticket)
+                    DiagnosticsLog.event(
+                        "Watch player teardown acknowledged generation=${ticket.generation}",
+                    )
+                }
                 ensureCurrentRequest(request)
-                resolveAndPlay(number, request)
+                resolveAndPlay(
+                    number = number,
+                    request = request,
+                    failurePolicy = failurePolicy,
+                    rollbackRouting = rollbackRouting,
+                    preferredProviderToCommit = preferredProviderToCommit,
+                )
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
                 if (!requestGate.isCurrentRequest(request)) return@launch
@@ -1414,8 +1587,37 @@ class WatchViewModel : ViewModel() {
                 requestGate.finishRequest(request)
                 DiagnosticsLog.throwable("Watch resolve failed id=$anilistId episode=${fmt(number)}", e)
                 _loadingStatus.value = null
-                _state.value = UiState.Error(e.message ?: "Failed to load episode")
+                val message = e.message ?: "Failed to load episode"
+                val previous = (_state.value as? UiState.Success)?.data
+                val history = previous?.let { LibraryStore.historyFor(it.anilistId) }
+                val effectiveFailurePolicy = effectiveResolutionFailurePolicy(
+                    requestedPolicy = failurePolicy,
+                    previousEpisodeNumber = previous?.current?.number,
+                    requestedEpisodeNumber = number,
+                    historyEpisodeNumber = history?.episodeNumber,
+                    historyContinuationEpisodeNumber = history?.continuationEpisodeNumber,
+                    historyCompleted = history?.completed == true,
+                )
+                restorePlaybackRouting(
+                    routingAfterResolutionFailure(
+                        policy = effectiveFailurePolicy,
+                        rollback = rollbackRouting,
+                        current = playbackRoutingState(),
+                    ),
+                )
+                val rollbackPosition = previous?.let { data ->
+                    history?.resumePositionFor(data.current.number)
+                        ?: data.startPositionMs
+                } ?: 0L
+                val rollbackData = previous.watchDataAfterFailedResolution(
+                    policy = effectiveFailurePolicy,
+                    refreshedSourceOptions = previous?.let { sourceOptions(it.current.number) }.orEmpty(),
+                    resumePositionMs = rollbackPosition,
+                    failureNotice = message,
+                )
+                _state.value = rollbackData?.let { UiState.Success(it) } ?: UiState.Error(message)
             } finally {
+                teardownTicket?.let(playbackTransitionBarrier::finish)
                 if (pendingResolution?.token == request) pendingResolution = null
             }
         }
@@ -1423,6 +1625,7 @@ class WatchViewModel : ViewModel() {
 
     private fun invalidatePendingResolution() {
         pendingResolution = null
+        playbackTransitionBarrier.cancel()
     }
 
     private fun launchLateAniSkipPublication(
@@ -1491,7 +1694,7 @@ class WatchViewModel : ViewModel() {
         val data = (_state.value as? UiState.Success)?.data ?: return
         if (data.isResolving) return
         captureNativeFailureProgress(data, streamUrl, positionMs)
-        withNativeProgressFlushedBeforeTransition(data) {
+        withProgressFlushedBeforeTransition(data) {
             activeNativePlaybackIdentity = null
         }
         DiagnosticsLog.event(
@@ -1536,14 +1739,13 @@ class WatchViewModel : ViewModel() {
 
         failedProviders += data.provider
         unavailableSources += EpisodeSourceKey(data.current.number, data.provider, data.category)
-        launchResolve(data.current.number, before = {
-            _state.value = UiState.Success(
-                data.copy(
-                    isResolving = true,
-                    notice = "${ProviderCatalog.label(data.provider)} failed: $message. Trying another source…",
-                ),
-            )
-        }, progressAlreadyFlushed = true)
+        launchResolve(
+            number = data.current.number,
+            resolvingNotice =
+                "${ProviderCatalog.label(data.provider)} failed: $message. Trying another source…",
+            progressAlreadyFlushed = true,
+            failurePolicy = ResolutionFailurePolicy.TERMINAL,
+        )
     }
 
     /** Reject failures queued by a MediaItem after another episode/source has taken ownership. */
@@ -1624,6 +1826,7 @@ class WatchViewModel : ViewModel() {
                                 episodes = episodesSnapshot,
                                 excludedProviders = providerNames - option.provider,
                                 maxAttempts = 1,
+                                mode = SourceResolutionMode.BACKGROUND_VALIDATION,
                             )
                         }.onFailure {
                             it.rethrowIfCancellation()

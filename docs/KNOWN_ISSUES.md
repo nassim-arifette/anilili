@@ -19,6 +19,8 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | PLAY-005 | [x] | Prevent a late Cast disconnect from restarting local audio after the Watch UI has gone away. | `fix/cast-background-disconnect` |
 | PLAY-006 | [x] | Recreate Embed, Pipe, and Login WebViews after renderer loss, while keeping timer and lifecycle changes instance-local. | `fix/webview-renderer-recreation`, `fix/webview-local-lifecycle` |
 | PLAY-007 | [x] | Scope decoder retries and native Compose state to a logical playback session instead of a reusable URL. | `fix/player-decoder-retry-per-playback`, `fix/native-playback-session-state` |
+| PLAY-008 | [x] | Prevent background SUB/DUB validation from opening hidden media pages; remove and stop the outgoing player before replacement resolution; silence and blank reused embeds; pause and reversibly hide reachable overlapping long-form media; and never synthesize an unacknowledged Kiwi fallback tap. | `fix/player-transition-isolation` |
+| PLAY-009 | [x] | Preserve the last verified native/embed position across player teardown, restore the previous source/audio routing after a failed user transition, and never resurrect a stream that already failed during automatic recovery. | `fix/player-transition-isolation` |
 
 ### Episode and source resolution
 
@@ -81,11 +83,14 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 - [ ] **OPEN-001 - Cross-origin embed telemetry.** Browser same-origin policy prevents the app
   from reading the actual `<video>` inside many provider iframes. Progress, resume, intro/outro,
   natural end, speed, and caption control remain unavailable there. A reliable solution needs a
-  provider `postMessage` contract, a native stream, or an app-controlled player page.
+  provider `postMessage` contract, a native stream, or an app-controlled player page. The app also
+  cannot enumerate or pause two independent media elements inside an active cross-origin iframe;
+  only whole-WebView pause and blanking during transitions are guaranteed.
 
 - [x] **OPEN-002 - Generic web fallback identity.** Generic fallback pages are now explicitly
   unmanaged: they cannot write route-owned progress/history, and cross-origin controls expose only
-  a neutral `Play or pause` action instead of inventing a playback state.
+  a safe handoff to the provider's real controls instead of inventing a playback state or sending a
+  blind synthetic play/pause tap.
 
 - [ ] **OPEN-003 - Cast auto-next after Watch disposal.** The playback service now owns Cast
   progress, durable completion, account sync, identity restoration after service recreation, and
@@ -100,7 +105,18 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 
 - [x] **OPEN-005 - Embed video selection heuristic.** Accessible videos are scored by duration,
   dimensions, visibility, readiness, and source stability. Ads, prerolls, and sub-two-minute media
-  are rejected, and the selected content identity is locked for telemetry, resume, and controls.
+  are rejected. Once a candidate is observed playing, its identity is sticky for telemetry, resume,
+  controls, and competing-player suppression; a later higher-resolution DUB cannot steal the lock.
+
+- [ ] **OPEN-025 - Ambiguous first embed sample.** If two same-origin, equally plausible long-form
+  videos are already playing before the app's first sample, there is no provider-neutral signal that
+  proves which layer the viewer intended. The app keeps one stable choice and avoids later switching,
+  but exact disambiguation needs provider-specific player metadata or a messaging contract.
+
+- [ ] **OPEN-026 - Separate synchronized embed audio.** A rare provider may intentionally drive a
+  standalone `<audio>` element alongside its video. Generic competing-media protection can classify
+  that track as background media and pause it; reliable pairing requires provider metadata or a
+  player messaging contract.
 
 - [x] **OPEN-006 - Optimistic manual embed controls.** Seek, play/pause, speed, volume, resume, and
   skip commands now carry a generation, command ID, and media identity. UI state changes only after
