@@ -303,7 +303,10 @@ fun PlayerSurface(
     // decoders (Fire TV's OMX.MS.AVC) can die on 1080p with a codec error even though the
     // format is nominally supported, and a provider failover for a device-side decode hiccup
     // needlessly restarts the episode on another server.
-    var decoderRetryDone by remember(stream.url) { mutableStateOf(false) }
+    // The listener below lives for the MediaController, not for a particular episode. Keep its
+    // retry marker in stable state so it always observes the currently loaded media id instead of
+    // retaining the first stream's keyed remember value in its closure.
+    var decoderRetryMediaId by remember { mutableStateOf<String?>(null) }
     val nativeQualityStreams = remember(stream.url, qualityStreams) {
         (listOf(stream) + qualityStreams)
             .filterNot(StreamItem::isEmbed)
@@ -366,8 +369,12 @@ fun PlayerSurface(
 
                 override fun onPlayerError(error: PlaybackException) {
                     DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
-                    if (error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED && !decoderRetryDone) {
-                        decoderRetryDone = true
+                    val failedMediaId = activeController.currentMediaItem?.mediaId
+                    if (
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED &&
+                        shouldRetryDecoderForMedia(decoderRetryMediaId, failedMediaId)
+                    ) {
+                        decoderRetryMediaId = failedMediaId
                         val resumeAt = activeController.currentPosition.coerceAtLeast(0L)
                         activeController.trackSelectionParameters = activeController.trackSelectionParameters
                             .buildUpon()
@@ -1098,6 +1105,9 @@ fun PlayerSurface(
         }
     }
 }
+
+internal fun shouldRetryDecoderForMedia(lastRetriedMediaId: String?, failedMediaId: String?): Boolean =
+    !failedMediaId.isNullOrBlank() && failedMediaId != lastRetriedMediaId
 
 /** Quick subtitle on/off for the control bar's CC button; full track choice lives in the sheet. */
 @OptIn(UnstableApi::class)
