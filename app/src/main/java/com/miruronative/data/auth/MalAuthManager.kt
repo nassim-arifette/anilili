@@ -45,9 +45,7 @@ object MalAuthManager {
     private lateinit var tokenStore: SecureTokenStore
     private var httpClient: OkHttpClient? = null
     private val refreshMutex = Mutex()
-    private val sessionGate = SessionGate()
-    private var pendingState: String? = null
-    private var pendingVerifier: String? = null
+    private val sessionGate = MalAuthSessionGate()
 
     private val _tokens = MutableStateFlow<MalTokens?>(null)
     internal val tokens = _tokens.asStateFlow()
@@ -73,10 +71,7 @@ object MalAuthManager {
         // PKCE `plain`: the verifier IS the challenge. 32 random bytes → 43-char base64url,
         // inside MAL's required 43–128 length window.
         val verifier = randomUrlSafe(32)
-        sessionGate.invalidate {
-            pendingState = state
-            pendingVerifier = verifier
-        }
+        sessionGate.beginLogin(state, verifier)
         return Uri.parse(AUTHORIZE_ENDPOINT).buildUpon()
             .appendQueryParameter("response_type", "code")
             .appendQueryParameter("client_id", CLIENT_ID)
@@ -94,41 +89,37 @@ object MalAuthManager {
             uri.getQueryParameter("code") != null
     }
 
-    fun extractCode(url: String): String? {
+    fun extractCode(url: String): MalAuthorizationCode? {
         if (!isRedirect(url)) return null
         val uri = Uri.parse(url)
-        val expectedState = pendingState ?: return null
-        if (uri.getQueryParameter("state") != expectedState) return null
-        return uri.getQueryParameter("code")?.takeIf { it.isNotBlank() }
+        return sessionGate.claimCode(
+            state = uri.getQueryParameter("state"),
+            code = uri.getQueryParameter("code"),
+        )
     }
 
     /** Trades the authorization code for the first token pair; throws on failure. */
-    suspend fun exchangeCode(code: String) = withContext(Dispatchers.IO) {
-        val loginAttempt = sessionGate.snapshot {
-            requireNotNull(pendingVerifier) { "No MAL login in progress" }
+    suspend fun exchangeCode(authorization: MalAuthorizationCode) = withContext(Dispatchers.IO) {
+        // Avoid even submitting a callback that was already superseded before this coroutine ran.
+        if (!sessionGate.isCurrent(authorization)) {
+            throw CancellationException("MAL login was superseded")
         }
-        val verifier = loginAttempt.value
         val body = FormBody.Builder()
             .add("client_id", CLIENT_ID)
             .add("grant_type", "authorization_code")
-            .add("code", code)
-            .add("code_verifier", verifier)
+            .add("code", authorization.code)
+            .add("code_verifier", authorization.verifier)
             .build()
         val fresh = try {
             requestTokens(body)
         } catch (error: Exception) {
             if (error is CancellationException) throw error
-            val stillCurrent = sessionGate.invalidateIfCurrent(loginAttempt) {
-                pendingState = null
-                pendingVerifier = null
-            }
+            val stillCurrent = sessionGate.replaceLoginIfCurrent(authorization) {}
             if (!stillCurrent) throw CancellationException("MAL login was superseded")
             throw error
         }
-        val committed = sessionGate.replaceIfCurrent(loginAttempt) {
+        val committed = sessionGate.replaceLoginIfCurrent(authorization) {
             store(fresh)
-            pendingState = null
-            pendingVerifier = null
         }
         if (!committed) throw CancellationException("MAL login was superseded")
         DiagnosticsLog.event("MAL login: token exchange succeeded")
@@ -182,8 +173,6 @@ object MalAuthManager {
         tokenStore.clear()
         _tokens.value = null
         loggedIn.value = false
-        pendingState = null
-        pendingVerifier = null
     }
 
     private fun requestTokens(body: FormBody): MalTokens {

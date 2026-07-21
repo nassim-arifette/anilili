@@ -105,11 +105,11 @@ private class TvImeBridge(private val webView: WebView) {
 }
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun LoginWebView(
+fun <T> LoginWebView(
     authorizeUrl: String,
     isRedirect: (String) -> Boolean,
-    extractResult: (String) -> String?,
-    onResult: (String) -> Unit,
+    extractResult: (String) -> T?,
+    onResult: (T) -> Unit,
     onCancel: () -> Unit,
 ) {
     val device = LocalAppDeviceProfile.current
