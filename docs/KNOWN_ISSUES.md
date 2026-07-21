@@ -149,7 +149,8 @@ bugs that their replacements fixed:
 ## Validation checklist
 
 - [x] Focused unit tests for each topic branch passed before integration.
-- [ ] Run the complete `testDebugUnitTest` suite on the final merged tree.
+- [x] Run the complete `testDebugUnitTest` suite on the final merged tree (`BUILD SUCCESSFUL`,
+  July 21, 2026).
 - [ ] Build the final debug APK with SDK 36 and verify its output name.
 - [ ] Validate rapid Watch A -> B transitions, embed/native handoff, pause/seek/exit resume,
   intro/outro, an airing show's latest episode, the actual series finale, Cast, renderer loss,
