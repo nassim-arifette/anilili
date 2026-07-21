@@ -243,6 +243,39 @@ class WatchSourcePolicyTest {
     }
 
     @Test
+    fun `late catalog publishes a direct-link episode while initial resolution is loading`() {
+        val rebuilt = listOf(episode(1), episode(12))
+
+        val publication = catalogSpinePublication(rebuilt, visibleEpisodeNumber = null)!!
+
+        assertEquals(rebuilt, publication.episodes)
+        assertNull(publication.currentIndex)
+        assertEquals(1, navigationEpisodeIndex(publication.episodes, 12.0))
+    }
+
+    @Test
+    fun `late catalog publication keeps visible episode and index in one snapshot`() {
+        val rebuilt = listOf(episode(1), episode(2), episode(3))
+
+        val publication = catalogSpinePublication(rebuilt, visibleEpisodeNumber = 2.0)!!
+
+        assertEquals(1, publication.currentIndex)
+        assertEquals(2.0, publication.episodes[publication.currentIndex!!].number, 0.0)
+    }
+
+    @Test
+    fun `late catalog publication rejects a spine that would orphan visible episode`() {
+        assertNull(catalogSpinePublication(listOf(episode(1), episode(3)), visibleEpisodeNumber = 2.0))
+    }
+
+    @Test
+    fun `unresolved source retries only after catalog generation changes`() {
+        assertTrue(shouldRetryAfterCatalogMerge(false, 2L, 3L))
+        assertEquals(false, shouldRetryAfterCatalogMerge(false, 3L, 3L))
+        assertEquals(false, shouldRetryAfterCatalogMerge(true, 2L, 3L))
+    }
+
+    @Test
     fun `navigation union is preserved for a switched audio category`() {
         val preferred = ProviderData(
             "bonk",
