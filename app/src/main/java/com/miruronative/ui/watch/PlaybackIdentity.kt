@@ -6,6 +6,8 @@ data class PlaybackIdentity(
     val episodeNumber: Double,
     val generation: Int,
     val mediaId: String,
+    /** Optional opaque instance scope when one media id can be replaced inside the same player. */
+    val mediaInstanceId: String? = null,
 )
 
 /** Last position reported by a concrete, identity-bearing playback item. */

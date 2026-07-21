@@ -31,6 +31,7 @@ class AniSkipPublicationPolicyTest {
             sourceGeneration = 30,
             mediaId = "https://cdn.example/episode-7-5.m3u8",
             durationBucketMs = 1_440_000L,
+            mediaInstanceId = "embed:4:1",
         )
 
         assertEquals(true, canPublishAniSkipSegments(expected, expected))
@@ -47,9 +48,17 @@ class AniSkipPublicationPolicyTest {
             false,
             canPublishAniSkipSegments(
                 expected,
+                expected.copy(mediaInstanceId = "embed:4:2"),
+            ),
+        )
+        assertEquals(
+            false,
+            canPublishAniSkipSegments(
+                expected,
                 expected.copy(request = request.copy(requestGeneration = 13)),
             ),
         )
+        assertFalse(expected.toString().contains("cdn.example"))
     }
 
     @Test
