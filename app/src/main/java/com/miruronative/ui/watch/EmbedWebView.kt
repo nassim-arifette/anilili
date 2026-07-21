@@ -74,6 +74,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import com.miruronative.data.model.AniSkipPlaybackSegment
 import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.settings.CaptionEdgeStyle
@@ -109,6 +110,8 @@ fun EmbedWebView(
     qualityStreams: List<StreamItem> = emptyList(),
     startPositionMs: Long = 0L,
     skip: SkipTimes? = null,
+    aniSkipSegments: List<AniSkipPlaybackSegment> = emptyList(),
+    aniSkipLookupStatus: AniSkipLookupStatus = AniSkipLookupStatus.COMPLETE,
     onPreviousEpisode: ((EmbedPlaybackKey) -> Unit)? = null,
     onNextEpisode: ((EmbedPlaybackKey) -> Unit)? = null,
     hasPreviousEpisode: Boolean = false,
@@ -222,10 +225,15 @@ fun EmbedWebView(
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
     val autoplay by SettingsStore.autoplay.collectAsState()
     val captionStyle by SettingsStore.captionStyle.collectAsState()
-    val introStartMs = skip?.introStart?.times(1000)?.toLong() ?: 0L
-    val introEndMs = skip?.introEnd?.times(1000)?.toLong()
-    val outroStartMs = skip?.outroStart?.times(1000)?.toLong()
-    val outroEndMs = skip?.outroEnd?.times(1000)?.toLong()
+    val skipPlan = remember(skip, aniSkipSegments, aniSkipLookupStatus) {
+        buildPlaybackSkipPlan(skip, aniSkipSegments, aniSkipLookupStatus)
+    }
+    val automaticOpening = skipPlan.automaticOpening
+    val automaticEnding = skipPlan.automaticEnding
+    val introStartMs = automaticOpening?.startMs ?: 0L
+    val introEndMs = automaticOpening?.endMs
+    val outroStartMs = automaticEnding?.startMs
+    val outroEndMs = automaticEnding?.endMs
     var introAutoSkipped by remember(navigationSession.generation, introStartMs, introEndMs) {
         mutableStateOf(false)
     }
@@ -1346,23 +1354,22 @@ fun EmbedWebView(
             )
         }
 
-        val action: Pair<String, () -> Unit>? = when {
-            !playbackMode.automatesEpisode -> null
-            introEndMs != null && isInSkipWindow(positionMs, introStartMs, introEndMs) ->
-                "Skip Intro" to {
-                    requestSeek(introEndMs, null)
-                }
-            outroStartMs != null &&
-                outroEndMs != null &&
-                isInSkipWindow(positionMs, outroStartMs, outroEndMs) ->
-                if (currentHasNextEpisode && currentOnNextEpisode != null) {
-                    "Next Episode" to { currentOnNextEpisode?.invoke(playbackKey) }
-                } else {
-                    "Skip Outro" to {
-                        requestSeek(outroEndMs, null)
+        val action = if (!playbackMode.automatesEpisode) {
+            null
+        } else {
+            skipPlan.actionAt(
+                positionMs = positionMs,
+                hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
+            )?.let { planned ->
+                planned.label to {
+                    if (planned.advanceToNextEpisode) {
+                        currentOnNextEpisode?.invoke(playbackKey)
+                    } else {
+                        planned.seekTargetMs?.let { requestSeek(it, null) }
                     }
+                    Unit
                 }
-            else -> null
+            }
         }
         action?.let { (label, onClick) ->
             WebSkipButton(

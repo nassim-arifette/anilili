@@ -12,6 +12,7 @@ import com.miruronative.data.library.LibraryStore
 import com.miruronative.data.auth.AccountService
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.data.settings.DEFAULT_PREFERRED_PROVIDER
+import com.miruronative.data.model.AniSkipPlaybackSegment
 import com.miruronative.data.model.Category
 import com.miruronative.data.model.EpisodeItem
 import com.miruronative.data.model.EpisodesResult
@@ -28,17 +29,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.CoroutineStart
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-
-/** How long a ready stream waits on the AniSkip lookup before starting without markers. */
-private const val ANISKIP_WAIT_MS = 2_500L
 
 /**
  * How long the initial load waits on the Miruro pipe before proceeding with the fast Anivexa
@@ -55,6 +51,9 @@ data class WatchData(
     val sourceOptions: List<WatchSourceOption>,
     val anilistId: Int,
     val sources: SourcesResult,
+    /** Duration-adjusted AniSkip markers for the exact active media session. */
+    val aniSkipSegments: List<AniSkipPlaybackSegment> = emptyList(),
+    val aniSkipLookupStatus: AniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
     val chosenStream: StreamItem?,
     val seriesTitle: String,
     val artworkUrl: String?,
@@ -199,14 +198,6 @@ private data class ProgressSyncKey(
     val service: AccountService,
 )
 
-private data class AniSkipWork(
-    val request: PlaybackRequestToken,
-    val lookup: Deferred<SkipTimes?>,
-    var publication: Job? = null,
-)
-
-private data class TimelyAniSkipResult(val skip: SkipTimes?)
-
 class WatchViewModel : ViewModel() {
     private val repo = AppGraph.repository
 
@@ -243,7 +234,8 @@ class WatchViewModel : ViewModel() {
     private var anivexaMergeJob: Job? = null
     private var miruroLateMergeJob: Job? = null
     private var sourceValidationJob: Job? = null
-    private var aniSkipWork: AniSkipWork? = null
+    private var aniSkipLookupIdentity: AniSkipLookupIdentity? = null
+    private var aniSkipLookupJob: Job? = null
     private var mergedIncludesAnivexa = false
     private var mergedEpisodes = EpisodesResult(emptyList())
     private var catalogGeneration = 0L
@@ -607,19 +599,10 @@ class WatchViewModel : ViewModel() {
                 "category=${requestedCategory.api} excluded=${excludedProviders.joinToString()}",
         )
         lastRequestedNumber = number
-        // Fetched alongside source resolution: fills intro/outro markers for providers that
-        // don't ship their own, so auto-skip keeps working after a provider fallback.
-        val aniSkipFallback = viewModelScope.async {
-            val skip = runCatching { repo.skipTimes(requestAnimeId, number) }
-                .onFailure { it.rethrowIfCancellation() }
-                .getOrNull()
-            ensureCurrentRequest(request)
-            skip
-        }
-        val skipWork = AniSkipWork(request, aniSkipFallback).also { work ->
-            cancelAniSkipWork()
-            aniSkipWork = work
-        }
+        // AniSkip v2 requires the real media duration. Lookup therefore starts only after a
+        // validated native/embed playback callback reports it; provider markers remain usable in
+        // the meantime and inaccessible cross-origin embeds fail open without a bogus length=0.
+        cancelAniSkipWork()
         val previous = (_state.value as? UiState.Success)?.data
         _state.value = previous?.let { UiState.Success(it.copy(isResolving = true, notice = null)) }
             ?: UiState.Loading
@@ -694,7 +677,7 @@ class WatchViewModel : ViewModel() {
             resolved = resolution.resolved
         }
         if (resolved == null) {
-            cancelAniSkipWork(request)
+            cancelAniSkipWork()
             ensureCurrentRequest(request)
             unavailableThisResolve.forEach { provider ->
                 unavailableSources += EpisodeSourceKey(number, provider, requestedCategory)
@@ -750,23 +733,6 @@ class WatchViewModel : ViewModel() {
                     "episode=${fmt(number)}",
             )
         }
-        val providerSkip = normalizedSkipTimes(playable.sources.skip)
-        var publishAniSkipLater = false
-        val fallbackSkip = if (hasCompleteSkipTimes(providerSkip)) {
-            cancelAniSkipWork(request)
-            null
-        } else {
-            val timely = withTimeoutOrNull(ANISKIP_WAIT_MS) {
-                TimelyAniSkipResult(aniSkipFallback.await())
-            }
-            if (timely == null) {
-                publishAniSkipLater = true
-                null
-            } else {
-                clearAniSkipWork(skipWork)
-                normalizedSkipTimes(timely.skip)
-            }
-        }
         ensureCurrentRequest(request)
         unavailableThisResolve.forEach { provider ->
             unavailableSources += EpisodeSourceKey(number, provider, requestedCategory)
@@ -779,7 +745,7 @@ class WatchViewModel : ViewModel() {
         if (playable.provider != requestedProvider && requestedProvider != DEFAULT_PREFERRED_PROVIDER) {
             unavailableSources += EpisodeSourceKey(number, requestedProvider, requestedCategory)
         }
-        val sources = playable.sources.copy(skip = mergeSkipTimes(providerSkip, fallbackSkip))
+        val sources = playable.sources.copy(skip = normalizedSkipTimes(playable.sources.skip))
         val index = navigationEpisodeIndex(spine, number)
             ?: error("Resolved episode ${fmt(number)} is missing from the navigation catalog")
         val resume = LibraryStore.historyFor(requestAnimeId)?.resumePositionFor(number) ?: 0L
@@ -815,6 +781,8 @@ class WatchViewModel : ViewModel() {
             sourceOptions = sourceOptions(number),
             anilistId = requestAnimeId,
             sources = sources,
+            aniSkipSegments = emptyList(),
+            aniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
             chosenStream = chosen,
             seriesTitle = seriesTitle,
             artworkUrl = artworkUrl,
@@ -831,14 +799,6 @@ class WatchViewModel : ViewModel() {
             notice = fallbackNotice,
         )
         _state.value = UiState.Success(data)
-        if (publishAniSkipLater) {
-            launchLateAniSkipPublication(
-                work = skipWork,
-                expected = data.aniSkipPublicationIdentity(request),
-            )
-        } else {
-            clearAniSkipWork(skipWork)
-        }
         launchSourceValidation(number, request)
     }
 
@@ -923,6 +883,23 @@ class WatchViewModel : ViewModel() {
                     "current=${data.current.displayNumber}",
             )
             return
+        }
+        val previousMediaId = activeNativePlaybackIdentity?.mediaId
+        if (previousMediaId != null && previousMediaId != identity.mediaId) {
+            // A quality/CDN replacement may have a different edit or duration. Do not retain
+            // duration-adjusted markers from the outgoing concrete media item.
+            cancelAniSkipWork()
+            if (
+                data.aniSkipSegments.isNotEmpty() ||
+                data.aniSkipLookupStatus != AniSkipLookupStatus.AWAITING_DURATION
+            ) {
+                _state.value = UiState.Success(
+                    data.copy(
+                        aniSkipSegments = emptyList(),
+                        aniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
+                    ),
+                )
+            }
         }
         activeNativePlaybackIdentity = identity
         DiagnosticsLog.event(
@@ -1199,6 +1176,7 @@ class WatchViewModel : ViewModel() {
         durationMs: Long,
     ) {
         lastKnownProgress = PlaybackProgressSnapshot(identity, positionMs, durationMs)
+        scheduleAniSkipLookup(data, identity, durationMs)
         maybeSyncAniListProgress(identity, positionMs, durationMs, totalEpisodes)
         val lastIdentity = lastProgressSaveIdentity
         if (lastIdentity == null || !isSamePlaybackSession(lastIdentity, identity)) {
@@ -1583,7 +1561,7 @@ class WatchViewModel : ViewModel() {
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
                 if (!requestGate.isCurrentRequest(request)) return@launch
-                cancelAniSkipWork(request)
+                cancelAniSkipWork()
                 requestGate.finishRequest(request)
                 DiagnosticsLog.throwable("Watch resolve failed id=$anilistId episode=${fmt(number)}", e)
                 _loadingStatus.value = null
@@ -1628,52 +1606,81 @@ class WatchViewModel : ViewModel() {
         playbackTransitionBarrier.cancel()
     }
 
-    private fun launchLateAniSkipPublication(
-        work: AniSkipWork,
-        expected: AniSkipPublicationIdentity,
+    private fun scheduleAniSkipLookup(
+        data: WatchData,
+        playbackIdentity: PlaybackIdentity,
+        actualDurationMs: Long,
     ) {
-        if (aniSkipWork !== work) {
-            work.lookup.cancel()
-            return
+        val durationBucketMs = aniSkipDurationBucketMs(actualDurationMs) ?: return
+        val expected = data.aniSkipLookupIdentity(
+            request = requestGate.currentRequest(),
+            mediaId = playbackIdentity.mediaId,
+            durationBucketMs = durationBucketMs,
+        )
+        if (aniSkipLookupIdentity == expected) return
+
+        aniSkipLookupJob?.cancel()
+        aniSkipLookupIdentity = expected
+        if (
+            data.aniSkipLookupStatus != AniSkipLookupStatus.LOADING ||
+            data.aniSkipSegments.isNotEmpty()
+        ) {
+            _state.value = UiState.Success(
+                data.copy(
+                    aniSkipSegments = emptyList(),
+                    aniSkipLookupStatus = AniSkipLookupStatus.LOADING,
+                ),
+            )
         }
-        val publication = viewModelScope.launch(start = CoroutineStart.LAZY) {
-            try {
-                val fallback = normalizedSkipTimes(work.lookup.await())
-                if (!requestGate.isCurrentRequest(work.request)) return@launch
-                val data = (_state.value as? UiState.Success)?.data ?: return@launch
-                val current = data.aniSkipPublicationIdentity(requestGate.currentRequest())
-                val updatedSkip = lateAniSkipUpdate(
-                    expected = expected,
-                    current = current,
-                    currentSkip = data.sources.skip,
-                    aniSkip = fallback,
-                ) ?: return@launch
-                _state.value = UiState.Success(
-                    data.copy(sources = data.sources.copy(skip = updatedSkip)),
+        aniSkipLookupJob = viewModelScope.launch {
+            val segments = runCatching {
+                repo.aniSkipSegments(
+                    anilistId = expected.animeId,
+                    episode = expected.episodeNumber,
+                    // Use the same stable duration as the lookup identity and repository cache.
+                    // Player containers occasionally jitter by a few milliseconds between ticks.
+                    actualDurationMs = durationBucketMs,
+                    sourceIdentity = expected.mediaId,
                 )
-                DiagnosticsLog.event(
-                    "Watch late AniSkip published id=${expected.animeId} " +
-                        "episode=${fmt(expected.episodeNumber)} provider=${expected.provider} " +
-                        "generation=${expected.sourceGeneration}",
+            }.onFailure {
+                it.rethrowIfCancellation()
+                DiagnosticsLog.throwable(
+                    "Watch AniSkip lookup failed id=${expected.animeId} " +
+                        "episode=${fmt(expected.episodeNumber)}",
+                    it,
                 )
-            } finally {
-                clearAniSkipWork(work)
+            }.getOrDefault(emptyList())
+
+            if (aniSkipLookupIdentity != expected || !requestGate.isCurrentRequest(expected.request)) {
+                return@launch
             }
+            val currentData = (_state.value as? UiState.Success)?.data ?: return@launch
+            val currentProgress = lastKnownProgress ?: return@launch
+            val currentDurationBucket = aniSkipDurationBucketMs(currentProgress.durationMs) ?: return@launch
+            val current = currentData.aniSkipLookupIdentity(
+                request = requestGate.currentRequest(),
+                mediaId = currentProgress.identity.mediaId,
+                durationBucketMs = currentDurationBucket,
+            )
+            if (!canPublishAniSkipSegments(expected, current)) return@launch
+            _state.value = UiState.Success(
+                currentData.copy(
+                    aniSkipSegments = segments,
+                    aniSkipLookupStatus = AniSkipLookupStatus.COMPLETE,
+                ),
+            )
+            DiagnosticsLog.event(
+                "Watch AniSkip published id=${expected.animeId} " +
+                    "episode=${fmt(expected.episodeNumber)} markers=${segments.size} " +
+                    "generation=${expected.sourceGeneration}",
+            )
         }
-        work.publication = publication
-        publication.start()
     }
 
-    private fun cancelAniSkipWork(request: PlaybackRequestToken? = null) {
-        val work = aniSkipWork ?: return
-        if (request != null && work.request != request) return
-        aniSkipWork = null
-        work.publication?.cancel()
-        work.lookup.cancel()
-    }
-
-    private fun clearAniSkipWork(work: AniSkipWork) {
-        if (aniSkipWork === work) aniSkipWork = null
+    private fun cancelAniSkipWork() {
+        aniSkipLookupIdentity = null
+        aniSkipLookupJob?.cancel()
+        aniSkipLookupJob = null
     }
 
     private fun nextPlaybackGeneration(): Int {
@@ -1716,6 +1723,7 @@ class WatchViewModel : ViewModel() {
                 failedUrls = failedStreamUrls,
             )
             if (next != null) {
+                cancelAniSkipWork()
                 val failed = data.sources.streams.firstOrNull { it.url == streamUrl }
                 val resume = maxOf(data.startPositionMs, positionMs.coerceAtLeast(0L))
                 DiagnosticsLog.event(
@@ -1725,6 +1733,8 @@ class WatchViewModel : ViewModel() {
                 _state.value = UiState.Success(
                     data.copy(
                         chosenStream = next,
+                        aniSkipSegments = emptyList(),
+                        aniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
                         startPositionMs = resume,
                         playbackGeneration = nextPlaybackGeneration(),
                         notice = "${failed?.label ?: "AllAnime source"} failed. Trying ${next.label}…",
@@ -1887,15 +1897,19 @@ class WatchViewModel : ViewModel() {
     }
 }
 
-private fun WatchData.aniSkipPublicationIdentity(
+private fun WatchData.aniSkipLookupIdentity(
     request: PlaybackRequestToken,
-): AniSkipPublicationIdentity = AniSkipPublicationIdentity(
+    mediaId: String,
+    durationBucketMs: Long,
+): AniSkipLookupIdentity = AniSkipLookupIdentity(
     request = request,
     animeId = anilistId,
     episodeNumber = current.number,
     provider = provider,
     category = category,
     sourceGeneration = playbackGeneration,
+    mediaId = mediaId,
+    durationBucketMs = durationBucketMs,
 )
 
 private fun WatchData.nativeMediaIds(): Set<String> {
@@ -2018,28 +2032,6 @@ internal fun preferredProviderForWatch(storedPreferred: String?, routeProvider: 
     if (stored.isNotBlank() && stored != DEFAULT_PREFERRED_PROVIDER) return stored
     return routeProvider.trim().lowercase().ifBlank { DEFAULT_PREFERRED_PROVIDER }
 }
-
-/**
- * Combines provider chapter markers with AniSkip a range at a time. A provider that only knows
- * the opening must not suppress a usable ending from the fallback (or vice versa), and empty or
- * inverted placeholder ranges are discarded before they reach the player.
- */
-internal fun mergeSkipTimes(primary: SkipTimes?, fallback: SkipTimes?): SkipTimes? {
-    val normalizedPrimary = normalizedSkipTimes(primary)
-    val normalizedFallback = normalizedSkipTimes(fallback)
-    val intro = introRange(normalizedPrimary) ?: introRange(normalizedFallback)
-    val outro = outroRange(normalizedPrimary) ?: outroRange(normalizedFallback)
-    if (intro == null && outro == null) return null
-    return SkipTimes(
-        introStart = intro?.first,
-        introEnd = intro?.second,
-        outroStart = outro?.first,
-        outroEnd = outro?.second,
-    )
-}
-
-internal fun hasCompleteSkipTimes(skip: SkipTimes?): Boolean =
-    introRange(skip) != null && outroRange(skip) != null
 
 private fun normalizedSkipTimes(skip: SkipTimes?): SkipTimes? {
     val intro = introRange(skip)

@@ -731,6 +731,8 @@ private fun WatchContent(
                                 qualityStreams = data.sources.embedStreams,
                                 startPositionMs = data.startPositionMs,
                                 skip = data.sources.skip,
+                                aniSkipSegments = data.aniSkipSegments,
+                                aniSkipLookupStatus = data.aniSkipLookupStatus,
                                 onPreviousEpisode = onEmbedPrevious,
                                 onNextEpisode = onEmbedNext,
                                 hasPreviousEpisode = data.hasPrev,
@@ -772,6 +774,8 @@ private fun WatchContent(
                         subtitles = data.sources.subtitles,
                         subtitleOffsetMs = data.sources.subtitleOffsetMs,
                         skip = data.sources.skip,
+                        aniSkipSegments = data.aniSkipSegments,
+                        aniSkipLookupStatus = data.aniSkipLookupStatus,
                         seriesTitle = data.seriesTitle,
                         episodeTitle = "Episode ${data.current.displayNumber}" +
                             (data.current.title?.let { ": $it" } ?: ""),

@@ -1,6 +1,9 @@
 package com.miruronative.data
 
 import com.miruronative.data.model.AiringSchedule
+import com.miruronative.data.model.AniSkipPlaybackSegment
+import com.miruronative.data.model.AniSkipRelationRule
+import com.miruronative.data.model.AniSkipSegment
 import com.miruronative.data.model.Category
 import com.miruronative.data.model.EpisodeItem
 import com.miruronative.data.model.EpisodesResult
@@ -14,7 +17,6 @@ import com.miruronative.data.model.SourcesResult
 import com.miruronative.data.cache.AppCache
 import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.model.DiscoverOptions
-import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.AnimeStat
 import com.miruronative.data.model.MediaListEntry
 import com.miruronative.data.model.UserAvatar
@@ -29,7 +31,10 @@ import com.miruronative.data.remote.KonohaEpisode
 import com.miruronative.data.remote.MalClient
 import com.miruronative.data.remote.MediaListProgressSnapshot
 import com.miruronative.data.remote.PipeClient
+import com.miruronative.data.remote.aniSkipSegmentsCacheKey
 import com.miruronative.data.remote.planMediaListProgressUpdate
+import com.miruronative.data.remote.resolveAniSkipEpisode
+import com.miruronative.data.remote.resolveAniSkipSegments
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
 import kotlinx.coroutines.CancellationException
@@ -381,21 +386,68 @@ class MiruroRepository(
         ) { withContext(Dispatchers.IO) { jikan.fillerEpisodes(malId) } }
     }
 
-    /** Community intro/outro markers via AniSkip; cached, null when unknown or on failure. */
-    suspend fun skipTimes(anilistId: Int, episode: Double): SkipTimes? {
-        if (episode % 1.0 != 0.0 || episode < 1) return null
-        val malId = animeInfo(anilistId)?.idMal?.takeIf { it > 0 } ?: return null
-        return cache.getOrFetch(
-            key = "aniskip:$malId:${episode.toInt()}",
-            serializer = SkipTimes.serializer().nullable,
-            ttlMs = OPTIONS_TTL,
+    /**
+     * Typed AniSkip v2 segments adjusted for the active stream's measured duration.
+     *
+     * The request is encode-scoped and is intentionally unavailable until a player reports a real
+     * duration. Cross-origin embeds that cannot expose it fail open and keep provider markers.
+     */
+    suspend fun aniSkipSegments(
+        anilistId: Int,
+        episode: Double,
+        actualDurationMs: Long,
+        sourceIdentity: String,
+    ): List<AniSkipPlaybackSegment> {
+        if (
+            anilistId <= 0 ||
+            !episode.isFinite() ||
+            episode < 0.0 ||
+            actualDurationMs <= 0L ||
+            sourceIdentity.isBlank()
         ) {
-            withContext(Dispatchers.IO) {
-                runCatching { aniSkip.skipTimes(malId, episode.toInt()) }
-                    .onFailure { it.rethrowIfCancellation() }
-                    .getOrNull()
-            }
+            return emptyList()
         }
+        val malId = animeInfo(anilistId)?.idMal?.takeIf { it > 0 } ?: return emptyList()
+        val rules = runCatching {
+            cache.getOrFetch(
+                key = "aniskip:v2:relations:$malId",
+                serializer = ListSerializer(AniSkipRelationRule.serializer()),
+                ttlMs = OPTIONS_TTL,
+            ) { withContext(Dispatchers.IO) { aniSkip.relationRules(malId) } }
+        }.onFailure {
+            it.rethrowIfCancellation()
+            DiagnosticsLog.throwable("AniSkip relation rules failed malId=$malId", it)
+        }.getOrDefault(emptyList())
+
+        val target = resolveAniSkipEpisode(malId, episode, rules)
+        val cacheKey = aniSkipSegmentsCacheKey(
+            malId = target.malId,
+            episode = target.episode,
+            actualDurationMs = actualDurationMs,
+            sourceIdentity = sourceIdentity,
+        )
+        val rawSegments = runCatching {
+            cache.getOrFetch(
+                key = cacheKey,
+                serializer = ListSerializer(AniSkipSegment.serializer()),
+                ttlMs = OPTIONS_TTL,
+            ) {
+                withContext(Dispatchers.IO) {
+                    aniSkip.skipTimes(
+                        malId = target.malId,
+                        episode = target.episode,
+                        episodeLengthSeconds = actualDurationMs / 1_000.0,
+                    )
+                }
+            }
+        }.onFailure {
+            it.rethrowIfCancellation()
+            DiagnosticsLog.throwable(
+                "AniSkip segments failed malId=${target.malId} episode=${target.episode}",
+                it,
+            )
+        }.getOrDefault(emptyList())
+        return resolveAniSkipSegments(rawSegments, actualDurationMs / 1_000.0)
     }
 
     suspend fun animeInfo(id: Int, force: Boolean = false): Media? = cache.getOrFetch(
