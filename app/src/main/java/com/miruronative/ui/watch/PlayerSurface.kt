@@ -317,6 +317,7 @@ fun PlayerSurface(
 ) {
     val context = LocalContext.current
     val device = LocalAppDeviceProfile.current
+    val playbackSessionKey = playbackIdentity.nativePlaybackSessionKey()
     DisposableEffect(Unit) { onDispose { resetPlayerBrightness(context) } }
     val lifecycleOwner = remember(context) { context.findPlayerLifecycleOwner() }
     DisposableEffect(lifecycleOwner) {
@@ -353,7 +354,7 @@ fun PlayerSurface(
     }
     // Each episode starts from what the loader measured for this stream, so a shift the viewer
     // dialled in for a broken one never follows them into the next.
-    LaunchedEffect(stream.url, subtitleOffsetMs) {
+    LaunchedEffect(playbackSessionKey, subtitleOffsetMs) {
         SubtitleDelay.set(subtitleOffsetMs, automatic = true)
     }
     val subtitleDelayMs by SubtitleDelay.delayMs.collectAsState()
@@ -369,11 +370,11 @@ fun PlayerSurface(
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnEnded by rememberUpdatedState(onEnded)
     val currentOnPlaybackIdentityChanged by rememberUpdatedState(onPlaybackIdentityChanged)
-    var activeStream by remember(stream.url) { mutableStateOf(stream) }
-    var nextStartPositionMs by remember(stream.url) { mutableLongStateOf(startPositionMs) }
-    var playbackIsPlaying by remember { mutableStateOf(false) }
-    var confirmedPlaybackIdentity by remember { mutableStateOf<PlaybackIdentity?>(null) }
-    var tracksRevision by remember { mutableIntStateOf(0) }
+    var activeStream by remember(playbackSessionKey) { mutableStateOf(stream) }
+    var nextStartPositionMs by remember(playbackSessionKey) { mutableLongStateOf(startPositionMs) }
+    var playbackIsPlaying by remember(playbackSessionKey) { mutableStateOf(false) }
+    var confirmedPlaybackIdentity by remember(playbackSessionKey) { mutableStateOf<PlaybackIdentity?>(null) }
+    var tracksRevision by remember(playbackSessionKey) { mutableIntStateOf(0) }
     // One same-stream retry at a capped resolution before giving the provider up: weak TV
     // decoders (Fire TV's OMX.MS.AVC) can die on 1080p with a codec error even though the
     // format is nominally supported, and a provider failover for a device-side decode hiccup
@@ -382,7 +383,7 @@ fun PlayerSurface(
     // retry allowance tied to each MediaItem installation so a new logical playback can retry
     // even when its provider reuses the same URL as the previous episode.
     val decoderRetryPolicy = remember { PlayerDecoderRetryPolicy() }
-    val nativeQualityStreams = remember(stream.url, qualityStreams) {
+    val nativeQualityStreams = remember(playbackSessionKey, stream, qualityStreams) {
         (listOf(stream) + qualityStreams)
             .filterNot(StreamItem::isEmbed)
             .distinctBy(StreamItem::url)
@@ -424,11 +425,11 @@ fun PlayerSurface(
         }
     }
 
-    LaunchedEffect(controller, stream.url) {
+    LaunchedEffect(controller, playbackSessionKey) {
         controller?.let(::clearVideoSelection)
     }
 
-    DisposableEffect(controller) {
+    DisposableEffect(controller, playbackSessionKey) {
         val activeController = controller
         if (activeController == null) {
             onDispose { }
@@ -620,9 +621,9 @@ fun PlayerSurface(
         }
     }
 
-    var positionMs by remember { mutableLongStateOf(0L) }
-    var durationMs by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(controller) {
+    var positionMs by remember(playbackSessionKey) { mutableLongStateOf(startPositionMs.coerceAtLeast(0L)) }
+    var durationMs by remember(playbackSessionKey) { mutableLongStateOf(0L) }
+    LaunchedEffect(controller, playbackSessionKey) {
         val activeController = controller ?: return@LaunchedEffect
         while (isActive) {
             positionMs = activeController.currentPosition.coerceAtLeast(0)
@@ -739,7 +740,7 @@ fun PlayerSurface(
         phoneControlsVisible = false
     }
     val captionStyle by SettingsStore.captionStyle.collectAsState()
-    var pinnedVideoHeight by remember(controller, stream.url) { mutableStateOf<Int?>(null) }
+    var pinnedVideoHeight by remember(controller, playbackSessionKey) { mutableStateOf<Int?>(null) }
     fun changeVideoHeight(activeController: MediaController, height: Int?): Boolean {
         val applied = when {
             height == null -> {
@@ -773,8 +774,8 @@ fun PlayerSurface(
         return applied
     }
     val defaultQuality by SettingsStore.defaultQuality.collectAsState()
-    var defaultQualityApplied by remember(stream.url) { mutableStateOf(false) }
-    LaunchedEffect(controller, tracksRevision, defaultQuality) {
+    var defaultQualityApplied by remember(playbackSessionKey) { mutableStateOf(false) }
+    LaunchedEffect(controller, playbackSessionKey, tracksRevision, defaultQuality) {
         val activeController = controller ?: return@LaunchedEffect
         if (defaultQualityApplied || pinnedVideoHeight != null) return@LaunchedEffect
         if (defaultQuality == DefaultQuality.AUTO) return@LaunchedEffect
@@ -803,8 +804,8 @@ fun PlayerSurface(
     val introEndMs = skip?.introEnd?.times(1000)?.toLong()
     val outroStartMs = skip?.outroStart?.times(1000)?.toLong()
     val outroEndMs = skip?.outroEnd?.times(1000)?.toLong()
-    var introAutoSkipped by remember(activeStream.url, introStartMs, introEndMs) { mutableStateOf(false) }
-    var outroAutoHandled by remember(activeStream.url, outroStartMs, outroEndMs) { mutableStateOf(false) }
+    var introAutoSkipped by remember(playbackSessionKey, introStartMs, introEndMs) { mutableStateOf(false) }
+    var outroAutoHandled by remember(playbackSessionKey, outroStartMs, outroEndMs) { mutableStateOf(false) }
 
     LaunchedEffect(seekFlashTick) {
         if (seekFlash != 0) {
@@ -822,9 +823,14 @@ fun PlayerSurface(
         introEndMs,
         outroStartMs,
         outroEndMs,
+        playbackSessionKey,
     ) {
         val activeController = controller ?: return@LaunchedEffect
         if (!autoSkipIntroOutro || !activeController.isPlaying) return@LaunchedEffect
+        val currentIdentity = activeController.currentMediaItem?.playbackIdentityOrNull()
+        if (currentIdentity == null || !isSamePlaybackSession(currentIdentity, playbackIdentity)) {
+            return@LaunchedEffect
+        }
 
         if (!introAutoSkipped && isInSkipWindow(positionMs, introStartMs, introEndMs)) {
             introAutoSkipped = true
