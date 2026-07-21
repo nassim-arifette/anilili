@@ -1,5 +1,9 @@
 # AniLili+
 
+<p align="center">
+  <img src="app/src/main/res/drawable/anilili_plus_launcher.png" width="180" alt="AniLili+ logo" />
+</p>
+
 AniLili+ is a native Android anime streaming client built with Kotlin, Jetpack Compose, and
 Media3. Metadata, login, library lists, and progress sync are powered by AniList, while
 episodes and stream sources are resolved from multiple providers: Miruro, AniKoto,
@@ -14,8 +18,8 @@ streams play with ExoPlayer; embed providers and fallback playback use WebView.
 
 ## Screenshots
 
-These screenshots predate the AniLili+ rebrand; refreshed launcher and in-app captures remain on the
-documentation backlog.
+These in-app screenshots predate the AniLili+ rebrand. The installed launcher and TV artwork are
+now fork-specific; refreshed device captures remain on the documentation backlog.
 
 <p align="center">
   <a href="showcase/mobile/01-home.webp"><img src="showcase/mobile/01-home.webp" width="180" alt="AniLili+ home screen" /></a>
