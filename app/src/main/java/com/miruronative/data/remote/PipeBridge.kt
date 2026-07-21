@@ -11,10 +11,8 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.miruronative.diagnostics.DiagnosticsLog
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 
 /** Raw pipe response as returned by the in-page fetch, before deobfuscation. */
 data class RawPipeResponse(val ok: Boolean, val status: Int, val obf: String?, val body: String?, val error: String?)
@@ -50,7 +48,7 @@ object PipeBridge {
      */
     private const val IDLE_AFTER_MS = 60_000L
     private val idleRunnable = Runnable {
-        webView?.onPause()
+        attachment?.view?.onPause()
         DiagnosticsLog.event("PipeBridge webview idled")
     }
 
@@ -59,19 +57,32 @@ object PipeBridge {
         main.postDelayed(idleRunnable, IDLE_AFTER_MS)
     }
 
-    @Volatile private var webView: WebView? = null
-    @Volatile private var ready = CompletableDeferred<Boolean>()
-    @Volatile private var originIndex = 0
-    private val pending = ConcurrentHashMap<String, CompletableDeferred<String>>()
+    private data class AttachedWebView(
+        val view: WebView,
+        val session: PipeRequestLifecycle.Session<String>,
+        var readinessGeneration: Long,
+        var originIndex: Int = 0,
+    )
 
-    private val activeOrigin: String get() = ORIGINS[originIndex]
+    private val lifecycle = PipeRequestLifecycle<String>()
+    @Volatile private var attachment: AttachedWebView? = null
+
+    private fun activeOrigin(attached: AttachedWebView): String = ORIGINS[attached.originIndex]
+
+    private fun isCurrent(attached: AttachedWebView, callbackView: WebView? = attached.view): Boolean =
+        callbackView === attached.view && attachment === attached && lifecycle.isCurrent(attached.session)
 
     /** Called from the hosting Composable on the main thread with a freshly created WebView. */
     @SuppressLint("SetJavaScriptEnabled")
     fun attach(wv: WebView) {
         DiagnosticsLog.event("PipeBridge.attach")
-        webView = wv
-        if (ready.isCompleted) ready = CompletableDeferred()
+        main.removeCallbacks(idleRunnable)
+        val previous = attachment
+        val transition = lifecycle.attach()
+        val attached = AttachedWebView(wv, transition.session, transition.readinessGeneration)
+        attachment = attached
+        previous?.view?.removeJavascriptInterface("AndroidPipe")
+        failRequests(transition.displacedRequests, "webview replaced")
 
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
@@ -102,17 +113,32 @@ object PipeBridge {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 DiagnosticsLog.event("PipeBridge page started: ${url ?: "unknown"}")
+                if (isCurrent(attached, view)) {
+                    lifecycle.advanceReadinessGeneration(attached.session)?.let {
+                        attached.readinessGeneration = it
+                    }
+                }
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 DiagnosticsLog.event("PipeBridge page finished: ${url ?: "unknown"} title=${view?.title ?: "none"}")
                 Log.d(TAG, "onPageFinished: $url  title=${view?.title}")
+                if (!isCurrent(attached, view)) return
                 // Give Cloudflare a moment to settle, then allow fetches.
-                if (url != null && url.startsWith(activeOrigin)) {
+                val origin = activeOrigin(attached)
+                if (url != null && (url == origin || url.startsWith("$origin/"))) {
+                    val readinessGeneration = attached.readinessGeneration
                     main.postDelayed(
                         {
-                            if (!ready.isCompleted) ready.complete(true)
-                            scheduleIdle()
+                            if (
+                                isCurrent(attached) && lifecycle.markReady(
+                                    attached.session,
+                                    readinessGeneration,
+                                    successful = true,
+                                )
+                            ) {
+                                scheduleIdle()
+                            }
                         },
                         2000,
                     )
@@ -124,19 +150,32 @@ object PipeBridge {
                 request: WebResourceRequest?,
                 error: android.webkit.WebResourceError?,
             ) {
-                if (request?.isForMainFrame != true) return
+                if (request?.isForMainFrame != true || !isCurrent(attached, view)) return
+                val origin = activeOrigin(attached)
+                val failedUrl = request.url.toString()
+                if (failedUrl != origin && !failedUrl.startsWith("$origin/")) return
                 DiagnosticsLog.event(
                     "PipeBridge main-frame error code=${error?.errorCode} " +
-                        "description=${error?.description} origin=$activeOrigin",
+                        "description=${error?.description} origin=$origin",
                 )
                 // This mirror is unreachable (ISP block, DNS, site down): roll to the next one.
                 // Only once all mirrors fail do waiters unblock into the cache/error path.
-                if (originIndex < ORIGINS.lastIndex) {
-                    originIndex++
-                    DiagnosticsLog.event("PipeBridge trying mirror $activeOrigin")
-                    main.post { webView?.loadUrl("$activeOrigin/") }
-                } else if (!ready.isCompleted) {
-                    ready.complete(false)
+                if (attached.originIndex < ORIGINS.lastIndex) {
+                    lifecycle.advanceReadinessGeneration(attached.session)?.let {
+                        attached.readinessGeneration = it
+                    }
+                    attached.originIndex++
+                    val nextOrigin = activeOrigin(attached)
+                    DiagnosticsLog.event("PipeBridge trying mirror $nextOrigin")
+                    main.post {
+                        if (isCurrent(attached)) attached.view.loadUrl("$nextOrigin/")
+                    }
+                } else {
+                    lifecycle.markReady(
+                        attached.session,
+                        attached.readinessGeneration,
+                        successful = false,
+                    )
                 }
             }
 
@@ -149,40 +188,58 @@ object PipeBridge {
                 return true
             }
         }
-        DiagnosticsLog.event("PipeBridge load origin=$activeOrigin")
-        wv.loadUrl("$activeOrigin/")
+        val origin = activeOrigin(attached)
+        DiagnosticsLog.event("PipeBridge load origin=$origin")
+        wv.loadUrl("$origin/")
     }
 
     /** Releases the attached browser and fails requests that can no longer complete. */
     fun detach(wv: WebView) {
-        if (webView !== wv) return
+        val attached = attachment?.takeIf { it.view === wv } ?: return
         DiagnosticsLog.event("PipeBridge.detach")
         main.removeCallbacks(idleRunnable)
-        webView = null
-        ready = CompletableDeferred()
-        pending.entries.toList().forEach { (id, request) ->
-            if (pending.remove(id, request)) {
-                request.complete("""{"ok":false,"status":-1,"error":"webview released"}""")
-            }
-        }
+        attachment = null
+        failRequests(lifecycle.detach(attached.session), "webview released")
         wv.removeJavascriptInterface("AndroidPipe")
     }
 
     object Bridge {
         @JavascriptInterface
         fun onResult(id: String?, json: String) {
-            if (id != null) pending.remove(id)?.complete(json)
+            if (id != null) lifecycle.take(id)?.result?.complete(json)
         }
     }
 
     /** Runs `fetch('/api/secure/pipe?e=…')` inside the page and returns the raw JSON bridge payload. */
     suspend fun fetch(e: String, timeoutMs: Long = 30_000): String {
-        withTimeoutOrNull(25_000) { ready.await() }
+        val result = if (timeoutMs <= 0) {
+            null
+        } else {
+            withTimeoutOrNull(timeoutMs) { fetchWithinDeadline(e) }
+        } ?: run {
+            DiagnosticsLog.event("PipeBridge fetch timeout e.len=${e.length}")
+            errorPayload("timeout")
+        }
+        Log.d(TAG, "fetch(e.len=${e.length}) -> ${result.take(180)}")
+        return result
+    }
+
+    private suspend fun fetchWithinDeadline(e: String): String {
+        val attached = attachment ?: return errorPayload("webview not ready")
+        val readyResult = withTimeoutOrNull(READY_WAIT_TIMEOUT_MS) {
+            attached.session.readiness.await()
+        }
+        if (readyResult != true) {
+            val reason = if (readyResult == null) "webview readiness timeout" else "webview unavailable"
+            DiagnosticsLog.event("PipeBridge $reason generation=${attached.session.generation}")
+            return errorPayload(reason)
+        }
+
         // The request id doubles as an unguessable capability. The bridge is visible to every
         // frame, but only the top-level injected script receives this value.
         val id = UUID.randomUUID().toString()
-        val deferred = CompletableDeferred<String>()
-        pending[id] = deferred
+        val request = lifecycle.register(attached.session, id)
+            ?: return errorPayload("webview replaced")
 
         val js = """
             (function(){
@@ -206,26 +263,43 @@ object PipeBridge {
         """.trimIndent()
 
         main.post {
-            val wv = webView
-            if (wv == null) {
-                pending.remove(id)?.complete("""{"ok":false,"status":-1,"error":"webview not ready"}""")
+            if (!lifecycle.isPending(request)) return@post
+            if (!isCurrent(attached)) {
+                failRequest(request, "webview replaced")
             } else {
                 main.removeCallbacks(idleRunnable)
-                wv.onResume()
-                wv.evaluateJavascript(js, null)
-                scheduleIdle()
+                try {
+                    attached.view.onResume()
+                    attached.view.evaluateJavascript(js, null)
+                    scheduleIdle()
+                } catch (error: Throwable) {
+                    Log.w(TAG, "evaluateJavascript failed", error)
+                    failRequest(request, "webview request failed")
+                }
             }
         }
 
-        val result = withTimeoutOrNull(timeoutMs) { deferred.await() }
-            ?: run {
-                pending.remove(id)
-                DiagnosticsLog.event("PipeBridge fetch timeout e.len=${e.length}")
-                """{"ok":false,"status":-1,"error":"timeout"}"""
-            }
-        Log.d(TAG, "fetch(e.len=${e.length}) -> ${result.take(180)}")
-        return result
+        return try {
+            request.result.await()
+        } finally {
+            // This also runs for caller cancellation and the outer request timeout. A posted main
+            // thread task checks this ownership before injecting JavaScript.
+            lifecycle.cancel(request)
+        }
     }
 
+    private fun failRequest(request: PipeRequestLifecycle.Request<String>, reason: String) {
+        if (lifecycle.cancel(request)) request.result.complete(errorPayload(reason))
+    }
+
+    private fun failRequests(requests: List<PipeRequestLifecycle.Request<String>>, reason: String) {
+        val payload = errorPayload(reason)
+        requests.forEach { it.result.complete(payload) }
+    }
+
+    private fun errorPayload(reason: String): String =
+        """{"ok":false,"status":-1,"error":"$reason"}"""
+
+    private const val READY_WAIT_TIMEOUT_MS = 25_000L
     private const val TAG = "PipeBridge"
 }
