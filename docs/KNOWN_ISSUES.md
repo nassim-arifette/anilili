@@ -51,9 +51,12 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | ID | Status | Fix | Topic branch |
 | --- | --- | --- | --- |
 | SKIP-001 | [x] | Merge provider and AniSkip intro/outro fields independently; a provider marker always wins for the field it supplied. | `fix/skip-marker-field-merge` |
-| SKIP-002 | [x] | Keep a slow AniSkip lookup alive after the 2.5-second startup budget and publish it only into the still-matching playback generation. | `fix/late-aniskip-publication` |
+| SKIP-002 | [x] | Keep a slow AniSkip lookup alive after the 2.5-second startup budget and publish it only into the still-matching playback generation. Superseded by the duration-bound typed policy in SKIP-006. | `fix/late-aniskip-publication` |
 | SKIP-003 | [x] | Keep Skip Outro independent from autoplay, and never auto-skip while playback is paused. | `fix/outro-skip-policy` |
 | SKIP-004 | [x] | Mark an embed auto-skip handled only after JavaScript confirms the seek; failed seeks are retried under the current navigation generation. | `fix/embed-seek-result-ack` |
+| SKIP-005 | [x] | Query AniSkip v2 with the measured media duration, decimal episode number, all five segment types, and MAL relation rules; retain typed intervals, reference durations, and contribution IDs. | `feature/aniskip-segments` |
+| SKIP-006 | [x] | Bind duration-adjusted AniSkip results to the exact request, episode, provider, category, generation, media item, and stable duration. Provider markers remain manual-only while the typed lookup is pending, then act as fallback only for families AniSkip did not identify. | `feature/aniskip-segments` |
+| SKIP-007 | [x] | Auto-skip only pure openings/endings. Mixed openings, mixed endings, and recaps have explicit manual actions; mixed typed markers suppress untyped provider auto-skip for the same family, including late responses. | `feature/aniskip-segments` |
 | EMBED-001 | [x] | Authenticate bridge callbacks and isolate every embed navigation so an old page cannot update the new episode. | `fix/webview-bridge-capabilities`, `fix/embed-navigation-generation` |
 | EMBED-002 | [x] | Retry resume until a same-origin video is ready, including accessible iframes, and preserve pause state during seeks. | `fix/embed-resume-readiness`, `fix/embed-seek-preserves-pause` |
 | EMBED-003 | [x] | Accept natural embed completion only after content-like playback samples, commit it before autoplay, and advance at most once. | `fix/embed-safe-natural-end-autoplay`, `fix/embed-terminal-progress-commit` |
@@ -85,7 +88,9 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   natural end, speed, and caption control remain unavailable there. A reliable solution needs a
   provider `postMessage` contract, a native stream, or an app-controlled player page. The app also
   cannot enumerate or pause two independent media elements inside an active cross-origin iframe;
-  only whole-WebView pause and blanking during transitions are guaranteed.
+  only whole-WebView pause and blanking during transitions are guaranteed. AniSkip is intentionally
+  not queried without a real duration on these embeds; provider markers remain a fail-open fallback
+  and cannot auto-seek while observable playback telemetry is unavailable.
 
 - [x] **OPEN-002 - Generic web fallback identity.** Generic fallback pages are now explicitly
   unmanaged: they cannot write route-owned progress/history, and cross-origin controls expose only
@@ -117,6 +122,11 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   standalone `<audio>` element alongside its video. Generic competing-media protection can classify
   that track as background media and pause it; reliable pairing requires provider metadata or a
   player messaging contract.
+
+- [ ] **OPEN-027 - Community skip-marker coverage.** AniSkip timestamps, segment classifications,
+  and MAL relation rules are community-maintained and may be missing or inaccurate for a particular
+  episode or encode. The app validates duration drift and ranges and preserves provider fallback,
+  but it cannot infer a trustworthy missing opening, ending, mixed segment, or recap locally.
 
 - [x] **OPEN-006 - Optimistic manual embed controls.** Seek, play/pause, speed, volume, resume, and
   skip commands now carry a generation, command ID, and media identity. UI state changes only after
@@ -232,6 +242,9 @@ replacements:
   `com.nassimarifette.anililiplus`, `versionCode 31`, 16 KiB ZIP alignment, one signer, and the
   pinned release certificate. Local SHA-256:
   `a131a746387f21bc722930d807fd0063e919e79abef9511ce908675abaf24f44`.
+- [x] Compile the duration-bound AniSkip integration and run 53 focused JVM tests covering API
+  parsing and URLs, relation mapping, duration correction and cache scope, mixed/recap policy,
+  pending and stale publication, and source-policy regressions (July 21, 2026).
 - [x] Publish and download GitHub Release `v0.2.0`, then independently verify its sidecar and API
   SHA-256 (`3c0897f11fb5763cf5eb71d51043321fb56b11835d8a5a719ed7e9fd9b45f6ad`),
   package metadata, 16 KiB alignment, and pinned signer (July 21, 2026).

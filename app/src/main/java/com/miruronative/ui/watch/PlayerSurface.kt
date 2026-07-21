@@ -92,6 +92,7 @@ import com.miruronative.data.model.Category
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import com.miruronative.data.model.AniSkipPlaybackSegment
 import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.model.SubtitleItem
@@ -345,6 +346,8 @@ internal fun PlayerSurface(
     qualityStreams: List<StreamItem> = listOf(stream),
     subtitles: List<SubtitleItem>,
     skip: SkipTimes?,
+    aniSkipSegments: List<AniSkipPlaybackSegment>,
+    aniSkipLookupStatus: AniSkipLookupStatus,
     seriesTitle: String,
     episodeTitle: String,
     historyEpisodeTitle: String?,
@@ -1164,10 +1167,15 @@ internal fun PlayerSurface(
     var seekFlashTick by remember { mutableIntStateOf(0) }
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
     val autoplay by SettingsStore.autoplay.collectAsState()
-    val introStartMs = skip?.introStart?.times(1000)?.toLong() ?: 0L
-    val introEndMs = skip?.introEnd?.times(1000)?.toLong()
-    val outroStartMs = skip?.outroStart?.times(1000)?.toLong()
-    val outroEndMs = skip?.outroEnd?.times(1000)?.toLong()
+    val skipPlan = remember(skip, aniSkipSegments, aniSkipLookupStatus) {
+        buildPlaybackSkipPlan(skip, aniSkipSegments, aniSkipLookupStatus)
+    }
+    val automaticOpening = skipPlan.automaticOpening
+    val automaticEnding = skipPlan.automaticEnding
+    val introStartMs = automaticOpening?.startMs ?: 0L
+    val introEndMs = automaticOpening?.endMs
+    val outroStartMs = automaticEnding?.startMs
+    val outroEndMs = automaticEnding?.endMs
     var introAutoSkipped by remember(playbackSessionKey, introStartMs, introEndMs) { mutableStateOf(false) }
     var outroAutoHandled by remember(playbackSessionKey, outroStartMs, outroEndMs) { mutableStateOf(false) }
 
@@ -1656,25 +1664,17 @@ internal fun PlayerSurface(
             )
         }
 
-        val action: Pair<String, () -> Unit>? = when {
-            introEndMs != null && positionMs in introStartMs..introEndMs ->
-                "Skip Intro" to {
-                    runIfPlaybackOwnerActive { controller?.seekTo(introEndMs) }
-                    Unit
-                }
-            outroStartMs != null && outroEndMs != null && positionMs in outroStartMs..outroEndMs ->
-                if (hasNextEpisode) {
-                    "Next Episode" to {
-                        runIfPlaybackOwnerActive { onNextEpisode() }
-                        Unit
-                    }
-                } else {
-                    "Skip Outro" to {
-                        runIfPlaybackOwnerActive { controller?.seekTo(outroEndMs) }
-                        Unit
+        val action = skipPlan.actionAt(positionMs, hasNextEpisode)?.let { planned ->
+            planned.label to {
+                runIfPlaybackOwnerActive {
+                    if (planned.advanceToNextEpisode) {
+                        onNextEpisode()
+                    } else {
+                        planned.seekTargetMs?.let { controller?.seekTo(it) }
                     }
                 }
-            else -> null
+                Unit
+            }
         }
         LaunchedEffect(action?.first, playerView, device.isTv, focusPlayerOnStart) {
             if (device.isTv && focusPlayerOnStart) {
