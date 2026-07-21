@@ -377,10 +377,10 @@ fun PlayerSurface(
     // decoders (Fire TV's OMX.MS.AVC) can die on 1080p with a codec error even though the
     // format is nominally supported, and a provider failover for a device-side decode hiccup
     // needlessly restarts the episode on another server.
-    // The listener below lives for the MediaController, not for a particular episode. Keep its
-    // retry marker in stable state so it always observes the currently loaded media id instead of
-    // retaining the first stream's keyed remember value in its closure.
-    var decoderRetryMediaId by remember { mutableStateOf<String?>(null) }
+    // The listener below lives for the MediaController, not for a particular episode. Keep the
+    // retry allowance tied to each MediaItem installation so a new logical playback can retry
+    // even when its provider reuses the same URL as the previous episode.
+    val decoderRetryPolicy = remember { PlayerDecoderRetryPolicy() }
     val nativeQualityStreams = remember(stream.url, qualityStreams) {
         (listOf(stream) + qualityStreams)
             .filterNot(StreamItem::isEmbed)
@@ -465,9 +465,8 @@ fun PlayerSurface(
                     val failedMediaId = activeController.currentMediaItem?.mediaId
                     if (
                         error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED &&
-                        shouldRetryDecoderForMedia(decoderRetryMediaId, failedMediaId)
+                        decoderRetryPolicy.tryConsumeRetry(failedMediaId)
                     ) {
-                        decoderRetryMediaId = failedMediaId
                         val resumeAt = activeController.currentPosition.coerceAtLeast(0L)
                         activeController.trackSelectionParameters = activeController.trackSelectionParameters
                             .buildUpon()
@@ -597,6 +596,7 @@ fun PlayerSurface(
             .build()
         currentOnPlaybackIdentityChanged(nativePlaybackIdentity)
         activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
+        decoderRetryPolicy.onMediaItemSet()
         activeController.prepare()
         activeController.playWhenReady = true
         DiagnosticsLog.event("PlayerSurface prepare called playWhenReady=true")
@@ -1226,9 +1226,6 @@ fun PlayerSurface(
         }
     }
 }
-
-internal fun shouldRetryDecoderForMedia(lastRetriedMediaId: String?, failedMediaId: String?): Boolean =
-    !failedMediaId.isNullOrBlank() && failedMediaId != lastRetriedMediaId
 
 private tailrec fun Context.findPlayerLifecycleOwner(): LifecycleOwner? = when (this) {
     is LifecycleOwner -> this
