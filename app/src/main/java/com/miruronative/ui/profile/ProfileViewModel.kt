@@ -46,6 +46,7 @@ class ProfileViewModel : ViewModel() {
     private val loadGate = ProfileLoadGate()
     private var profileLoadJob: Job? = null
     private var malLoginJob: Job? = null
+    private var malLoginGeneration = 0L
 
     private val _profile = MutableStateFlow<UiState<AniListProfile>?>(null)
     val profile = _profile.asStateFlow()
@@ -55,8 +56,7 @@ class ProfileViewModel : ViewModel() {
     fun loadIfLoggedIn(refresh: Boolean = false) {
         // A profile load supersedes a pending login result. This also covers a login completed
         // outside this ViewModel (for example an Activity OAuth redirect).
-        malLoginJob?.cancel()
-        malLoginJob = null
+        cancelMalLogin()
         val session = currentAccountSession()
         if (session == null) {
             invalidateProfileLoad()
@@ -139,7 +139,7 @@ class ProfileViewModel : ViewModel() {
     fun onLoggedIn(authorization: AniListAuthorizationToken) {
         if (!AuthManager.setToken(authorization)) return
         invalidateProfileLoad()
-        malLoginJob?.cancel()
+        cancelMalLogin()
         LibraryStore.syncSavedToRemote()
         loadIfLoggedIn()
     }
@@ -147,7 +147,8 @@ class ProfileViewModel : ViewModel() {
     /** MAL redirect hands back a code; trade it for tokens before loading the profile. */
     fun onMalCode(code: MalAuthorizationCode) {
         invalidateProfileLoad()
-        malLoginJob?.cancel()
+        cancelMalLogin()
+        val loginGeneration = malLoginGeneration
         _profile.value = UiState.Loading
         malLoginJob = viewModelScope.launch {
             try {
@@ -159,15 +160,16 @@ class ProfileViewModel : ViewModel() {
                 e.rethrowIfCancellation()
                 // MalAuthManager clears only the login attempt that actually failed. An
                 // unconditional logout here could erase a newer login that won the race.
-                _profile.value = UiState.Error(e.message ?: "MyAnimeList login failed")
+                if (malLoginGeneration == loginGeneration) {
+                    _profile.value = UiState.Error(e.message ?: "MyAnimeList login failed")
+                }
             }
         }
     }
 
     fun logout() {
         invalidateProfileLoad()
-        malLoginJob?.cancel()
-        malLoginJob = null
+        cancelMalLogin()
         AuthManager.logout()
         MalAuthManager.logout()
         _profile.value = null
@@ -178,6 +180,12 @@ class ProfileViewModel : ViewModel() {
         profileLoadJob?.cancel()
         profileLoadJob = null
         _isRefreshing.value = false
+    }
+
+    private fun cancelMalLogin() {
+        malLoginGeneration++
+        malLoginJob?.cancel()
+        malLoginJob = null
     }
 
     /** Account validation is outermost so an auth mutation cannot interleave with publication. */
