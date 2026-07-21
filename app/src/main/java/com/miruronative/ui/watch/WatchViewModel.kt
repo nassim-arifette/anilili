@@ -19,6 +19,7 @@ import com.miruronative.data.model.SourcesResult
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.remote.KonohaEpisode
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.playback.PlaybackService
 import com.miruronative.ui.UiState
 import com.miruronative.ui.detail.mergeEpisodeMetadata
 import com.miruronative.ui.rethrowIfCancellation
@@ -60,6 +61,7 @@ data class WatchData(
     val averageScore: Int? = null,
     val popularity: Int? = null,
     val description: String? = null,
+    val totalEpisodes: Int? = null,
     val startPositionMs: Long = 0,
     val playbackGeneration: Int = 0,
     val preferredProvider: String = DEFAULT_PREFERRED_PROVIDER,
@@ -661,6 +663,7 @@ class WatchViewModel : ViewModel() {
             averageScore = averageScore,
             popularity = popularity,
             description = description,
+            totalEpisodes = totalEpisodes,
             startPositionMs = resume,
             playbackGeneration = sourceGeneration,
             preferredProvider = globalPreferredProvider,
@@ -781,6 +784,24 @@ class WatchViewModel : ViewModel() {
 
     /** Commits a natural end synchronously before the caller is allowed to autoplay Next. */
     fun onNativePlaybackEnded(completion: NativePlaybackCompletion): Boolean {
+        if (PlaybackService.wasRemotePlaybackCompletionCommitted(completion.identity.playbackId)) {
+            DiagnosticsLog.event("Watch ignored service-committed remote native end")
+            return false
+        }
+        if (
+            PlaybackService.ownsRemotePlaybackCompletion(
+                playbackId = completion.identity.playbackId,
+                animeId = completion.identity.animeId,
+                episodeNumber = completion.identity.episodeNumber,
+                mediaId = completion.identity.mediaId,
+            )
+        ) {
+            // PlaybackService commits remote terminal state before it invokes the registered
+            // episode navigator. Returning false also prevents this UI listener from becoming a
+            // second terminal writer for the same Cast event.
+            DiagnosticsLog.event("Watch delegated remote native end to PlaybackService")
+            return false
+        }
         val data = (_state.value as? UiState.Success)?.data ?: return false
         if (data.isResolving) return false
         val commit = planNativeCompletionCommit(
@@ -1002,6 +1023,23 @@ class WatchViewModel : ViewModel() {
             )
             return
         }
+        val resumedLocalOwnership = PlaybackService.acknowledgeFreshLocalPlaybackProgress(
+            animeId = identity.animeId,
+            episodeNumber = identity.episodeNumber,
+            generation = identity.generation,
+            mediaId = identity.mediaId,
+        )
+        if (
+            !resumedLocalOwnership &&
+            PlaybackService.ownsRemotePlaybackHistory(
+                animeId = identity.animeId,
+                episodeNumber = identity.episodeNumber,
+                generation = identity.generation,
+                mediaId = identity.mediaId,
+            )
+        ) {
+            return
+        }
         acceptProgress(data, identity, positionMs, durationMs)
     }
 
@@ -1055,13 +1093,27 @@ class WatchViewModel : ViewModel() {
     private fun <T> withNativeProgressFlushedBeforeTransition(
         data: WatchData?,
         transition: () -> T,
-    ): T = flushProgressBeforeTransition(
-        candidate = lastKnownProgress,
-        confirmedIdentity = confirmedHistoryIdentity,
-        activeTarget = data?.nativePlaybackTarget(),
-        persist = ::persistTransitionProgress,
-        transition = transition,
-    )
+    ): T {
+        val candidateIdentity = lastKnownProgress?.identity
+        val serviceOwnsCandidate = candidateIdentity != null &&
+            PlaybackService.ownsRemotePlaybackHistory(
+                animeId = candidateIdentity.animeId,
+                episodeNumber = candidateIdentity.episodeNumber,
+                generation = candidateIdentity.generation,
+                mediaId = candidateIdentity.mediaId,
+            )
+        if (serviceOwnsCandidate || (candidateIdentity == null && PlaybackService.isRemotePlaybackHistoryOwnedByService())) {
+            PlaybackService.flushRemotePlaybackHistory()
+            return transition()
+        }
+        return flushProgressBeforeTransition(
+            candidate = lastKnownProgress,
+            confirmedIdentity = confirmedHistoryIdentity,
+            activeTarget = data?.nativePlaybackTarget(),
+            persist = ::persistTransitionProgress,
+            transition = transition,
+        )
+    }
 
     private fun persistTransitionProgress(progress: PlaybackProgressSnapshot) {
         // updateProgress deliberately cannot create history. The matching entry was inserted by
@@ -1184,6 +1236,23 @@ class WatchViewModel : ViewModel() {
      */
     fun commitPlaybackPosition() {
         val data = (_state.value as? UiState.Success)?.data ?: return
+        val candidateIdentity = lastKnownProgress?.identity
+        val serviceOwnsCandidate = candidateIdentity != null &&
+            PlaybackService.ownsRemotePlaybackHistory(
+                animeId = candidateIdentity.animeId,
+                episodeNumber = candidateIdentity.episodeNumber,
+                generation = candidateIdentity.generation,
+                mediaId = candidateIdentity.mediaId,
+            )
+        if (serviceOwnsCandidate || (candidateIdentity == null && PlaybackService.isRemotePlaybackHistoryOwnedByService())) {
+            PlaybackService.flushRemotePlaybackHistory()
+            val saved = LibraryStore.historyFor(data.anilistId)
+                ?.takeIf { it.episodeNumber == data.current.number }
+            if (saved != null) {
+                _state.value = UiState.Success(data.copy(startPositionMs = saved.positionMs))
+            }
+            return
+        }
         val progress = lastKnownProgress ?: return
         if (!acceptsPlaybackProgress(progress.identity, data.playbackTarget()) || progress.positionMs <= 0) return
         lastProgressSave = SystemClock.elapsedRealtime()

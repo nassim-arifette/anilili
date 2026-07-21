@@ -1,9 +1,13 @@
 package com.miruronative.playback
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.os.Build
+import android.os.SystemClock
 import android.view.KeyEvent
 import android.webkit.WebSettings
 import androidx.annotation.OptIn
@@ -30,10 +34,26 @@ import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.MainActivity
+import com.miruronative.data.AppGraph
+import com.miruronative.data.auth.AccountService
+import com.miruronative.data.library.HistoryEntry
+import com.miruronative.data.library.LibraryStore
+import com.miruronative.data.settings.SettingsStore
 import com.miruronative.ui.nav.Routes
+import com.miruronative.ui.watch.shouldSyncAniListProgress
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 
 /** Process-wide playback state used by the activity to decide when PiP is appropriate. */
 object PlaybackStatus {
@@ -86,7 +106,15 @@ object PlaybackStatus {
 
 private class EpisodeNavigatorRegistration(
     val owner: WatchPlaybackOwnerToken,
+    var playback: EpisodeNavigatorPlaybackIdentity,
     val navigate: (direction: Int) -> Unit,
+)
+
+private data class RemoteProgressSyncKey(
+    val animeId: Int,
+    val episode: Int,
+    val generation: Int,
+    val service: AccountService,
 )
 
 /**
@@ -99,10 +127,21 @@ class PlaybackService : MediaSessionService() {
     private lateinit var castPlayer: CastPlayer
     private lateinit var session: MediaSession
     private lateinit var httpFactory: HttpDataSource.Factory
+    private val remoteHistoryCoordinator = RemoteCastHistoryCoordinator()
+    private val remoteHistoryRegistry = RemotePlaybackHistoryRegistry()
+    private val remoteHistoryJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    private lateinit var remoteHistoryPreferences: SharedPreferences
+    private var remoteHistoryRegistryDirty = false
+    private val syncedRemoteProgress = mutableSetOf<RemoteProgressSyncKey>()
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     override fun onCreate() {
         super.onCreate()
         DiagnosticsLog.event("PlaybackService.onCreate")
+        remoteHistoryPreferences = getSharedPreferences(REMOTE_HISTORY_PREFS, Context.MODE_PRIVATE)
+        restoreRemotePlaybackHistoryMetadata()
+        remoteHistoryMetadataRegistrar = ::rememberRemotePlaybackHistoryMetadata
+        remoteHistoryMetadataResolver = remoteHistoryRegistry::resolve
         val playerUserAgent = runCatching { WebSettings.getDefaultUserAgent(this).replace("; wv", "") }
             .getOrDefault(FALLBACK_PLAYER_USER_AGENT)
         activeUserAgent = playerUserAgent
@@ -162,6 +201,30 @@ class PlaybackService : MediaSessionService() {
             .setTransferCallback { sourcePlayer, targetPlayer ->
                 val sourceRoute = sourcePlayer.playbackRoute()
                 val targetRoute = targetPlayer.playbackRoute()
+                val sourceMetadata = remoteHistoryMetadataFor(sourcePlayer.currentMediaItem)
+                if (targetRoute == PlaybackRoute.REMOTE) {
+                    remoteHistoryHandoffIdentity = null
+                } else if (sourceRoute == PlaybackRoute.REMOTE) {
+                    // Keep the exact receiver identity until Watch observes a fresh local sample.
+                    // This closes the short window where its last cached tick is still pre-Cast.
+                    remoteHistoryHandoffIdentity = sourceMetadata?.identity
+                }
+                if (targetRoute == PlaybackRoute.REMOTE && sourceMetadata != null) {
+                    remoteHistoryOwnerIdentity = sourceMetadata.identity
+                    val matchingHistoryExists = LibraryStore.historyFor(sourceMetadata.animeId)
+                        ?.episodeNumber == sourceMetadata.episodeNumber
+                    if (sourcePlayer.isPlaying && matchingHistoryExists) {
+                        remoteHistoryCoordinator.adoptConfirmedPlayback(
+                            metadata = sourceMetadata,
+                            elapsedRealtimeMs = SystemClock.elapsedRealtime(),
+                        )
+                    }
+                }
+                if (sourceRoute == PlaybackRoute.REMOTE) {
+                    // Capture the receiver's exact last position before Media3 swaps the active
+                    // player. Once local playback owns the session again, UI persistence resumes.
+                    persistRemoteProgress(sourcePlayer, force = true, isRemote = true)
+                }
                 val directive = castTransferDirective(
                     sourceRoute = sourceRoute,
                     targetRoute = targetRoute,
@@ -182,6 +245,7 @@ class PlaybackService : MediaSessionService() {
                 } else {
                     CastPlayer.TransferCallback.DEFAULT.transferState(sourcePlayer, targetPlayer)
                 }
+                if (targetRoute == PlaybackRoute.LOCAL) remoteHistoryOwnerIdentity = null
             }
             .build()
             .apply {
@@ -193,10 +257,18 @@ class PlaybackService : MediaSessionService() {
                         // re-arms the media buttons; the suppression only covers the window
                         // between the lifecycle pause and the next deliberate start.
                         if (isPlaying) allowMediaButtonResume()
+                        // A remote pause is a lifecycle boundary: bank it synchronously rather
+                        // than waiting for another playing sample that may never arrive.
+                        persistRemoteProgress(castPlayer, force = !isPlaying)
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         DiagnosticsLog.event("PlaybackService player state=${playbackState.stateName()}")
+                        if (playbackState == Player.STATE_ENDED) {
+                            persistRemoteCompletion(castPlayer)
+                        } else {
+                            persistRemoteProgress(castPlayer)
+                        }
                     }
 
                     override fun onDeviceInfoChanged(deviceInfo: DeviceInfo) {
@@ -210,6 +282,11 @@ class PlaybackService : MediaSessionService() {
                             "PlaybackService route=${route.name.lowercase()} " +
                                 "routingController=${deviceInfo.routingControllerId ?: "none"}",
                         )
+                        if (deviceInfo.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE) {
+                            persistRemoteProgress(castPlayer)
+                        } else {
+                            remoteHistoryOwnerIdentity = null
+                        }
                     }
 
                     override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -234,13 +311,35 @@ class PlaybackService : MediaSessionService() {
                                 "mediaId=${mediaItem?.mediaId?.take(120) ?: "none"}",
                         )
                         if (!::session.isInitialized) return
+                        val retained = remoteHistoryMetadataFor(mediaItem)
                         val route = mediaItem?.mediaMetadata?.extras?.getString(EXTRA_WATCH_ROUTE)
+                            ?: retained?.let {
+                                Routes.watch(
+                                    it.animeId,
+                                    it.provider,
+                                    it.category,
+                                    it.episodeNumber.routeEpisodeLabel(),
+                                )
+                            }
                         session.setSessionActivity(sessionActivity(route))
+                        persistRemoteProgress(castPlayer)
                     }
                 })
             }
         activePlayer = castPlayer
         PlaybackStatus.updatePlaybackRoute(castPlayer.playbackRoute())
+        remoteHistoryFlusher = { persistRemoteProgress(castPlayer, force = true) }
+        serviceScope.launch {
+            while (isActive) {
+                delay(REMOTE_HISTORY_POLL_MS)
+                if (!::castPlayer.isInitialized) continue
+                if (castPlayer.playbackState == Player.STATE_ENDED) {
+                    persistRemoteCompletion(castPlayer)
+                } else {
+                    persistRemoteProgress(castPlayer)
+                }
+            }
+        }
 
         // The playlist holds one media item at a time (episodes resolve lazily, per provider),
         // but the session still advertises next/previous by forwarding them to the app's
@@ -268,24 +367,28 @@ class PlaybackService : MediaSessionService() {
             override fun hasPreviousMediaItem(): Boolean = hasActiveEpisodeNavigator()
 
             override fun seekToNext() {
+                persistRemoteProgress(castPlayer, force = true)
                 val handled = navigateActiveEpisode(1)
                 DiagnosticsLog.event("PlaybackService seekToNext navigator=$handled")
                 if (!handled) super.seekToNext()
             }
 
             override fun seekToNextMediaItem() {
+                persistRemoteProgress(castPlayer, force = true)
                 val handled = navigateActiveEpisode(1)
                 DiagnosticsLog.event("PlaybackService seekToNextMediaItem navigator=$handled")
                 if (!handled) super.seekToNextMediaItem()
             }
 
             override fun seekToPrevious() {
+                persistRemoteProgress(castPlayer, force = true)
                 val handled = navigateActiveEpisode(-1)
                 DiagnosticsLog.event("PlaybackService seekToPrevious navigator=$handled")
                 if (!handled) super.seekToPrevious()
             }
 
             override fun seekToPreviousMediaItem() {
+                persistRemoteProgress(castPlayer, force = true)
                 val handled = navigateActiveEpisode(-1)
                 DiagnosticsLog.event("PlaybackService seekToPreviousMediaItem navigator=$handled")
                 if (!handled) super.seekToPreviousMediaItem()
@@ -346,17 +449,324 @@ class PlaybackService : MediaSessionService() {
         )
     }
 
+    private fun restoreRemotePlaybackHistoryMetadata() {
+        val encoded = remoteHistoryPreferences.getString(KEY_REMOTE_HISTORY_METADATA, null) ?: return
+        runCatching {
+            remoteHistoryJson.decodeFromString(
+                ListSerializer(RemotePlaybackHistoryMetadata.serializer()),
+                encoded,
+            )
+        }.onSuccess { restored ->
+            restored.forEach(remoteHistoryRegistry::register)
+            DiagnosticsLog.event("PlaybackService restored remote history metadata=${restored.size}")
+        }.onFailure {
+            DiagnosticsLog.throwable("PlaybackService remote history metadata restore failed", it)
+        }
+    }
+
+    @SuppressLint("ApplySharedPref")
+    private fun rememberRemotePlaybackHistoryMetadata(metadata: RemotePlaybackHistoryMetadata) {
+        if (remoteHistoryRegistry.register(metadata)) remoteHistoryRegistryDirty = true
+        persistRemotePlaybackHistoryRegistry()
+    }
+
+    @SuppressLint("ApplySharedPref")
+    private fun persistRemotePlaybackHistoryRegistry(): Boolean {
+        if (!remoteHistoryRegistryDirty) return true
+        val committed = runCatching {
+            val encoded = remoteHistoryJson.encodeToString(
+                ListSerializer(RemotePlaybackHistoryMetadata.serializer()),
+                remoteHistoryRegistry.snapshot(),
+            )
+            remoteHistoryPreferences.edit().putString(KEY_REMOTE_HISTORY_METADATA, encoded).commit()
+        }.onFailure {
+            DiagnosticsLog.throwable("PlaybackService remote history metadata encode failed", it)
+        }.getOrDefault(false)
+        remoteHistoryRegistryDirty = !committed
+        if (!committed) {
+            DiagnosticsLog.event("PlaybackService remote history metadata disk commit failed")
+        }
+        return committed
+    }
+
+    private fun remoteHistoryMetadataFor(
+        item: androidx.media3.common.MediaItem?,
+    ): RemotePlaybackHistoryMetadata? {
+        if (item == null) return null
+        val embedded = item.remotePlaybackHistoryMetadataOrNull()
+        if (embedded != null) {
+            rememberRemotePlaybackHistoryMetadata(embedded)
+            return embedded
+        }
+        // DefaultMediaItemConverter keeps MediaItem.mediaId but drops MediaMetadata.extras.
+        // PlayerSurface registers the immutable metadata before setMediaItem(), so the unique
+        // playback ID remains sufficient after the Cast round trip even when URLs are reused.
+        return remoteHistoryRegistry.resolve(item.mediaId)?.also { retained ->
+            persistRemotePlaybackHistoryRegistry()
+            // Re-bind a live Watch navigator after service/process recreation as well as during
+            // the initial sender-side registration. The UUID remains the authority in both cases.
+            latestRegisteredRemoteHistoryMetadata = retained
+            bindEpisodeNavigatorPlayback(retained)
+        }
+    }
+
+    private fun persistRemoteProgress(
+        source: Player,
+        force: Boolean = false,
+        isRemote: Boolean = source.deviceInfo.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE,
+    ): Boolean {
+        val metadata = remoteHistoryMetadataFor(source.currentMediaItem)
+        if (isRemote) remoteHistoryOwnerIdentity = metadata?.identity
+        val elapsedRealtimeMs = SystemClock.elapsedRealtime()
+        val canRestorePausedConfirmation = force &&
+            isRemote &&
+            !source.isPlaying &&
+            metadata != null &&
+            LibraryStore.historyFor(metadata.animeId)?.episodeNumber == metadata.episodeNumber
+        val restoredPausedConfirmation = canRestorePausedConfirmation &&
+            remoteHistoryCoordinator.adoptConfirmedPlayback(metadata, elapsedRealtimeMs)
+        val write = if (restoredPausedConfirmation) {
+            // A durable matching entry proves this receiver item was already confirmed before
+            // service recreation. Reinsert through the non-regressing confirmation path first.
+            RemoteHistoryWrite.Confirmed(
+                metadata = checkNotNull(metadata),
+                positionMs = source.currentPosition.coerceAtLeast(0L),
+                durationMs = source.duration.coerceAtLeast(0L),
+            )
+        } else {
+            remoteHistoryCoordinator.sample(
+                metadata = metadata,
+                positionMs = source.currentPosition,
+                durationMs = source.duration,
+                isPlaying = source.isPlaying,
+                isRemote = isRemote,
+                elapsedRealtimeMs = elapsedRealtimeMs,
+                force = force,
+            )
+        } ?: return false
+        val persisted = runCatching {
+            when (write) {
+                is RemoteHistoryWrite.Confirmed -> persistConfirmedRemoteHistory(write)
+                is RemoteHistoryWrite.Progress -> persistRemoteHistoryProgress(write)
+                is RemoteHistoryWrite.Completion -> false
+            }
+        }.onFailure {
+            DiagnosticsLog.throwable("PlaybackService remote history progress failed", it)
+        }.getOrDefault(false)
+        if (!persisted && write is RemoteHistoryWrite.Confirmed) {
+            remoteHistoryCoordinator.retryConfirmation(write.metadata.identity)
+        }
+        return persisted
+    }
+
+    private fun persistConfirmedRemoteHistory(write: RemoteHistoryWrite.Confirmed): Boolean {
+        val metadata = write.metadata
+        val previous = LibraryStore.historyFor(metadata.animeId)
+            ?.takeIf { it.episodeNumber == metadata.episodeNumber }
+        val entry = metadata.toHistoryEntry(
+            positionMs = if (previous?.completed == true) {
+                write.positionMs
+            } else {
+                maxOf(previous?.positionMs ?: 0L, write.positionMs)
+            },
+            durationMs = maxOf(previous?.durationMs ?: 0L, write.durationMs),
+            completed = false,
+        )
+        if (!LibraryStore.upsertHistoryDurably(entry)) return false
+        maybeSyncRemoteAccountProgress(metadata, entry.positionMs, entry.durationMs)
+        DiagnosticsLog.event(
+            "PlaybackService remote history confirmed episode=${metadata.episodeNumber} " +
+                "playbackId=${metadata.playbackId.take(8)} positionMs=${entry.positionMs}",
+        )
+        return true
+    }
+
+    private fun persistRemoteHistoryProgress(write: RemoteHistoryWrite.Progress): Boolean {
+        val metadata = write.metadata
+        val saved = LibraryStore.historyFor(metadata.animeId)
+            ?.takeIf { it.episodeNumber == metadata.episodeNumber }
+            ?: return false
+        val durationMs = maxOf(saved.durationMs, write.durationMs)
+        val persisted = if (write.durable) {
+            LibraryStore.upsertHistoryDurably(
+                saved.copy(positionMs = write.positionMs, durationMs = durationMs),
+            )
+        } else {
+            LibraryStore.updateProgress(
+                anilistId = metadata.animeId,
+                episodeNumber = metadata.episodeNumber,
+                positionMs = write.positionMs,
+                durationMs = durationMs,
+            )
+            true
+        }
+        if (!persisted) return false
+        maybeSyncRemoteAccountProgress(metadata, write.positionMs, durationMs)
+        DiagnosticsLog.event(
+            "PlaybackService remote history progress episode=${metadata.episodeNumber} " +
+                "positionMs=${write.positionMs}",
+        )
+        return true
+    }
+
+    private fun persistRemoteCompletion(source: Player): Boolean {
+        val isRemote = source.deviceInfo.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE
+        val metadata = remoteHistoryMetadataFor(source.currentMediaItem)
+        if (isRemote) remoteHistoryOwnerIdentity = metadata?.identity
+        remoteHistoryCoordinator.sample(
+            metadata = metadata,
+            positionMs = source.currentPosition,
+            durationMs = source.duration,
+            isPlaying = false,
+            isRemote = isRemote,
+            elapsedRealtimeMs = SystemClock.elapsedRealtime(),
+        )
+        val completion = remoteHistoryCoordinator.completion(
+            metadata = metadata,
+            reportedPositionMs = source.currentPosition,
+            durationMs = source.duration,
+            isRemote = isRemote,
+        ) ?: return false
+        val persisted = runCatching {
+            LibraryStore.upsertHistoryDurably(
+                completion.metadata.toHistoryEntry(
+                    positionMs = completion.positionMs,
+                    durationMs = completion.durationMs,
+                    completed = completion.completedFinalEpisode,
+                    continuationEpisodeNumber = completion.metadata.nextEpisodeNumber
+                        ?.takeIf {
+                            completion.metadata.hasNextEpisode &&
+                                !completion.completedFinalEpisode &&
+                                it.isFinite() &&
+                                it != completion.metadata.episodeNumber
+                        },
+                ),
+            )
+        }.onFailure {
+            DiagnosticsLog.throwable("PlaybackService remote completion failed", it)
+        }.getOrDefault(false)
+        if (!persisted || !remoteHistoryCoordinator.acknowledgeCompletion(completion.metadata.identity)) {
+            return false
+        }
+        maybeSyncRemoteAccountProgress(
+            metadata = completion.metadata,
+            positionMs = completion.positionMs,
+            durationMs = completion.durationMs,
+        )
+        recordRemoteCompletion(completion.metadata.playbackId)
+        DiagnosticsLog.event(
+            "PlaybackService remote completion committed episode=${completion.metadata.episodeNumber} " +
+                "playbackId=${completion.metadata.playbackId.take(8)}",
+        )
+        if (completion.metadata.hasNextEpisode && SettingsStore.autoplay.value) {
+            // Resolving the next provider URL still needs the live Watch catalog. The owner
+            // generation prevents a late receiver event from advancing a newer Watch screen;
+            // without an active matching navigator, completion remains durably saved and stops.
+            val navigated = navigateActiveEpisode(
+                direction = 1,
+                expectedPlayback = completion.metadata.identity,
+            )
+            DiagnosticsLog.event(
+                "PlaybackService remote completion autoplay navigator=$navigated " +
+                    "next=${completion.metadata.nextEpisodeNumber ?: "unknown"}",
+            )
+        }
+        return true
+    }
+
+    private fun maybeSyncRemoteAccountProgress(
+        metadata: RemotePlaybackHistoryMetadata,
+        positionMs: Long,
+        durationMs: Long,
+    ) {
+        val accountService = AccountService.active ?: return
+        if (!SettingsStore.autoSyncAniList.value) return
+        if (!shouldSyncAniListProgress(metadata.episodeNumber, positionMs, durationMs)) return
+        val episode = metadata.episodeNumber.toInt()
+        val key = RemoteProgressSyncKey(
+            animeId = metadata.animeId,
+            episode = episode,
+            generation = metadata.generation,
+            service = accountService,
+        )
+        if (!syncedRemoteProgress.add(key)) return
+        serviceScope.launch {
+            runCatching {
+                when (accountService) {
+                    AccountService.ANILIST -> AppGraph.repository.saveAniListProgress(
+                        metadata.animeId,
+                        episode,
+                        metadata.totalEpisodes,
+                    )
+                    AccountService.MAL -> AppGraph.repository.saveMalProgress(
+                        metadata.animeId,
+                        episode,
+                        metadata.totalEpisodes,
+                    )
+                }
+            }.onFailure {
+                if (it is CancellationException) throw it
+                syncedRemoteProgress.remove(key)
+                DiagnosticsLog.throwable(
+                    "PlaybackService remote ${accountService.label} progress sync failed",
+                    it,
+                )
+            }
+        }
+    }
+
+    private fun RemotePlaybackHistoryMetadata.toHistoryEntry(
+        positionMs: Long,
+        durationMs: Long,
+        completed: Boolean,
+        continuationEpisodeNumber: Double? = null,
+    ): HistoryEntry = HistoryEntry(
+        anilistId = animeId,
+        title = seriesTitle,
+        cover = coverUrl,
+        episodeNumber = episodeNumber,
+        episodeTitle = episodeTitle,
+        provider = provider,
+        category = category,
+        positionMs = positionMs.coerceAtLeast(0L),
+        durationMs = durationMs.coerceAtLeast(0L),
+        continuationEpisodeNumber = continuationEpisodeNumber,
+        completed = completed,
+    )
+
+    private fun Double.routeEpisodeLabel(): String =
+        if (isFinite() && this % 1.0 == 0.0) toInt().toString() else toString()
+
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession = session
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         DiagnosticsLog.event("PlaybackService.onTaskRemoved playing=${if (::castPlayer.isInitialized) castPlayer.playWhenReady else false}")
-        if (!::castPlayer.isInitialized || !castPlayer.playWhenReady || castPlayer.mediaItemCount == 0) stopSelf()
+        val initialized = ::castPlayer.isInitialized
+        val shouldStop = shouldStopPlaybackServiceAfterTaskRemoved(
+            playerInitialized = initialized,
+            route = if (initialized) castPlayer.playbackRoute() else PlaybackRoute.LOCAL,
+            mediaItemCount = if (initialized) castPlayer.mediaItemCount else 0,
+            playWhenReady = initialized && castPlayer.playWhenReady,
+        )
+        if (shouldStop) {
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {
         DiagnosticsLog.event("PlaybackService.onDestroy")
+        if (::castPlayer.isInitialized) persistRemoteProgress(castPlayer, force = true)
+        persistRemotePlaybackHistoryRegistry()
+        serviceScope.cancel()
         activeHttpFactory = null
         activePlayer = null
+        remoteHistoryFlusher = null
+        remoteHistoryMetadataRegistrar = null
+        remoteHistoryMetadataResolver = null
+        remoteHistoryOwnerIdentity = null
+        remoteHistoryHandoffIdentity = null
+        latestRegisteredRemoteHistoryMetadata = null
+        remoteHistoryRegistry.clear()
         episodeNavigator = null
         watchPlaybackOwners.clear()
         PlaybackStatus.resetPlayerState()
@@ -384,6 +794,10 @@ class PlaybackService : MediaSessionService() {
 
     companion object {
         const val EXTRA_WATCH_ROUTE = "watch_route"
+        private const val REMOTE_HISTORY_POLL_MS = 2_000L
+        private const val MAX_REMOTE_HISTORY_ITEMS = 16
+        private const val REMOTE_HISTORY_PREFS = "remote_playback_history"
+        private const val KEY_REMOTE_HISTORY_METADATA = "metadata"
         private const val FALLBACK_PLAYER_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
@@ -396,8 +810,132 @@ class PlaybackService : MediaSessionService() {
         private var activePlaylistKey: String? = null
         @Volatile
         private var activePlayer: Player? = null
+        @Volatile
+        private var remoteHistoryFlusher: (() -> Boolean)? = null
+        @Volatile
+        private var remoteHistoryMetadataRegistrar: ((RemotePlaybackHistoryMetadata) -> Unit)? = null
+        @Volatile
+        private var remoteHistoryMetadataResolver: ((String) -> RemotePlaybackHistoryMetadata?)? = null
+        @Volatile
+        private var remoteHistoryOwnerIdentity: RemotePlaybackHistoryIdentity? = null
+        @Volatile
+        private var remoteHistoryHandoffIdentity: RemotePlaybackHistoryIdentity? = null
+        @Volatile
+        private var latestRegisteredRemoteHistoryMetadata: RemotePlaybackHistoryMetadata? = null
+        private val remoteCompletionLedger = LinkedHashSet<String>()
         private val localPlaybackOwners = LocalPlaybackOwnerRegistry()
         private val watchPlaybackOwners = WatchPlaybackOwnerRegistry()
+
+        /** Register before setMediaItem; Cast retains playbackId even though it drops extras. */
+        internal fun registerRemotePlaybackHistoryMetadata(metadata: RemotePlaybackHistoryMetadata) {
+            remoteHistoryMetadataRegistrar?.invoke(metadata)
+            val handoff = remoteHistoryHandoffIdentity
+            if (
+                handoff != null &&
+                activePlayer?.deviceInfo?.playbackType != DeviceInfo.PLAYBACK_TYPE_REMOTE &&
+                handoff != metadata.identity
+            ) {
+                remoteHistoryHandoffIdentity = null
+            }
+            latestRegisteredRemoteHistoryMetadata = metadata
+            bindEpisodeNavigatorPlayback(metadata)
+        }
+
+        private fun bindEpisodeNavigatorPlayback(metadata: RemotePlaybackHistoryMetadata) {
+            val registration = episodeNavigator
+            if (
+                registration != null &&
+                registration.owner.generation == metadata.watchOwnerGeneration &&
+                registration.playback.animeId == metadata.animeId &&
+                registration.playback.episodeNumber == metadata.episodeNumber &&
+                registration.playback.playbackGeneration == metadata.generation
+            ) {
+                registration.playback = registration.playback.copy(playbackId = metadata.playbackId)
+            }
+        }
+
+        internal fun registeredRemotePlaybackHistoryMetadata(
+            retainedMediaId: String,
+        ): RemotePlaybackHistoryMetadata? = remoteHistoryMetadataResolver?.invoke(retainedMediaId)
+
+        /** True only while a valid Cast item owns progress/history persistence. */
+        fun isRemotePlaybackHistoryOwnedByService(): Boolean =
+            serviceHistoryIdentity() != null
+
+        private fun serviceHistoryIdentity(): RemotePlaybackHistoryIdentity? =
+            if (activePlayer?.deviceInfo?.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE) {
+                remoteHistoryOwnerIdentity
+            } else {
+                remoteHistoryHandoffIdentity
+            }
+
+        internal fun ownsRemotePlaybackHistory(
+            animeId: Int,
+            episodeNumber: Double,
+            generation: Int,
+            mediaId: String,
+        ): Boolean {
+            val owner = serviceHistoryIdentity() ?: return false
+            return owner.animeId == animeId &&
+                owner.episodeNumber == episodeNumber &&
+                owner.generation == generation &&
+                owner.mediaId == mediaId
+        }
+
+        internal fun ownsRemotePlaybackCompletion(
+            playbackId: String,
+            animeId: Int,
+            episodeNumber: Double,
+            mediaId: String,
+        ): Boolean {
+            val owner = serviceHistoryIdentity() ?: return false
+            return owner.playbackId == playbackId &&
+                owner.animeId == animeId &&
+                owner.episodeNumber == episodeNumber &&
+                owner.mediaId == mediaId
+        }
+
+        /** Releases the remote-to-local barrier only for the first valid local sample. */
+        internal fun acknowledgeFreshLocalPlaybackProgress(
+            animeId: Int,
+            episodeNumber: Double,
+            generation: Int,
+            mediaId: String,
+        ): Boolean {
+            if (activePlayer?.deviceInfo?.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE) return false
+            val handoff = remoteHistoryHandoffIdentity ?: return false
+            if (
+                handoff.animeId != animeId ||
+                handoff.episodeNumber != episodeNumber ||
+                handoff.generation != generation ||
+                handoff.mediaId != mediaId
+            ) {
+                return false
+            }
+            remoteHistoryHandoffIdentity = null
+            DiagnosticsLog.event(
+                "PlaybackService local progress acknowledged remote handoff " +
+                    "playbackId=${handoff.playbackId.take(8)}",
+            )
+            return true
+        }
+
+        @Synchronized
+        private fun recordRemoteCompletion(playbackId: String) {
+            remoteCompletionLedger.remove(playbackId)
+            remoteCompletionLedger += playbackId
+            while (remoteCompletionLedger.size > MAX_REMOTE_HISTORY_ITEMS) {
+                remoteCompletionLedger.remove(remoteCompletionLedger.first())
+            }
+        }
+
+        @Synchronized
+        internal fun wasRemotePlaybackCompletionCommitted(playbackId: String): Boolean =
+            playbackId in remoteCompletionLedger
+
+        /** Banks the receiver's current position before a UI transition or disposal. */
+        fun flushRemotePlaybackHistory(): Boolean =
+            if (isRemotePlaybackHistoryOwnedByService()) remoteHistoryFlusher?.invoke() == true else false
 
         @Volatile
         private var episodeNavigator: EpisodeNavigatorRegistration? = null
@@ -480,14 +1018,25 @@ class PlaybackService : MediaSessionService() {
          */
         internal fun registerEpisodeNavigator(
             owner: WatchPlaybackOwnerToken,
+            playback: EpisodeNavigatorPlaybackIdentity,
             navigator: (direction: Int) -> Unit,
         ): Boolean = watchPlaybackOwners.runIfActive(owner) {
-            episodeNavigator = EpisodeNavigatorRegistration(owner, navigator)
+            episodeNavigator = EpisodeNavigatorRegistration(owner, playback, navigator)
+            latestRegisteredRemoteHistoryMetadata?.let(::bindEpisodeNavigatorPlayback)
         }
 
-        internal fun clearEpisodeNavigator(owner: WatchPlaybackOwnerToken) {
+        internal fun clearEpisodeNavigator(
+            owner: WatchPlaybackOwnerToken,
+            playback: EpisodeNavigatorPlaybackIdentity,
+        ) {
             watchPlaybackOwners.runIfActive(owner) {
-                if (episodeNavigator?.owner === owner) episodeNavigator = null
+                val registered = episodeNavigator
+                if (
+                    registered?.owner === owner &&
+                    registered.playback.matchesLogicalPlayback(playback)
+                ) {
+                    episodeNavigator = null
+                }
             }
         }
 
@@ -496,8 +1045,25 @@ class PlaybackService : MediaSessionService() {
             return watchPlaybackOwners.isActive(registration.owner)
         }
 
-        private fun navigateActiveEpisode(direction: Int): Boolean {
+        private fun navigateActiveEpisode(
+            direction: Int,
+            expectedPlayback: RemotePlaybackHistoryIdentity? = null,
+        ): Boolean {
             val registration = episodeNavigator ?: return false
+            if (
+                !acceptsEpisodeNavigatorPlayback(
+                    activeOwnerGeneration = registration.owner.generation,
+                    active = registration.playback,
+                    expected = expectedPlayback,
+                )
+            ) {
+                DiagnosticsLog.event(
+                    "PlaybackService rejected stale episode navigator " +
+                        "expected=${expectedPlayback?.playbackId?.take(8) ?: "manual"} " +
+                        "active=${registration.playback.playbackId?.take(8) ?: "unbound"}",
+                )
+                return false
+            }
             return watchPlaybackOwners.runIfActive(registration.owner) {
                 registration.navigate(direction)
             }
@@ -507,8 +1073,13 @@ class PlaybackService : MediaSessionService() {
         fun stopActivePlayback() {
             DiagnosticsLog.event("PlaybackService.stopActivePlayback")
             activePlayer?.run {
+                if (deviceInfo.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE) {
+                    remoteHistoryFlusher?.invoke()
+                }
                 stop()
                 clearMediaItems()
+                remoteHistoryOwnerIdentity = null
+                remoteHistoryHandoffIdentity = null
             }
         }
 

@@ -104,9 +104,12 @@ import com.miruronative.playback.LocalPlaybackOwnerToken
 import com.miruronative.playback.CastSourceDecision
 import com.miruronative.playback.chooseCastSource
 import com.miruronative.playback.PictureInPictureSourceRect
+import com.miruronative.playback.EpisodeNavigatorPlaybackIdentity
 import com.miruronative.playback.PlaybackService
+import com.miruronative.playback.RemotePlaybackHistoryMetadata
 import com.miruronative.playback.SubtitleDelay
 import com.miruronative.playback.WatchPlaybackOwnerToken
+import com.miruronative.playback.putRemotePlaybackHistoryMetadata
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
@@ -269,26 +272,35 @@ private const val EXTRA_NAV_STREAM_URL = "anilili.navigation.STREAM_URL"
 private const val EXTRA_NAV_MEDIA_ID = "anilili.navigation.MEDIA_ID"
 
 private fun MediaItem.playbackNavigationIdentityOrNull(): PlaybackNavigationIdentity? {
-    val extras = mediaMetadata.extras ?: return null
+    val extras = mediaMetadata.extras
     if (
-        !extras.containsKey(EXTRA_NAV_ANIME_ID) ||
-        !extras.containsKey(EXTRA_NAV_EPISODE_NUMBER) ||
-        !extras.containsKey(EXTRA_NAV_PROVIDER) ||
-        !extras.containsKey(EXTRA_NAV_CATEGORY) ||
-        !extras.containsKey(EXTRA_NAV_GENERATION) ||
-        !extras.containsKey(EXTRA_NAV_STREAM_URL) ||
-        !extras.containsKey(EXTRA_NAV_MEDIA_ID)
+        extras != null &&
+        extras.containsKey(EXTRA_NAV_ANIME_ID) &&
+        extras.containsKey(EXTRA_NAV_EPISODE_NUMBER) &&
+        extras.containsKey(EXTRA_NAV_PROVIDER) &&
+        extras.containsKey(EXTRA_NAV_CATEGORY) &&
+        extras.containsKey(EXTRA_NAV_GENERATION) &&
+        extras.containsKey(EXTRA_NAV_STREAM_URL) &&
+        extras.containsKey(EXTRA_NAV_MEDIA_ID) &&
+        extras.getString(EXTRA_NATIVE_PLAYBACK_ID) == mediaId
     ) {
-        return null
+        return PlaybackNavigationIdentity(
+            animeId = extras.getInt(EXTRA_NAV_ANIME_ID),
+            episodeNumber = extras.getDouble(EXTRA_NAV_EPISODE_NUMBER),
+            provider = extras.getString(EXTRA_NAV_PROVIDER) ?: return null,
+            category = Category.from(extras.getString(EXTRA_NAV_CATEGORY) ?: return null),
+            playbackGeneration = extras.getInt(EXTRA_NAV_GENERATION),
+            streamUrl = extras.getString(EXTRA_NAV_STREAM_URL),
+        )
     }
-    if (extras.getString(EXTRA_NAV_MEDIA_ID) != mediaId) return null
+    val retained = PlaybackService.registeredRemotePlaybackHistoryMetadata(mediaId) ?: return null
     return PlaybackNavigationIdentity(
-        animeId = extras.getInt(EXTRA_NAV_ANIME_ID),
-        episodeNumber = extras.getDouble(EXTRA_NAV_EPISODE_NUMBER),
-        provider = extras.getString(EXTRA_NAV_PROVIDER) ?: return null,
-        category = Category.from(extras.getString(EXTRA_NAV_CATEGORY) ?: return null),
-        playbackGeneration = extras.getInt(EXTRA_NAV_GENERATION),
-        streamUrl = extras.getString(EXTRA_NAV_STREAM_URL),
+        animeId = retained.animeId,
+        episodeNumber = retained.episodeNumber,
+        provider = retained.provider,
+        category = Category.from(retained.category),
+        playbackGeneration = retained.generation,
+        streamUrl = retained.navigationStreamUrl,
     )
 }
 
@@ -299,21 +311,28 @@ private const val EXTRA_PLAYBACK_MEDIA_ID = "anilili.playback.MEDIA_ID"
 
 /** Reads the history/progress identity from the MediaItem that actually emitted the callback. */
 private fun MediaItem.playbackIdentityOrNull(): PlaybackIdentity? {
-    val extras = mediaMetadata.extras ?: return null
+    val extras = mediaMetadata.extras
     if (
-        !extras.containsKey(EXTRA_PLAYBACK_ANIME_ID) ||
-        !extras.containsKey(EXTRA_PLAYBACK_EPISODE_NUMBER) ||
-        !extras.containsKey(EXTRA_PLAYBACK_GENERATION)
+        extras != null &&
+        extras.containsKey(EXTRA_PLAYBACK_ANIME_ID) &&
+        extras.containsKey(EXTRA_PLAYBACK_EPISODE_NUMBER) &&
+        extras.containsKey(EXTRA_PLAYBACK_GENERATION) &&
+        extras.getString(EXTRA_NATIVE_PLAYBACK_ID) == mediaId
     ) {
-        return null
+        val storedMediaId = extras.getString(EXTRA_PLAYBACK_MEDIA_ID) ?: return null
+        return PlaybackIdentity(
+            animeId = extras.getInt(EXTRA_PLAYBACK_ANIME_ID),
+            episodeNumber = extras.getDouble(EXTRA_PLAYBACK_EPISODE_NUMBER),
+            generation = extras.getInt(EXTRA_PLAYBACK_GENERATION),
+            mediaId = storedMediaId,
+        )
     }
-    val storedMediaId = extras.getString(EXTRA_PLAYBACK_MEDIA_ID) ?: return null
-    if (mediaId.isBlank() || storedMediaId != mediaId) return null
+    val retained = PlaybackService.registeredRemotePlaybackHistoryMetadata(mediaId) ?: return null
     return PlaybackIdentity(
-        animeId = extras.getInt(EXTRA_PLAYBACK_ANIME_ID),
-        episodeNumber = extras.getDouble(EXTRA_PLAYBACK_EPISODE_NUMBER),
-        generation = extras.getInt(EXTRA_PLAYBACK_GENERATION),
-        mediaId = mediaId,
+        animeId = retained.animeId,
+        episodeNumber = retained.episodeNumber,
+        generation = retained.generation,
+        mediaId = retained.mediaId,
     )
 }
 
@@ -328,6 +347,7 @@ internal fun PlayerSurface(
     skip: SkipTimes?,
     seriesTitle: String,
     episodeTitle: String,
+    historyEpisodeTitle: String?,
     artworkUrl: String?,
     animeId: Int,
     provider: String,
@@ -345,6 +365,8 @@ internal fun PlayerSurface(
     onProgress: ((PlaybackIdentity, Long, Long, Boolean) -> Unit)? = null,
     onPreviousEpisode: (() -> Unit)? = null,
     hasNextEpisode: Boolean = true,
+    nextEpisodeNumber: Double? = null,
+    totalEpisodes: Int? = null,
     hasPreviousEpisode: Boolean = true,
     focusPlayerOnStart: Boolean = true,
     isFullscreen: Boolean = false,
@@ -626,7 +648,7 @@ internal fun PlayerSurface(
                         DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
                         val failedItem = activeController.currentMediaItem
                         val failedIdentity = failedItem?.playbackIdentityOrNull()
-                        val failedMediaId = failedItem?.mediaId
+                        val failedMediaId = failedIdentity?.mediaId
                         val failedStream = currentActiveStream
                         if (
                             failedIdentity == null ||
@@ -788,10 +810,10 @@ internal fun PlayerSurface(
         }
         val progressIdentity = playbackIdentity.copy(mediaId = activeStream.url)
         val currentItem = activeController.currentMediaItem
+        val currentProgressIdentity = currentItem?.playbackIdentityOrNull()
         val currentIdentity = currentItem?.nativePlaybackIdentity()
         if (
-            currentItem?.mediaId == activeStream.url &&
-            currentItem.playbackIdentityOrNull() == progressIdentity &&
+            currentProgressIdentity == progressIdentity &&
             currentItem.playbackNavigationIdentityOrNull() == playbackNavigationIdentity &&
             currentIdentity != null &&
             currentIdentity.animeId == playbackNavigationIdentity.animeId &&
@@ -819,6 +841,23 @@ internal fun PlayerSurface(
             mediaId = activeStream.url,
             episodeNumber = playbackNavigationIdentity.episodeNumber,
         )
+        val historyMetadata = RemotePlaybackHistoryMetadata(
+            playbackId = nativePlaybackIdentity.playbackId,
+            animeId = progressIdentity.animeId,
+            mediaId = activeStream.url,
+            episodeNumber = progressIdentity.episodeNumber,
+            generation = progressIdentity.generation,
+            watchOwnerGeneration = playbackOwner.generation,
+            seriesTitle = seriesTitle,
+            coverUrl = artworkUrl,
+            episodeTitle = historyEpisodeTitle,
+            provider = provider,
+            category = category,
+            navigationStreamUrl = playbackNavigationIdentity.streamUrl,
+            totalEpisodes = totalEpisodes,
+            hasNextEpisode = hasNextEpisode,
+            nextEpisodeNumber = nextEpisodeNumber,
+        )
         val metadata = MediaMetadata.Builder()
             .setTitle(episodeTitle)
             .setArtist(seriesTitle)
@@ -839,10 +878,14 @@ internal fun PlayerSurface(
                 putString(EXTRA_NATIVE_PLAYBACK_ID, nativePlaybackIdentity.playbackId)
                 putInt(EXTRA_NATIVE_ANIME_ID, nativePlaybackIdentity.animeId)
                 putDouble(EXTRA_NATIVE_EPISODE_NUMBER, nativePlaybackIdentity.episodeNumber)
+                putRemotePlaybackHistoryMetadata(historyMetadata)
             })
             .build()
         val item = MediaItem.Builder()
-            .setMediaId(activeStream.url)
+            // Media3's default Cast converter retains mediaId but drops MediaMetadata.extras.
+            // Use the unique playback ID as the Cast-safe registry key; the source URL remains
+            // the PlaybackIdentity mediaId in the extras and local configuration URI.
+            .setMediaId(nativePlaybackIdentity.playbackId)
             .setUri(activeStream.url)
             .setMediaMetadata(metadata)
             .apply { if (activeStream.isHls) setMimeType(MimeTypes.APPLICATION_M3U8) }
@@ -868,6 +911,7 @@ internal fun PlayerSurface(
         val surfaceAccepted = playbackSurfaceLease.runIfActive {
             ownerAccepted = runIfPlaybackOwnerActive {
                 PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
+                PlaybackService.registerRemotePlaybackHistoryMetadata(historyMetadata)
                 currentOnPlaybackIdentityChanged(nativePlaybackIdentity)
                 activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
                 activeController.prepare()
@@ -1017,7 +1061,14 @@ internal fun PlayerSurface(
     }
 
     // Bridges notification, remote, and hardware media-key commands into episode resolution.
-    DisposableEffect(playbackOwner) {
+    val navigatorPlayback = remember(playbackNavigationIdentity) {
+        EpisodeNavigatorPlaybackIdentity(
+            animeId = playbackNavigationIdentity.animeId,
+            episodeNumber = playbackNavigationIdentity.episodeNumber,
+            playbackGeneration = playbackNavigationIdentity.playbackGeneration,
+        )
+    }
+    DisposableEffect(playbackOwner, navigatorPlayback) {
         val navigator: (Int) -> Unit = { direction ->
             DiagnosticsLog.event("PlayerSurface episode navigator direction=$direction")
             when {
@@ -1025,13 +1076,17 @@ internal fun PlayerSurface(
                 direction < 0 && currentHasPrevious -> currentOnPreviousEpisode?.invoke()
             }
         }
-        val registered = PlaybackService.registerEpisodeNavigator(playbackOwner, navigator)
+        val registered = PlaybackService.registerEpisodeNavigator(
+            owner = playbackOwner,
+            playback = navigatorPlayback,
+            navigator = navigator,
+        )
         DiagnosticsLog.event(
             "PlayerSurface episode navigator registered=$registered " +
                 "hasPrev=$hasPreviousEpisode hasNext=$hasNextEpisode",
         )
         onDispose {
-            PlaybackService.clearEpisodeNavigator(playbackOwner)
+            PlaybackService.clearEpisodeNavigator(playbackOwner, navigatorPlayback)
             DiagnosticsLog.event("PlayerSurface episode navigator cleared")
         }
     }
@@ -1089,7 +1144,9 @@ internal fun PlayerSurface(
         if (defaultQuality == DefaultQuality.AUTO) return@LaunchedEffect
         // The controller is persistent across episodes, so its tracks may still describe the
         // previous media item; only apply once it is actually reporting this stream.
-        if (activeController.currentMediaItem?.mediaId != activeStream.url) return@LaunchedEffect
+        if (activeController.currentMediaItem?.playbackIdentityOrNull()?.mediaId != activeStream.url) {
+            return@LaunchedEffect
+        }
         // Never force a track override mid-preparation: on weak TV decoders a codec reconfigure
         // during the initial BUFFERING is exactly where OMX implementations wedge. Let playback
         // reach READY on the ABR pick first; the state listener re-triggers this effect then.
@@ -2054,22 +2111,30 @@ internal val PlaybackSpeeds = listOf(
 )
 
 private fun MediaItem.nativePlaybackIdentity(): NativePlaybackIdentity? {
-    val extras = mediaMetadata.extras ?: return null
-    val playbackId = extras.getString(EXTRA_NATIVE_PLAYBACK_ID)?.takeIf(String::isNotBlank) ?: return null
+    val extras = mediaMetadata.extras
+    val playbackId = extras?.getString(EXTRA_NATIVE_PLAYBACK_ID)?.takeIf(String::isNotBlank)
     if (
-        !extras.containsKey(EXTRA_NATIVE_ANIME_ID) ||
-        !extras.containsKey(EXTRA_NATIVE_EPISODE_NUMBER) ||
-        mediaId.isBlank()
+        extras != null &&
+        playbackId != null &&
+        playbackId == mediaId &&
+        extras.containsKey(EXTRA_NATIVE_ANIME_ID) &&
+        extras.containsKey(EXTRA_NATIVE_EPISODE_NUMBER)
     ) {
-        return null
+        val episodeNumber = extras.getDouble(EXTRA_NATIVE_EPISODE_NUMBER)
+        if (!episodeNumber.isFinite()) return null
+        return NativePlaybackIdentity(
+            playbackId = playbackId,
+            animeId = extras.getInt(EXTRA_NATIVE_ANIME_ID),
+            mediaId = extras.getString(EXTRA_PLAYBACK_MEDIA_ID) ?: return null,
+            episodeNumber = episodeNumber,
+        )
     }
-    val episodeNumber = extras.getDouble(EXTRA_NATIVE_EPISODE_NUMBER)
-    if (!episodeNumber.isFinite()) return null
+    val retained = PlaybackService.registeredRemotePlaybackHistoryMetadata(mediaId) ?: return null
     return NativePlaybackIdentity(
-        playbackId = playbackId,
-        animeId = extras.getInt(EXTRA_NATIVE_ANIME_ID),
-        mediaId = mediaId,
-        episodeNumber = episodeNumber,
+        playbackId = retained.playbackId,
+        animeId = retained.animeId,
+        mediaId = retained.mediaId,
+        episodeNumber = retained.episodeNumber,
     )
 }
 
