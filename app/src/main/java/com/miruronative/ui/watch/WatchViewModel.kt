@@ -1,6 +1,7 @@
 package com.miruronative.ui.watch
 
 import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.miruronative.data.AppGraph
@@ -88,6 +89,19 @@ private data class PendingResolution(
     val key: EpisodeResolutionKey,
 )
 
+private data class PlaybackProgress(
+    val identity: PlaybackIdentity,
+    val positionMs: Long,
+    val durationMs: Long,
+)
+
+private data class ProgressSyncKey(
+    val animeId: Int,
+    val episode: Int,
+    val generation: Int,
+    val service: AccountService,
+)
+
 class WatchViewModel : ViewModel() {
     private val repo = AppGraph.repository
 
@@ -111,7 +125,7 @@ class WatchViewModel : ViewModel() {
     private var popularity: Int? = null
     private var description: String? = null
     private var totalEpisodes: Int? = null
-    private val syncedAniListEpisodes = mutableSetOf<Int>()
+    private val syncedProgressEpisodes = mutableSetOf<ProgressSyncKey>()
     private var lastRequestedNumber = 1.0
     private var failedProviders = mutableSetOf<String>()
     private val unavailableSources = mutableSetOf<EpisodeSourceKey>()
@@ -151,12 +165,13 @@ class WatchViewModel : ViewModel() {
         averageScore = null
         popularity = null
         description = null
-        syncedAniListEpisodes.clear()
+        syncedProgressEpisodes.clear()
         failedProviders.clear()
         unavailableSources.clear()
         confirmedSources.clear()
         mergedIncludesAnivexa = false
         episodeMeta = emptyList()
+        resetProgressSession()
 
         invalidatePendingResolution()
         resolveJob?.cancel()
@@ -586,7 +601,6 @@ class WatchViewModel : ViewModel() {
                 notice = fallbackNotice,
             ),
         )
-        recordHistory(number, resolved.provider)
         launchSourceValidation(number, request)
     }
 
@@ -649,27 +663,10 @@ class WatchViewModel : ViewModel() {
         launchResolve(currentNumber)
     }
 
-    private fun recordHistory(number: Double, provider: String) {
-        val ep = spine.firstOrNull { it.number == number }
-        LibraryStore.upsertHistory(
-            HistoryEntry(
-                anilistId = anilistId,
-                title = seriesTitle,
-                cover = artworkUrl,
-                episodeNumber = number,
-                episodeTitle = ep?.title,
-                provider = provider,
-                category = category.api,
-                positionMs = LibraryStore.historyFor(anilistId)?.takeIf { it.episodeNumber == number }?.positionMs ?: 0L,
-                durationMs = LibraryStore.historyFor(anilistId)?.takeIf { it.episodeNumber == number }?.durationMs ?: 0L,
-            ),
-        )
-    }
-
     private var lastProgressSave = 0L
-    private var lastKnownPositionMs = 0L
-    private var lastKnownDurationMs = 0L
-    private var lastKnownNumber: Double? = null
+    private var lastProgressSaveIdentity: PlaybackIdentity? = null
+    private var lastKnownProgress: PlaybackProgress? = null
+    private var confirmedHistoryIdentity: PlaybackIdentity? = null
     private var activeNativePlaybackIdentity: NativePlaybackIdentity? = null
     private var committedNativePlaybackIdentity: NativePlaybackIdentity? = null
 
@@ -715,7 +712,24 @@ class WatchViewModel : ViewModel() {
             )
             return false
         }
-        val saved = LibraryStore.historyFor(anilistId)
+        val progressIdentity = PlaybackIdentity(
+            animeId = commit.identity.animeId,
+            episodeNumber = commit.identity.episodeNumber,
+            generation = data.playbackGeneration,
+            mediaId = commit.identity.mediaId,
+        )
+        val activeProgressTarget = data.nativePlaybackTarget()
+        if (activeProgressTarget == null || !acceptsPlaybackProgress(progressIdentity, activeProgressTarget)) {
+            DiagnosticsLog.event(
+                "Watch ignored native end with stale progress identity " +
+                    "episode=${fmt(progressIdentity.episodeNumber)} generation=${progressIdentity.generation}",
+            )
+            return false
+        }
+        // A validated natural end is itself proof that this media item played. This also creates
+        // history for very short/resumed items that can end before the periodic progress tick.
+        acceptProgress(data, progressIdentity, commit.positionMs, commit.durationMs)
+        val saved = LibraryStore.historyFor(progressIdentity.animeId)
         if (saved?.episodeNumber != commit.identity.episodeNumber) {
             DiagnosticsLog.event(
                 "Watch ignored native end without matching history episode=${fmt(commit.identity.episodeNumber)}",
@@ -724,13 +738,13 @@ class WatchViewModel : ViewModel() {
         }
         if (saved.positionMs != commit.positionMs || saved.durationMs != commit.durationMs) {
             LibraryStore.updateProgress(
-                anilistId = anilistId,
+                anilistId = progressIdentity.animeId,
                 episodeNumber = commit.identity.episodeNumber,
                 positionMs = commit.positionMs,
                 durationMs = commit.durationMs,
             )
         }
-        val persisted = LibraryStore.historyFor(anilistId)
+        val persisted = LibraryStore.historyFor(progressIdentity.animeId)
         if (
             persisted == null ||
             persisted.episodeNumber != commit.identity.episodeNumber ||
@@ -743,11 +757,9 @@ class WatchViewModel : ViewModel() {
             return false
         }
         committedNativePlaybackIdentity = commit.identity
-        lastKnownPositionMs = commit.positionMs
-        lastKnownDurationMs = commit.durationMs
-        lastKnownNumber = commit.identity.episodeNumber
-        lastProgressSave = System.currentTimeMillis()
-        maybeSyncAniListProgress(commit.identity.episodeNumber, commit.positionMs, commit.durationMs)
+        lastKnownProgress = PlaybackProgress(progressIdentity, commit.positionMs, commit.durationMs)
+        lastProgressSaveIdentity = progressIdentity
+        lastProgressSave = SystemClock.elapsedRealtime()
         DiagnosticsLog.event(
             "Watch native end committed episode=${fmt(commit.identity.episodeNumber)} " +
                 "positionMs=${commit.positionMs} playbackId=${commit.identity.playbackId.take(8)}",
@@ -756,16 +768,159 @@ class WatchViewModel : ViewModel() {
         return true
     }
 
-    fun onProgress(positionMs: Long, durationMs: Long) {
+    private fun WatchData.embedPlaybackKey(): EmbedPlaybackKey = EmbedPlaybackKey(
+        animeId = anilistId,
+        provider = provider,
+        category = category.api,
+        episodeNumber = current.number,
+        sourceGeneration = playbackGeneration,
+    )
+
+    fun onEmbedProgress(key: EmbedPlaybackKey, positionMs: Long, durationMs: Long) {
         val data = (_state.value as? UiState.Success)?.data ?: return
-        lastKnownPositionMs = positionMs
-        lastKnownDurationMs = durationMs
-        lastKnownNumber = data.current.number
-        maybeSyncAniListProgress(data.current.number, positionMs, durationMs)
-        val now = System.currentTimeMillis()
+        if (!acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) {
+            DiagnosticsLog.event(
+                "Watch ignored stale embed progress episode=${fmt(key.episodeNumber)} " +
+                    "generation=${key.sourceGeneration}",
+            )
+            return
+        }
+        val stream = data.chosenStream ?: return
+        acceptProgress(
+            data = data,
+            identity = PlaybackIdentity(
+                animeId = key.animeId,
+                episodeNumber = key.episodeNumber,
+                generation = key.sourceGeneration,
+                mediaId = stream.url,
+            ),
+            positionMs = positionMs,
+            durationMs = durationMs,
+        )
+    }
+
+    /** Native progress must identify the MediaItem that actually produced the callback. */
+    fun onNativeProgress(
+        identity: PlaybackIdentity,
+        positionMs: Long,
+        durationMs: Long,
+        playbackConfirmed: Boolean,
+    ) {
+        if (!playbackConfirmed) return
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        val active = data.nativePlaybackTarget()
+        if (active == null || !acceptsPlaybackProgress(identity, active)) {
+            DiagnosticsLog.event(
+                "Watch ignored stale native progress callbackAnime=${identity.animeId} " +
+                    "callbackEpisode=${fmt(identity.episodeNumber)} callbackGeneration=${identity.generation} " +
+                    "activeAnime=${data.anilistId} activeEpisode=${fmt(data.current.number)} " +
+                    "activeGeneration=${data.playbackGeneration}",
+            )
+            return
+        }
+        acceptProgress(data, identity, positionMs, durationMs)
+    }
+
+    private fun acceptProgress(
+        data: WatchData,
+        identity: PlaybackIdentity,
+        positionMs: Long,
+        durationMs: Long,
+    ) {
+        lastKnownProgress = PlaybackProgress(identity, positionMs, durationMs)
+        maybeSyncAniListProgress(identity, positionMs, durationMs, totalEpisodes)
+        val lastIdentity = lastProgressSaveIdentity
+        if (lastIdentity == null || !isSamePlaybackSession(lastIdentity, identity)) {
+            lastProgressSave = 0L
+            lastProgressSaveIdentity = identity
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (isNewConfirmedPlayback(confirmedHistoryIdentity, identity)) {
+            confirmedHistoryIdentity = identity
+            val previous = LibraryStore.historyFor(identity.animeId)
+                ?.takeIf { it.episodeNumber == identity.episodeNumber }
+            LibraryStore.upsertHistory(
+                HistoryEntry(
+                    anilistId = identity.animeId,
+                    title = data.seriesTitle,
+                    cover = data.artworkUrl,
+                    episodeNumber = identity.episodeNumber,
+                    episodeTitle = data.current.title,
+                    provider = data.provider,
+                    category = data.category.api,
+                    positionMs = maxOf(previous?.positionMs ?: 0L, positionMs.coerceAtLeast(0L)),
+                    durationMs = maxOf(previous?.durationMs ?: 0L, durationMs.coerceAtLeast(0L)),
+                ),
+            )
+            lastProgressSave = now
+            DiagnosticsLog.event(
+                "Watch history confirmed episode=${fmt(identity.episodeNumber)} " +
+                    "generation=${identity.generation}",
+            )
+            return
+        }
         if (now - lastProgressSave < 8_000) return
         lastProgressSave = now
-        LibraryStore.updateProgress(anilistId, data.current.number, positionMs, durationMs)
+        LibraryStore.updateProgress(identity.animeId, identity.episodeNumber, positionMs, durationMs)
+    }
+
+    private fun resetProgressSession() {
+        // Invalidate callbacks from the previous route even before the next MediaItem is ready.
+        nextPlaybackGeneration()
+        lastProgressSave = 0L
+        lastProgressSaveIdentity = null
+        lastKnownProgress = null
+        confirmedHistoryIdentity = null
+    }
+
+    private fun WatchData.playbackTarget(): ActivePlaybackTarget = ActivePlaybackTarget(
+        animeId = anilistId,
+        episodeNumber = current.number,
+        generation = playbackGeneration,
+        mediaIds = buildSet {
+            chosenStream?.url?.let { add(it) }
+            sources.streams.forEach { add(it.url) }
+        },
+    )
+
+    private fun WatchData.nativePlaybackTarget(): ActivePlaybackTarget? {
+        val chosen = chosenStream ?: return null
+        if (chosen.isEmbed || ProviderCatalog.isEmbed(provider)) return null
+        return ActivePlaybackTarget(
+            animeId = anilistId,
+            episodeNumber = current.number,
+            generation = playbackGeneration,
+            mediaIds = nativeMediaIds(),
+        )
+    }
+
+    fun onEmbedPlaybackError(
+        key: EmbedPlaybackKey,
+        message: String,
+        streamUrl: String,
+        positionMs: Long,
+    ) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (!acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) {
+            DiagnosticsLog.event(
+                "Watch ignored stale embed error episode=${fmt(key.episodeNumber)} " +
+                    "generation=${key.sourceGeneration}",
+            )
+            return
+        }
+        onPlaybackError(message, streamUrl, positionMs)
+    }
+
+    fun nextFromEmbed(key: EmbedPlaybackKey) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) next()
+        else DiagnosticsLog.event("Watch ignored stale embed next episode=${fmt(key.episodeNumber)}")
+    }
+
+    fun prevFromEmbed(key: EmbedPlaybackKey) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        if (acceptsEmbedPlaybackCallback(key, data.embedPlaybackKey())) prev()
+        else DiagnosticsLog.event("Watch ignored stale embed previous episode=${fmt(key.episodeNumber)}")
     }
 
     /**
@@ -776,34 +931,52 @@ class WatchViewModel : ViewModel() {
      */
     fun commitPlaybackPosition() {
         val data = (_state.value as? UiState.Success)?.data ?: return
-        val number = lastKnownNumber ?: return
-        if (number != data.current.number || lastKnownPositionMs <= 0) return
-        lastProgressSave = System.currentTimeMillis()
-        LibraryStore.updateProgress(anilistId, number, lastKnownPositionMs, lastKnownDurationMs)
-        DiagnosticsLog.event(
-            "Watch commit position episode=${fmt(number)} positionMs=$lastKnownPositionMs",
+        val progress = lastKnownProgress ?: return
+        if (!acceptsPlaybackProgress(progress.identity, data.playbackTarget()) || progress.positionMs <= 0) return
+        lastProgressSave = SystemClock.elapsedRealtime()
+        lastProgressSaveIdentity = progress.identity
+        LibraryStore.updateProgress(
+            progress.identity.animeId,
+            progress.identity.episodeNumber,
+            progress.positionMs,
+            progress.durationMs,
         )
-        _state.value = UiState.Success(data.copy(startPositionMs = lastKnownPositionMs))
+        DiagnosticsLog.event(
+            "Watch commit position episode=${fmt(progress.identity.episodeNumber)} " +
+                "positionMs=${progress.positionMs}",
+        )
+        _state.value = UiState.Success(data.copy(startPositionMs = progress.positionMs))
     }
 
-    private fun maybeSyncAniListProgress(episodeNumber: Double, positionMs: Long, durationMs: Long) {
+    private fun maybeSyncAniListProgress(
+        identity: PlaybackIdentity,
+        positionMs: Long,
+        durationMs: Long,
+        totalEpisodesSnapshot: Int?,
+    ) {
         val service = AccountService.active ?: return
         if (!SettingsStore.autoSyncAniList.value) return
-        if (!shouldSyncAniListProgress(episodeNumber, positionMs, durationMs)) return
-        val episode = episodeNumber.toInt()
-        if (!syncedAniListEpisodes.add(episode)) return
+        if (!shouldSyncAniListProgress(identity.episodeNumber, positionMs, durationMs)) return
+        val episode = identity.episodeNumber.toInt()
+        val syncKey = ProgressSyncKey(identity.animeId, episode, identity.generation, service)
+        if (!syncedProgressEpisodes.add(syncKey)) return
+        val animeIdSnapshot = identity.animeId
+        val episodeNumberSnapshot = identity.episodeNumber
         viewModelScope.launch {
             runCatching {
                 when (service) {
-                    AccountService.ANILIST -> repo.saveAniListProgress(anilistId, episode, totalEpisodes)
-                    AccountService.MAL -> repo.saveMalProgress(anilistId, episode, totalEpisodes)
+                    AccountService.ANILIST ->
+                        repo.saveAniListProgress(animeIdSnapshot, episode, totalEpisodesSnapshot)
+                    AccountService.MAL ->
+                        repo.saveMalProgress(animeIdSnapshot, episode, totalEpisodesSnapshot)
                 }
             }
                 .onFailure {
                     it.rethrowIfCancellation()
-                    syncedAniListEpisodes.remove(episode)
+                    syncedProgressEpisodes.remove(syncKey)
                     DiagnosticsLog.throwable(
-                        "Watch ${service.label} progress sync failed id=$anilistId episode=${fmt(episodeNumber)}",
+                        "Watch ${service.label} progress sync failed id=$animeIdSnapshot " +
+                            "episode=${fmt(episodeNumberSnapshot)}",
                         it,
                     )
                 }

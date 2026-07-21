@@ -224,14 +224,24 @@ fun WatchScreen(
         }
     }
 
+    val fallbackPlaybackKey = remember(animeId, provider, category, episode) {
+        EmbedPlaybackKey(
+            animeId = animeId,
+            provider = provider,
+            category = category,
+            episodeNumber = episode.toDoubleOrNull() ?: -1.0,
+        )
+    }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (webFallback) {
             EmbedWebView(
                 url = "https://www.miruro.to/info/$animeId",
                 referer = "https://www.miruro.to/",
+                playbackKey = fallbackPlaybackKey,
                 modifier = Modifier.fillMaxSize(),
                 onFullscreenChanged = { fullscreen = it },
-                onProgress = vm::onProgress,
+                onProgress = vm::onEmbedProgress,
+                onPlaybackError = vm::onEmbedPlaybackError,
                 onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
             )
             BackButton(pauseAndBack, Modifier.align(Alignment.TopStart))
@@ -300,10 +310,14 @@ fun WatchScreen(
                     onWebFallback = { webFallback = true },
                     onToggleFullscreen = { fullscreen = !fullscreen },
                     onFullscreenChanged = { fullscreen = it },
-                    onProgress = vm::onProgress,
                     onNativePlaybackIdentityChanged = vm::onNativePlaybackIdentityChanged,
                     onNativePlaybackEnded = vm::onNativePlaybackEnded,
+                    onEmbedProgress = vm::onEmbedProgress,
+                    onNativeProgress = vm::onNativeProgress,
                     onPlaybackError = vm::onPlaybackError,
+                    onEmbedPlaybackError = vm::onEmbedPlaybackError,
+                    onEmbedPrevious = vm::prevFromEmbed,
+                    onEmbedNext = vm::nextFromEmbed,
                     onPlaybackStopperChanged = { embeddedPlaybackStopper = it },
                     onPlayerClosed = vm::commitPlaybackPosition,
                 )
@@ -329,10 +343,14 @@ private fun WatchContent(
     onWebFallback: () -> Unit,
     onToggleFullscreen: () -> Unit,
     onFullscreenChanged: (Boolean) -> Unit,
-    onProgress: (Long, Long) -> Unit,
     onNativePlaybackIdentityChanged: (NativePlaybackIdentity) -> Unit,
     onNativePlaybackEnded: (NativePlaybackCompletion) -> Boolean,
+    onEmbedProgress: (EmbedPlaybackKey, Long, Long) -> Unit,
+    onNativeProgress: (PlaybackIdentity, Long, Long, Boolean) -> Unit,
     onPlaybackError: (String, String, Long) -> Unit,
+    onEmbedPlaybackError: (EmbedPlaybackKey, String, String, Long) -> Unit,
+    onEmbedPrevious: (EmbedPlaybackKey) -> Unit,
+    onEmbedNext: (EmbedPlaybackKey) -> Unit,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
     onPlayerClosed: () -> Unit = {},
 ) {
@@ -410,6 +428,21 @@ private fun WatchContent(
         }
         Box(playerModifier.then(playerFocusModifier).background(Color.Black)) {
             val stream = data.chosenStream
+            val embedPlaybackKey = remember(
+                data.anilistId,
+                data.provider,
+                data.category,
+                data.current.number,
+                data.playbackGeneration,
+            ) {
+                EmbedPlaybackKey(
+                    animeId = data.anilistId,
+                    provider = data.provider,
+                    category = data.category.api,
+                    episodeNumber = data.current.number,
+                    sourceGeneration = data.playbackGeneration,
+                )
+            }
             // Key on the KIND of player only, never per-episode/per-url: recreating PlayerSurface
             // for every Next tore down and rebuilt the PlayerView + MediaController each episode
             // (the new view was even created before the old one released). On weak TV hardware
@@ -429,7 +462,7 @@ private fun WatchContent(
                         // Keep native PlayerView/WebView focus out of the TV episode grid: the
                         // player only exists in fullscreen. Leaving fullscreen stops playback, so
                         // first bank the position it reached — every resume path reads it.
-                        LaunchedEffect(stream?.url) {
+                        LaunchedEffect(embedPlaybackKey, stream?.url) {
                             PlaybackService.stopActivePlayback()
                             onPlayerClosed()
                         }
@@ -477,30 +510,33 @@ private fun WatchContent(
                     stream == null -> NoSource(onWebFallback)
                     stream.isEmbed || ProviderCatalog.isEmbed(data.provider) ->
                         Box(Modifier.fillMaxSize()) {
-                            LaunchedEffect(stream.url) { PlaybackService.stopActivePlayback() }
+                            LaunchedEffect(embedPlaybackKey, stream.url) {
+                                PlaybackService.stopActivePlayback()
+                            }
                             EmbedEpisodeNavigationEffect(
                                 hasPrevious = data.hasPrev,
                                 hasNext = data.hasNext,
-                                onPrevious = { onPlayerPrev(playbackNavigation) },
-                                onNext = { onPlayerNext(playbackNavigation) },
+                                onPrevious = { onEmbedPrevious(embedPlaybackKey) },
+                                onNext = { onEmbedNext(embedPlaybackKey) },
                             )
                             EmbedWebView(
                                 url = stream.url,
                                 referer = stream.referer,
+                                playbackKey = embedPlaybackKey,
                                 modifier = Modifier.fillMaxSize(),
                                 qualityStreams = data.sources.embedStreams,
                                 startPositionMs = data.startPositionMs,
                                 skip = data.sources.skip,
-                                onPreviousEpisode = { onPlayerPrev(playbackNavigation) },
-                                onNextEpisode = { onPlayerNext(playbackNavigation) },
+                                onPreviousEpisode = onEmbedPrevious,
+                                onNextEpisode = onEmbedNext,
                                 hasPreviousEpisode = data.hasPrev,
                                 hasNextEpisode = data.hasNext,
                                 focusPlayerOnStart = fullscreen,
                                 isFullscreen = fullscreen,
                                 onToggleFullscreen = onToggleFullscreen,
                                 onFullscreenChanged = onFullscreenChanged,
-                                onProgress = onProgress,
-                                onPlaybackError = onPlaybackError.takeIf { data.provider == "allanime" },
+                                onProgress = onEmbedProgress,
+                                onPlaybackError = onEmbedPlaybackError.takeIf { data.provider == "allanime" },
                                 onPlaybackStopperChanged = onPlaybackStopperChanged,
                             )
                             // Embed players often use CSS "web fullscreen" that never reaches the
@@ -538,6 +574,12 @@ private fun WatchContent(
                         provider = data.provider,
                         category = data.category.api,
                         episode = data.current.displayNumber,
+                        playbackIdentity = PlaybackIdentity(
+                            animeId = data.anilistId,
+                            episodeNumber = data.current.number,
+                            generation = data.playbackGeneration,
+                            mediaId = stream.url,
+                        ),
                         playbackNavigationIdentity = playbackNavigation,
                         onEnded = { completion, endedBy ->
                             finalizeNativeCompletionThenNavigate(
@@ -555,7 +597,7 @@ private fun WatchContent(
                         modifier = Modifier.fillMaxSize(),
                         onToggleFullscreen = onToggleFullscreen,
                         startPositionMs = data.startPositionMs,
-                        onProgress = onProgress,
+                        onProgress = onNativeProgress,
                         onPreviousEpisode = { onPlayerPrev(playbackNavigation) },
                         hasNextEpisode = data.hasNext,
                         hasPreviousEpisode = data.hasPrev,
