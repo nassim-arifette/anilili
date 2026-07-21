@@ -69,9 +69,6 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import android.content.Context
 import android.view.ContextThemeWrapper
-import android.view.LayoutInflater
-import android.view.ViewGroup
-import androidx.media3.common.ViewProvider
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.cast.MediaRouteButtonFactory
 import androidx.mediarouter.app.MediaRouteButton
@@ -82,9 +79,6 @@ import androidx.mediarouter.app.MediaRouteChooserDialogFragment
 import androidx.mediarouter.app.MediaRouteControllerDialog
 import androidx.mediarouter.app.MediaRouteControllerDialogFragment
 import androidx.mediarouter.app.MediaRouteDialogFactory
-import com.google.common.util.concurrent.Futures
-import com.google.common.util.concurrent.ListenableFuture
-import com.google.common.util.concurrent.MoreExecutors
 import com.miruronative.R
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -106,6 +100,8 @@ import com.miruronative.data.settings.DefaultQuality
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.LocalPlaybackOwnerToken
+import com.miruronative.playback.CastSourceDecision
+import com.miruronative.playback.chooseCastSource
 import com.miruronative.playback.PlaybackService
 import com.miruronative.playback.SubtitleDelay
 import com.miruronative.playback.WatchPlaybackOwnerToken
@@ -125,27 +121,6 @@ private const val EXTRA_NATIVE_ANIME_ID = "com.miruronative.extra.NATIVE_ANIME_I
 private const val EXTRA_NATIVE_EPISODE_NUMBER = "com.miruronative.extra.NATIVE_EPISODE_NUMBER"
 
 /**
- * Same as media3's MediaRouteButtonViewProvider, but inflates the MediaRouteButton with an
- * AppCompat-derived theme. The activity keeps its framework theme, and MediaRouteButton (and the
- * route chooser/controller dialogs it opens) crash with "background can not be translucent: #0"
- * without AppCompat theme attributes — so both the button and its dialogs get a wrapped context.
- */
-@UnstableApi
-private class ThemedMediaRouteButtonViewProvider : ViewProvider {
-    override fun getView(parent: ViewGroup): ListenableFuture<View> {
-        val themedContext = ContextThemeWrapper(parent.context, R.style.Theme_MiruroNative_MediaRouter)
-        val button = LayoutInflater.from(themedContext)
-            .inflate(androidx.media3.cast.R.layout.media_route_button_view, parent, false) as MediaRouteButton
-        button.setDialogFactory(ThemedMediaRouteDialogFactory())
-        return Futures.transform(
-            MediaRouteButtonFactory.setUpMediaRouteButton(parent.context, button),
-            { button as View },
-            MoreExecutors.directExecutor(),
-        )
-    }
-}
-
-/**
  * The route chooser/controller dialog fragments create their dialogs from the hosting activity's
  * context; wrap it with the AppCompat-derived theme the same way as the button. Named (non-private)
  * fragment classes so the FragmentManager can re-instantiate them after configuration changes.
@@ -156,6 +131,11 @@ internal class ThemedMediaRouteChooserDialogFragment : MediaRouteChooserDialogFr
             ContextThemeWrapper(context, R.style.Theme_MiruroNative_MediaRouter),
             savedInstanceState,
         )
+
+    override fun onDismiss(dialog: android.content.DialogInterface) {
+        super.onDismiss(dialog)
+        CastChooserDismissEvents.notifyDismissed()
+    }
 }
 
 internal class ThemedMediaRouteControllerDialogFragment : MediaRouteControllerDialogFragment() {
@@ -173,6 +153,57 @@ private class ThemedMediaRouteDialogFactory : MediaRouteDialogFactory() {
     override fun onCreateControllerDialogFragment(): MediaRouteControllerDialogFragment =
         ThemedMediaRouteControllerDialogFragment()
 }
+
+private object CastChooserDismissEvents {
+    private val listeners = java.util.concurrent.CopyOnWriteArraySet<() -> Unit>()
+
+    fun add(listener: () -> Unit) {
+        listeners += listener
+    }
+
+    fun remove(listener: () -> Unit) {
+        listeners -= listener
+    }
+
+    fun notifyDismissed() {
+        listeners.forEach { it() }
+    }
+}
+
+private class GatedMediaRouteButton(context: Context) : MediaRouteButton(context) {
+    var onPrepareCast: (() -> Unit)? = null
+    var preparationEnabled: Boolean = true
+        set(value) {
+            field = value
+            refreshEnabledState()
+        }
+    private var setupReady = false
+
+    fun markSetupReady() {
+        setupReady = true
+        refreshEnabledState()
+    }
+
+    override fun showDialog(): Boolean {
+        if (!setupReady || !preparationEnabled) return false
+        val prepare = onPrepareCast ?: return super.showDialog()
+        prepare()
+        // MediaRouteButton.performClick() calls this override. Report the handled preparation;
+        // the real chooser is opened only after the target MediaItem is observable.
+        return true
+    }
+
+    fun showPreparedDialog(): Boolean = isAttachedToWindow && super.showDialog()
+
+    private fun refreshEnabledState() {
+        isEnabled = setupReady && preparationEnabled
+    }
+}
+
+private data class PendingCastDialogRequest(
+    val targetUrl: String,
+    val openDialog: () -> Boolean,
+)
 
 /** Makes PlayerView's own previous/next buttons navigate episodes, not its one-item playlist. */
 @OptIn(UnstableApi::class)
@@ -375,6 +406,15 @@ internal fun PlayerSurface(
     val currentOnEnded by rememberUpdatedState(onEnded)
     val currentOnPlaybackIdentityChanged by rememberUpdatedState(onPlaybackIdentityChanged)
     var activeStream by remember(playbackSessionKey) { mutableStateOf(stream) }
+    var castMediaItemSanitized by remember(playbackSessionKey) { mutableStateOf(false) }
+    var castRestoreStream by remember(playbackSessionKey) { mutableStateOf<StreamItem?>(null) }
+    var pendingCastDialog by remember(playbackSessionKey) {
+        mutableStateOf<PendingCastDialogRequest?>(null)
+    }
+    var castChooserDismissRevision by remember(playbackSessionKey) { mutableIntStateOf(0) }
+    val currentActiveStream by rememberUpdatedState(activeStream)
+    val currentCastMediaItemSanitized by rememberUpdatedState(castMediaItemSanitized)
+    val currentCastRestoreStream by rememberUpdatedState(castRestoreStream)
     var nextStartPositionMs by remember(playbackSessionKey) { mutableLongStateOf(startPositionMs) }
     var playbackIsPlaying by remember(playbackSessionKey) { mutableStateOf(false) }
     var confirmedPlaybackIdentity by remember(playbackSessionKey) { mutableStateOf<PlaybackIdentity?>(null) }
@@ -395,8 +435,89 @@ internal fun PlayerSurface(
             .filterNot(StreamItem::isEmbed)
             .distinctBy(StreamItem::url)
     }
-    val currentActiveStream by rememberUpdatedState(activeStream)
     val currentNativeQualityStreams by rememberUpdatedState(nativeQualityStreams)
+    val castSourceDecision = remember(activeStream, nativeQualityStreams) {
+        chooseCastSource(activeStream, nativeQualityStreams)
+    }
+    // SubtitleItem cannot describe cookies or request headers. Never transfer side-loaded tracks
+    // to a stock receiver until a provider explicitly marks them public.
+    val activeSubtitles = if (castMediaItemSanitized) emptyList() else subtitles
+
+    DisposableEffect(playbackSessionKey) {
+        val listener: () -> Unit = {
+            castChooserDismissRevision++
+            Unit
+        }
+        CastChooserDismissEvents.add(listener)
+        onDispose { CastChooserDismissEvents.remove(listener) }
+    }
+
+    LaunchedEffect(castChooserDismissRevision, controller, playbackSessionKey) {
+        if (castChooserDismissRevision == 0 || !castMediaItemSanitized) return@LaunchedEffect
+        // Selection dismisses the chooser just before the controller reports REMOTE. Give the Cast
+        // session time to attach; a plain cancellation stays LOCAL and restores the exact source.
+        delay(2_000)
+        val activeController = controller ?: return@LaunchedEffect
+        val hasCastSession = runCatching {
+            CastContext.getSharedInstance(context).sessionManager.currentCastSession != null
+        }.getOrDefault(false)
+        if (
+            activeController.deviceInfo.playbackType == androidx.media3.common.DeviceInfo.PLAYBACK_TYPE_LOCAL &&
+            !hasCastSession
+        ) {
+            runIfPlaybackOwnerActive {
+                nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                activeStream = castRestoreStream ?: stream
+                castMediaItemSanitized = false
+                castRestoreStream = null
+                pendingCastDialog = null
+                DiagnosticsLog.event("PlayerSurface restored local source after Cast chooser dismissal")
+            }
+        }
+    }
+
+    LaunchedEffect(pendingCastDialog, controller, playbackSessionKey) {
+        val request = pendingCastDialog ?: return@LaunchedEffect
+        val activeController = controller ?: return@LaunchedEffect
+        repeat(100) {
+            val item = activeController.currentMediaItem
+            val targetInstalled = item?.mediaId == request.targetUrl &&
+                item.localConfiguration?.subtitleConfigurations.orEmpty().isEmpty()
+            if (targetInstalled) {
+                pendingCastDialog = null
+                if (!request.openDialog()) {
+                    runIfPlaybackOwnerActive {
+                        nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                        activeStream = castRestoreStream ?: stream
+                        castMediaItemSanitized = false
+                        castRestoreStream = null
+                    }
+                    android.widget.Toast.makeText(
+                        context,
+                        "The Cast device chooser could not be opened.",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return@LaunchedEffect
+            }
+            delay(50)
+        }
+        if (pendingCastDialog === request) {
+            pendingCastDialog = null
+            runIfPlaybackOwnerActive {
+                nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                activeStream = castRestoreStream ?: stream
+                castMediaItemSanitized = false
+                castRestoreStream = null
+            }
+            android.widget.Toast.makeText(
+                context,
+                "The Cast-compatible source could not be prepared.",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+            DiagnosticsLog.event("PlayerSurface timed out preparing Cast MediaItem")
+        }
+    }
 
     DisposableEffect(controllerFuture) {
         controllerFuture.addListener(
@@ -609,6 +730,24 @@ internal fun PlayerSurface(
                         }
                     }
                 }
+
+                override fun onDeviceInfoChanged(deviceInfo: androidx.media3.common.DeviceInfo) {
+                    if (
+                        deviceInfo.playbackType == androidx.media3.common.DeviceInfo.PLAYBACK_TYPE_LOCAL &&
+                        currentCastMediaItemSanitized
+                    ) {
+                        runIfPlaybackOwnerActive {
+                            nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                            activeStream = currentCastRestoreStream ?: currentActiveStream
+                            castMediaItemSanitized = false
+                            castRestoreStream = null
+                            pendingCastDialog = null
+                            DiagnosticsLog.event(
+                                "PlayerSurface restored local source after Cast",
+                            )
+                        }
+                    }
+                }
             }
             val listenerAttached = runIfPlaybackOwnerActive {
                 playbackIsPlaying = activeController.isPlaying
@@ -634,7 +773,13 @@ internal fun PlayerSurface(
         }
     }
 
-    LaunchedEffect(controller, activeStream.url, subtitles, playbackIdentity, playbackNavigationIdentity) {
+    LaunchedEffect(
+        controller,
+        activeStream.url,
+        activeSubtitles,
+        playbackIdentity,
+        playbackNavigationIdentity,
+    ) {
         val activeController = controller ?: return@LaunchedEffect
         if (!PlaybackService.isWatchPlaybackOwnerActive(playbackOwner)) {
             DiagnosticsLog.event("PlayerSurface ignored media item work for stale watch owner")
@@ -663,7 +808,7 @@ internal fun PlayerSurface(
 
         DiagnosticsLog.event(
             "PlayerSurface prepare stream type=${activeStream.typeLabel()} host=${activeStream.host()} " +
-                "height=${activeStream.declaredVideoHeight() ?: "auto"} subtitles=${subtitles.size} " +
+                "height=${activeStream.declaredVideoHeight() ?: "auto"} subtitles=${activeSubtitles.size} " +
                 "startMs=$nextStartPositionMs",
         )
         val watchRoute = Routes.watch(animeId, provider, category, episode)
@@ -701,7 +846,7 @@ internal fun PlayerSurface(
             .setMediaMetadata(metadata)
             .apply { if (activeStream.isHls) setMimeType(MimeTypes.APPLICATION_M3U8) }
             .setSubtitleConfigurations(
-                subtitles.mapIndexed { index, subtitle ->
+                activeSubtitles.mapIndexed { index, subtitle ->
                     MediaItem.SubtitleConfiguration.Builder(Uri.parse(subtitle.url))
                         .setMimeType(mimeFor(subtitle.url))
                         .setLanguage(subtitle.language)
@@ -759,7 +904,6 @@ internal fun PlayerSurface(
     }
 
     var playerView by remember { mutableStateOf<PlayerView?>(null) }
-    val mediaRouteButtonViewProvider = remember { ThemedMediaRouteButtonViewProvider() }
     var controllerVisible by remember { mutableStateOf(false) }
     var tvControlsVisible by remember { mutableStateOf(false) }
     var tvControlsInteraction by remember { mutableIntStateOf(0) }
@@ -1031,7 +1175,6 @@ internal fun PlayerSurface(
                     player = playerControls.takeIf {
                         PlaybackService.isWatchPlaybackOwnerActive(playbackOwner)
                     }
-                    setMediaRouteButtonViewProvider(mediaRouteButtonViewProvider)
                     // Phone and TV both draw their own controls (Compose bar / TvPlayerControls),
                     // so Media3's built-in controller is off everywhere.
                     useController = false
@@ -1080,9 +1223,6 @@ internal fun PlayerSurface(
                 it.isFocusableInTouchMode = !device.isTv
                 if (device.isTv) it.clearFocus()
                 it.applyCaptionStyle(captionStyle)
-                // Deliberately NOT re-setting the media route button provider here: every
-                // setMediaRouteButtonViewProvider call inflates a fresh button, so repeated
-                // update passes stack duplicate cast icons. The factory sets it once.
                 it.bindUnifiedSettingsButton { settingsExpanded = true }
                 DiagnosticsLog.event(
                     "PlayerSurface AndroidView update controller=${controller != null} " +
@@ -1187,7 +1327,50 @@ internal fun PlayerSurface(
                         }
                     },
                 )
-                CastButton(Modifier.size(48.dp))
+                CastButton(
+                    decision = castSourceDecision,
+                    preparationPending = pendingCastDialog != null,
+                    onPrepareCast = { ready, openDialog ->
+                        controller?.let { activeController ->
+                            if (
+                                activeController.deviceInfo.playbackType ==
+                                androidx.media3.common.DeviceInfo.PLAYBACK_TYPE_REMOTE
+                            ) {
+                                if (!openDialog()) {
+                                    DiagnosticsLog.event("CastButton failed to open controller dialog")
+                                }
+                            } else if (pendingCastDialog == null) {
+                                val sourceBeforeCast = activeStream
+                                castRestoreStream = sourceBeforeCast
+                                nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                                castMediaItemSanitized = true
+                                activeStream = ready.stream
+                                pendingCastDialog = PendingCastDialogRequest(
+                                    targetUrl = ready.stream.url,
+                                    openDialog = openDialog,
+                                )
+                                if (ready.switchesSource || subtitles.isNotEmpty()) {
+                                    val sourceMessage = if (ready.switchesSource) {
+                                        "Using ${ready.stream.label} for Cast. "
+                                    } else {
+                                        ""
+                                    }
+                                    val subtitleMessage = if (subtitles.isNotEmpty()) {
+                                        "External subtitles are unavailable on the stock receiver."
+                                    } else {
+                                        ""
+                                    }
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        sourceMessage + subtitleMessage,
+                                        android.widget.Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                            }
+                        }
+                    },
+                    modifier = Modifier.size(48.dp),
+                )
                 PlayerControlIconButton(
                     if (isFullscreen) "Exit fullscreen" else "Fullscreen",
                     if (isFullscreen) Icons.Default.FullscreenExit else Icons.Default.Fullscreen,
@@ -1445,7 +1628,7 @@ private fun toggleSubtitles(controller: MediaController, trackNameProvider: Defa
 }
 
 /**
- * The Cast button as a Compose element. Media3's own controller is off, so we inflate the
+ * The Cast button as a Compose element. Media3's own controller is off, so we create the
  * MediaRouteButton ourselves (with the AppCompat-derived theme its dialogs require) and place it
  * in the custom control bar.
  *
@@ -1460,8 +1643,14 @@ private fun toggleSubtitles(controller: MediaController, trackNameProvider: Defa
  */
 @OptIn(UnstableApi::class)
 @Composable
-private fun CastButton(modifier: Modifier = Modifier) {
+private fun CastButton(
+    decision: CastSourceDecision,
+    preparationPending: Boolean,
+    onPrepareCast: (CastSourceDecision.Ready, () -> Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
+    val currentOnPrepareCast by rememberUpdatedState(onPrepareCast)
     val router = remember(context) { runCatching { MediaRouter.getInstance(context) }.getOrNull() }
     val selector = remember(context) {
         runCatching { CastContext.getSharedInstance(context).mergedSelector }.getOrNull()
@@ -1490,18 +1679,58 @@ private fun CastButton(modifier: Modifier = Modifier) {
         }
     }
 
-    if (castRoutesAvailable) {
+    if (castRoutesAvailable && decision is CastSourceDecision.Ready) {
         AndroidView(
             modifier = modifier,
             factory = { ctx ->
                 val themed = ContextThemeWrapper(ctx, R.style.Theme_MiruroNative_MediaRouter)
-                val button = LayoutInflater.from(themed)
-                    .inflate(androidx.media3.cast.R.layout.media_route_button_view, null, false) as MediaRouteButton
+                val button = GatedMediaRouteButton(themed)
                 button.setDialogFactory(ThemedMediaRouteDialogFactory())
+                button.preparationEnabled = !preparationPending
+                button.onPrepareCast = {
+                    currentOnPrepareCast(decision) { button.showPreparedDialog() }
+                }
                 runCatching { MediaRouteButtonFactory.setUpMediaRouteButton(ctx, button) }
+                    .onSuccess { setupFuture ->
+                        setupFuture.addListener(
+                            {
+                                runCatching { setupFuture.get() }
+                                    .onSuccess { button.markSetupReady() }
+                                    .onFailure {
+                                        DiagnosticsLog.throwable("CastButton setup failed", it)
+                                    }
+                            },
+                            ContextCompat.getMainExecutor(ctx),
+                        )
+                    }
+                    .onFailure { DiagnosticsLog.throwable("CastButton setup failed", it) }
                 button
             },
+            update = { button ->
+                button.preparationEnabled = !preparationPending
+                button.onPrepareCast = {
+                    currentOnPrepareCast(decision) { button.showPreparedDialog() }
+                }
+            },
         )
+    } else if (castRoutesAvailable && decision is CastSourceDecision.Blocked) {
+        androidx.compose.material3.IconButton(
+            onClick = {
+                android.widget.Toast.makeText(
+                    context,
+                    decision.reason.userMessage,
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+                openSystemCastPicker(context)
+            },
+            modifier = modifier,
+        ) {
+            androidx.compose.material3.Icon(
+                Icons.Default.Cast,
+                contentDescription = "Screen mirror this protected source",
+                tint = Color.White.copy(alpha = 0.55f),
+            )
+        }
     } else {
         androidx.compose.material3.IconButton(
             onClick = { openSystemCastPicker(context) },
