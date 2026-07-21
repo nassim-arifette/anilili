@@ -91,9 +91,6 @@ jobs:
     environment: release
     permissions:
       contents: read
-    outputs:
-      apk_name: ${{ steps.package.outputs.apk_name }}
-      checksum_name: ${{ steps.package.outputs.checksum_name }}
 
     steps:
       - name: Download unsigned APK
@@ -148,7 +145,6 @@ jobs:
             "$RUNNER_TEMP/anilili-plus-aligned.apk"
 
       - name: Verify package, version, signer, and monotonic version code
-        id: package
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -230,8 +226,6 @@ jobs:
           fi
 
           (cd dist && sha256sum "$apk_name" > "$checksum_name")
-          echo "apk_name=$apk_name" >> "$GITHUB_OUTPUT"
-          echo "checksum_name=$checksum_name" >> "$GITHUB_OUTPUT"
 
       - name: Upload verified signed APK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -262,7 +256,8 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum --check "${{ needs.sign.outputs.checksum_name }}"
+          apk_name="anilili-plus-v${{ needs.build.outputs.version }}.apk"
+          sha256sum --check "${apk_name}.sha256"
 
       - name: Create immutable GitHub Release
         shell: bash
@@ -270,8 +265,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.build.outputs.tag }}
           VERSION: ${{ needs.build.outputs.version }}
-          APK_NAME: ${{ needs.sign.outputs.apk_name }}
-          CHECKSUM_NAME: ${{ needs.sign.outputs.checksum_name }}
+          APK_NAME: anilili-plus-v${{ needs.build.outputs.version }}.apk
+          CHECKSUM_NAME: anilili-plus-v${{ needs.build.outputs.version }}.apk.sha256
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
