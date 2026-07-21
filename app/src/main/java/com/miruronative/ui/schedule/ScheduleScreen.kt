@@ -35,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -131,12 +132,15 @@ fun ScheduleScreen(
             when (val s = state) {
                 is UiState.Loading -> LoadingBox()
                 is UiState.Error -> ErrorBox(s.message, vm::load)
-                is UiState.Success -> PullRefreshContainer(
-                    isRefreshing = isRefreshing,
-                    onRefresh = vm::refresh,
-                    modifier = Modifier.fillMaxSize(),
-                ) {
-                    ScheduleList(s.data, scheduled, onAnimeClick, toggleReminder)
+                is UiState.Success -> {
+                    LaunchedEffect(s.data) { ReminderManager.reconcileSchedule(s.data) }
+                    PullRefreshContainer(
+                        isRefreshing = isRefreshing,
+                        onRefresh = vm::refresh,
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        ScheduleList(s.data, scheduled, onAnimeClick, toggleReminder)
+                    }
                 }
             }
         }

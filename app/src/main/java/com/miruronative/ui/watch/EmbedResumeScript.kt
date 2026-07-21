@@ -21,21 +21,7 @@ internal fun embedResumeWhenReadyJs(
         return window.__aniliNavigationToken === '$navigationGeneration' &&
           window.__aniliNavigationRevoked !== true;
       }
-      function findVideo() {
-        var v = document.querySelector('video');
-        if (v) return v;
-        var frames = document.querySelectorAll('iframe');
-        for (var i = 0; i < frames.length; i++) {
-          try {
-            var d = frames[i].contentDocument;
-            if (d) {
-              var fv = d.querySelector('video');
-              if (fv) return fv;
-            }
-          } catch (e) { /* cross-origin */ }
-        }
-        return null;
-      }
+      ${embedContentVideoSelectorJs()}
       function scheduleRetry() {
         if (Date.now() >= deadline) return;
         setTimeout(attemptResume, $EMBED_RESUME_RETRY_INTERVAL_MS);
@@ -44,7 +30,7 @@ internal fun embedResumeWhenReadyJs(
         if (!isCurrentNavigation()) return;
         if (Date.now() >= deadline) return;
         try {
-          var video = findVideo();
+          var video = findContentVideo();
           if (video && video.readyState >= 1) {
             var target = $targetSec;
             video.currentTime = isFinite(video.duration) && video.duration > 0

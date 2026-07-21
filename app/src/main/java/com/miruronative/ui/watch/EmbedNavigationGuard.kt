@@ -184,30 +184,14 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
       window.__aniliNavigationRevoked = false;
       if (window.__aniliProgressHookedFor === navigationToken) return;
       window.__aniliProgressHookedFor = navigationToken;
-      function findVideo() {
-        var v = document.querySelector('video');
-        if (v) return v;
-        var frames = document.querySelectorAll('iframe');
-        for (var i = 0; i < frames.length; i++) {
-          try {
-            var d = frames[i].contentDocument;
-            if (d) {
-              var fv = d.querySelector('video');
-              if (fv) return fv;
-            }
-          } catch (e) { /* cross-origin */ }
-        }
-        return null;
-      }
+      ${embedContentVideoSelectorJs()}
       var observedVideo = null;
       var observedMediaKey = null;
       var observedPlayingSamples = 0;
       var endedHandler = null;
       var endedReportedMediaKey = null;
       function mediaKey(video) {
-        var source = video.currentSrc || video.src || '';
-        var duration = isFinite(video.duration) ? video.duration : 'unknown';
-        return source + '|' + duration;
+        return __aniliMediaIdentity(video);
       }
       function reportEnded(video) {
         var key = mediaKey(video);
@@ -244,7 +228,7 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
           return;
         }
         try {
-          var v = findVideo();
+          var v = findContentVideo();
           if (v) observeVideo(v);
           if (v && !window.__aniliVideoReported) {
             window.__aniliVideoReported = true;

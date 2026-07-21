@@ -31,6 +31,45 @@ internal fun castTransferDirective(
         CastTransferDirective.PRESERVE_PLAY_STATE
     }
 
+/** A paused receiver session must outlive removal of the sender app's task. */
+internal fun shouldStopPlaybackServiceAfterTaskRemoved(
+    playerInitialized: Boolean,
+    route: PlaybackRoute,
+    mediaItemCount: Int,
+    playWhenReady: Boolean,
+): Boolean {
+    if (!playerInitialized) return true
+    if (route == PlaybackRoute.REMOTE && mediaItemCount > 0) return false
+    return !playWhenReady || mediaItemCount == 0
+}
+
+internal data class EpisodeNavigatorPlaybackIdentity(
+    val animeId: Int,
+    val episodeNumber: Double,
+    val playbackGeneration: Int,
+    val playbackId: String? = null,
+)
+
+/** The playback UUID may be bound after Compose registers the logical episode callback. */
+internal fun EpisodeNavigatorPlaybackIdentity.matchesLogicalPlayback(
+    other: EpisodeNavigatorPlaybackIdentity,
+): Boolean =
+    animeId == other.animeId &&
+        episodeNumber == other.episodeNumber &&
+        playbackGeneration == other.playbackGeneration
+
+internal fun acceptsEpisodeNavigatorPlayback(
+    activeOwnerGeneration: Long,
+    active: EpisodeNavigatorPlaybackIdentity,
+    expected: RemotePlaybackHistoryIdentity?,
+): Boolean = expected == null || (
+    activeOwnerGeneration == expected.watchOwnerGeneration &&
+        active.animeId == expected.animeId &&
+        active.episodeNumber == expected.episodeNumber &&
+        active.playbackGeneration == expected.generation &&
+        active.playbackId == expected.playbackId
+    )
+
 internal class LocalPlaybackOwnerToken(val id: Long)
 
 /**
@@ -50,4 +89,8 @@ internal class LocalPlaybackOwnerRegistry {
 
     @Synchronized
     fun hasOwner(): Boolean = owners.isNotEmpty()
+
+    @Synchronized
+    fun isLatest(token: LocalPlaybackOwnerToken): Boolean =
+        owners.maxByOrNull(LocalPlaybackOwnerToken::id) === token
 }

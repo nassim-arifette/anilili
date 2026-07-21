@@ -4,8 +4,8 @@
         <shape android:shape="rectangle">
             <gradient
                 android:angle="0"
-                android:startColor="#07070B"
-                android:endColor="#17101F" />
+                android:startColor="#070714"
+                android:endColor="#191044" />
             <corners android:radius="8dp" />
         </shape>
     </item>
@@ -16,7 +16,7 @@
         android:left="8dp">
         <bitmap
             android:gravity="fill"
-            android:src="@drawable/anilili_launcher" />
+            android:src="@drawable/anilili_plus_launcher" />
     </item>
     <item
         android:width="150dp"
@@ -42,7 +42,7 @@
             <path
                 android:fillColor="@android:color/transparent"
                 android:pathData="M134,23 L134,39 M126,31 L142,31"
-                android:strokeColor="#FF2C78"
+                android:strokeColor="#2DD4FF"
                 android:strokeLineCap="round"
                 android:strokeWidth="4" />
         </vector>

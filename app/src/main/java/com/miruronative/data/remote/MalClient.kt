@@ -85,13 +85,13 @@ class MalClient(
     }
 
     /** The whole list in one call when possible (MAL allows limit up to 1000), else paged. */
-    suspend fun animeList(): List<MalListEntry> = withContext(Dispatchers.IO) {
+    suspend fun animeList(accessToken: String? = null): List<MalListEntry> = withContext(Dispatchers.IO) {
         val entries = mutableListOf<MalListEntry>()
         var url: String? = "$API/users/@me/animelist" +
             "?fields=list_status,num_episodes&limit=1000&nsfw=true"
         var pages = 0
         while (url != null && pages < MAX_LIST_PAGES) {
-            val parsed = json.decodeFromString(MalListResponse.serializer(), get(url))
+            val parsed = json.decodeFromString(MalListResponse.serializer(), get(url, accessToken))
             parsed.data.forEach { item ->
                 val list = item.listStatus ?: return@forEach
                 entries += MalListEntry(
@@ -110,35 +110,42 @@ class MalClient(
     }
 
     /** The viewer's list entry for one anime, or null when it isn't on their list. */
-    suspend fun listStatus(malId: Int): MalListStatus? = withContext(Dispatchers.IO) {
+    suspend fun listStatus(malId: Int, accessToken: String? = null): MalListStatus? = withContext(Dispatchers.IO) {
         val parsed = json.decodeFromString(
             MalAnimeWithStatus.serializer(),
-            get("$API/anime/$malId?fields=my_list_status"),
+            get("$API/anime/$malId?fields=my_list_status", accessToken),
         )
         parsed.myListStatus?.takeIf { it.status != null }
     }
 
     /** Upsert progress/status. [status] uses MAL vocabulary (watching/completed/…); null keeps it. */
-    suspend fun updateListStatus(malId: Int, progress: Int? = null, status: String? = null) =
+    suspend fun updateListStatus(
+        malId: Int,
+        progress: Int? = null,
+        status: String? = null,
+        accessToken: String? = null,
+    ) =
         withContext(Dispatchers.IO) {
             val body = FormBody.Builder().apply {
                 progress?.let { add("num_watched_episodes", it.toString()) }
                 status?.let { add("status", it) }
             }.build()
-            val request = authed("$API/anime/$malId/my_list_status").patch(body).build()
+            val request = authed("$API/anime/$malId/my_list_status", accessToken).patch(body).build()
             execute(request)
         }
 
-    suspend fun deleteListEntry(malId: Int) = withContext(Dispatchers.IO) {
-        execute(authed("$API/anime/$malId/my_list_status").delete().build())
+    suspend fun deleteListEntry(malId: Int, accessToken: String? = null) = withContext(Dispatchers.IO) {
+        execute(authed("$API/anime/$malId/my_list_status", accessToken).delete().build())
     }
 
     // ---- helpers ----
 
-    private suspend fun get(url: String): String = execute(authed(url).get().build())
+    private suspend fun get(url: String, accessToken: String? = null): String =
+        execute(authed(url, accessToken).get().build())
 
-    private suspend fun authed(url: String): Request.Builder {
-        val token = MalAuthManager.freshAccessToken() ?: error("Not logged in to MyAnimeList")
+    private suspend fun authed(url: String, accessToken: String? = null): Request.Builder {
+        val token = accessToken ?: MalAuthManager.freshAccessToken()
+            ?: error("Not logged in to MyAnimeList")
         return Request.Builder().url(url.toHttpUrl()).header("Authorization", "Bearer $token")
     }
 

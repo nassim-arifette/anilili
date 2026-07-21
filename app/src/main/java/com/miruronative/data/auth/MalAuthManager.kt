@@ -148,9 +148,12 @@ object MalAuthManager {
      * one is within [EXPIRY_MARGIN_MS] of expiry. Null when not logged in; on a failed refresh
      * with an expired access token the session is cleared (MAL refresh tokens do die).
      */
-    suspend fun freshAccessToken(): String? {
+    suspend fun freshAccessToken(expectedGeneration: Long? = null): String? {
         return refreshMutex.withLock {
             val session = sessionGate.snapshot { _tokens.value }
+            if (expectedGeneration != null && session.generation != expectedGeneration) {
+                return@withLock null
+            }
             val latest = session.value ?: return@withLock null
             if (System.currentTimeMillis() < latest.expiresAtMs - EXPIRY_MARGIN_MS) {
                 return@withLock latest.accessToken

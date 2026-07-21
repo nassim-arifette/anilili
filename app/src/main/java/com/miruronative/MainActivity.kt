@@ -1,14 +1,17 @@
 package com.miruronative
 
 import android.Manifest
+import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
+import android.util.Rational
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.SystemBarStyle
@@ -77,9 +80,12 @@ import androidx.navigation.navArgument
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.miruronative.data.auth.AuthManager
+import com.miruronative.data.AppGraph
 import com.miruronative.data.library.LibraryStore
 import com.miruronative.data.reminder.AutomaticReleaseManager
+import com.miruronative.data.reminder.NotificationPermissionAction
 import com.miruronative.data.reminder.ReleaseSyncScheduler
+import com.miruronative.data.reminder.notificationPermissionAction
 import com.miruronative.diagnostics.CrashReportDialog
 import com.miruronative.diagnostics.CrashReporter
 import com.miruronative.diagnostics.DiagnosticsLog
@@ -105,13 +111,20 @@ import com.miruronative.ui.theme.MiruroTheme
 import com.miruronative.ui.watch.WatchScreen
 import com.miruronative.playback.PlaybackStatus
 import com.miruronative.playback.PlaybackService
+import com.miruronative.playback.PictureInPictureEntryMode
+import com.miruronative.playback.PictureInPicturePlaybackSnapshot
+import com.miruronative.playback.pictureInPictureEntryMode
+import com.miruronative.playback.shouldPausePlaybackOnActivityStop
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
+private const val POST_NOTIFICATIONS_PERMISSION = "android.permission.POST_NOTIFICATIONS"
+
 class MainActivity : FragmentActivity() {
     private var inPictureInPicture by mutableStateOf(false)
     private var pendingRoute by mutableStateOf<String?>(null)
+    private var latestPictureInPictureSnapshot = PictureInPicturePlaybackSnapshot()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         DiagnosticsLog.event("MainActivity.onCreate start savedState=${savedInstanceState != null}")
@@ -167,13 +180,18 @@ class MainActivity : FragmentActivity() {
             )
         }
         lifecycleScope.launch {
-            PlaybackStatus.isPlaying.collect { playing ->
-                DiagnosticsLog.event("PlaybackStatus.isPlaying=$playing")
-                if (playing) {
+            PlaybackStatus.pictureInPictureSnapshot.collect { snapshot ->
+                latestPictureInPictureSnapshot = snapshot
+                DiagnosticsLog.event(
+                    "PlaybackStatus PiP playing=${snapshot.isPlaying} " +
+                        "native=${snapshot.hasNativeSurface} route=${snapshot.playbackRoute}",
+                )
+                if (snapshot.isPlaying) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 } else {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
+                updatePictureInPictureParams(snapshot)
             }
         }
     }
@@ -193,6 +211,23 @@ class MainActivity : FragmentActivity() {
     override fun onPause() {
         super.onPause()
         DiagnosticsLog.event("MainActivity.onPause")
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        val mode = currentPictureInPictureEntryMode(latestPictureInPictureSnapshot)
+        if (mode != PictureInPictureEntryMode.USER_LEAVE_HINT) {
+            DiagnosticsLog.event("PictureInPicture user leave ignored mode=$mode")
+            return
+        }
+        val entered = runCatching {
+            enterPictureInPictureMode(
+                buildPictureInPictureParams(latestPictureInPictureSnapshot, mode),
+            )
+        }.onFailure {
+            DiagnosticsLog.throwable("PictureInPicture legacy entry failed", it)
+        }.getOrDefault(false)
+        DiagnosticsLog.event("PictureInPicture legacy entry requested entered=$entered")
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -222,8 +257,14 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         super.onStop()
-        DiagnosticsLog.event("MainActivity.onStop")
-        PlaybackService.pauseActivePlayback()
+        val actuallyInPictureInPicture =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode
+        DiagnosticsLog.event("MainActivity.onStop pictureInPicture=$actuallyInPictureInPicture")
+        if (shouldPausePlaybackOnActivityStop(actuallyInPictureInPicture)) {
+            PlaybackService.pauseActivePlayback()
+        } else {
+            DiagnosticsLog.event("MainActivity.onStop kept native playback for PictureInPicture")
+        }
     }
 
     override fun onDestroy() {
@@ -253,7 +294,51 @@ class MainActivity : FragmentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         inPictureInPicture = isInPictureInPictureMode
+        updatePictureInPictureParams(latestPictureInPictureSnapshot)
         DiagnosticsLog.event("PictureInPicture changed active=$isInPictureInPictureMode")
+    }
+
+    private fun currentPictureInPictureEntryMode(
+        snapshot: PictureInPicturePlaybackSnapshot,
+    ): PictureInPictureEntryMode = pictureInPictureEntryMode(
+        snapshot = snapshot,
+        sdkInt = Build.VERSION.SDK_INT,
+        isTv = AppGraph.isTv,
+        isAlreadyInPictureInPicture =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode,
+    )
+
+    private fun updatePictureInPictureParams(snapshot: PictureInPicturePlaybackSnapshot) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val mode = currentPictureInPictureEntryMode(snapshot)
+        runCatching {
+            setPictureInPictureParams(buildPictureInPictureParams(snapshot, mode))
+        }.onFailure {
+            DiagnosticsLog.throwable("PictureInPicture params update failed", it)
+        }
+    }
+
+    private fun buildPictureInPictureParams(
+        snapshot: PictureInPicturePlaybackSnapshot,
+        mode: PictureInPictureEntryMode,
+    ): PictureInPictureParams {
+        val ratio = snapshot.aspectRatio
+        return PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(ratio.width, ratio.height))
+            .apply {
+                snapshot.sourceRect
+                    ?.takeIf { snapshot.hasNativeSurface && it.isUsable }
+                    ?.let { source ->
+                        setSourceRectHint(
+                            Rect(source.left, source.top, source.right, source.bottom),
+                        )
+                    }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    setAutoEnterEnabled(mode == PictureInPictureEntryMode.AUTO_ENTER)
+                    setSeamlessResizeEnabled(true)
+                }
+            }
+            .build()
     }
 
 }
@@ -453,29 +538,49 @@ private fun MiruroRoot(
 private fun NotificationPermissionEffect() {
     val context = LocalContext.current
     val device = LocalAppDeviceProfile.current
+    val settingsLoaded by SettingsStore.isLoaded.collectAsState()
     val enabled by SettingsStore.releaseNotifications.collectAsState()
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        SettingsStore.setReleaseNotifications(granted)
-        if (granted) ReleaseSyncScheduler.runNow(context) else AutomaticReleaseManager.cancelAll()
+        // A result can arrive during recreation; never apply it to the provisional default or
+        // undo a user's explicit disable while the system dialog was open.
+        if (SettingsStore.isLoaded.value && SettingsStore.releaseNotifications.value) {
+            SettingsStore.setReleaseNotifications(granted)
+            if (granted) ReleaseSyncScheduler.runNow(context) else AutomaticReleaseManager.cancelAll()
+        }
     }
 
-    LaunchedEffect(enabled, device.isTv) {
-        if (!enabled) {
-            AutomaticReleaseManager.cancelAll()
-            return@LaunchedEffect
-        }
-        if (device.isTv || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return@LaunchedEffect
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
-            ReleaseSyncScheduler.runNow(context)
-            return@LaunchedEffect
-        }
+    LaunchedEffect(settingsLoaded, enabled, device.isTv) {
+        val runtimePermissionRequired =
+            !device.isTv && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        val permissionGranted = !runtimePermissionRequired ||
+            ContextCompat.checkSelfPermission(
+                context,
+                POST_NOTIFICATIONS_PERMISSION,
+            ) == PackageManager.PERMISSION_GRANTED
         val prefs = context.getSharedPreferences("anilili_permissions", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("release_notifications_prompted", false)) {
-            prefs.edit().putBoolean("release_notifications_prompted", true).apply()
-            launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            SettingsStore.setReleaseNotifications(false)
-            AutomaticReleaseManager.cancelAll()
+        when (
+            notificationPermissionAction(
+                settingsLoaded = settingsLoaded,
+                releaseNotificationsEnabled = enabled,
+                runtimePermissionRequired = runtimePermissionRequired,
+                permissionGranted = permissionGranted,
+                permissionWasPrompted = prefs.getBoolean("release_notifications_prompted", false),
+            )
+        ) {
+            NotificationPermissionAction.WAIT_FOR_SETTINGS,
+            NotificationPermissionAction.NO_ACTION -> Unit
+
+            NotificationPermissionAction.CANCEL_RELEASES -> AutomaticReleaseManager.cancelAll()
+            NotificationPermissionAction.SYNC_RELEASES -> ReleaseSyncScheduler.runNow(context)
+            NotificationPermissionAction.REQUEST_PERMISSION -> {
+                prefs.edit().putBoolean("release_notifications_prompted", true).apply()
+                launcher.launch(POST_NOTIFICATIONS_PERMISSION)
+            }
+
+            NotificationPermissionAction.DISABLE_AND_CANCEL -> {
+                SettingsStore.setReleaseNotifications(false)
+                AutomaticReleaseManager.cancelAll()
+            }
         }
     }
 }
@@ -540,10 +645,10 @@ private fun AppNavHost(
                     onAnimeClick = { id -> nav.navigate(Routes.detail(id)) },
                     onWatchNow = { id ->
                         val saved = com.miruronative.data.library.LibraryStore.historyFor(id)
-                        if (saved != null) nav.navigate(Routes.watch(id, saved.provider, saved.category, saved.episodeLabel))
+                        if (saved != null) nav.navigate(Routes.watch(id, saved.provider, saved.category, saved.continueEpisodeLabel))
                         else nav.navigate(Routes.watch(id, "auto", if (com.miruronative.data.settings.SettingsStore.preferDub.value) "dub" else "sub", "1"))
                     },
-                    onResume = { e -> nav.navigate(Routes.watch(e.anilistId, e.provider, e.category, e.episodeLabel)) },
+                    onResume = { e -> nav.navigate(Routes.watch(e.anilistId, e.provider, e.category, e.continueEpisodeLabel)) },
                     onSearchClick = { nav.navigateTab(Routes.SEARCH) },
                     onNotificationsClick = { nav.navigate(Routes.NOTIFICATIONS) { launchSingleTop = true } },
                 )
@@ -568,7 +673,7 @@ private fun AppNavHost(
                 ProfileScreen(
                     onAnimeClick = { id -> nav.navigate(Routes.detail(id)) },
                     onResume = { e ->
-                        nav.navigate(Routes.watch(e.anilistId, e.provider, e.category, e.episodeLabel))
+                        nav.navigate(Routes.watch(e.anilistId, e.provider, e.category, e.continueEpisodeLabel))
                     },
                 )
             }
@@ -605,7 +710,7 @@ private fun AppNavHost(
                     onSeasonWatch = { seasonId ->
                         val saved = com.miruronative.data.library.LibraryStore.historyFor(seasonId)
                         if (saved != null) {
-                            nav.navigate(Routes.episodes(seasonId, saved.provider, saved.category, saved.episodeLabel))
+                            nav.navigate(Routes.episodes(seasonId, saved.provider, saved.category, saved.continueEpisodeLabel))
                         } else {
                             nav.navigate(Routes.episodes(seasonId, "auto", if (com.miruronative.data.settings.SettingsStore.preferDub.value) "dub" else "sub", "1"))
                         }

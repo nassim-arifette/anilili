@@ -28,8 +28,10 @@ internal data class AccountSessionIdentity(
  * A same-provider logout/login therefore never looks like the original account.
  */
 internal fun currentAccountSession(): AccountSessionIdentity? {
-    AuthManager.sessionGeneration()?.let {
-        return AccountSessionIdentity(AccountService.ANILIST, it)
+    if (AuthManager.current() != null) {
+        AuthManager.sessionGeneration()?.let {
+            return AccountSessionIdentity(AccountService.ANILIST, it)
+        }
     }
     MalAuthManager.sessionGeneration()?.let {
         return AccountSessionIdentity(AccountService.MAL, it)
@@ -57,3 +59,6 @@ internal fun commitIfCurrentAccountSession(
         committed
     }
 }
+
+internal fun isCurrentAccountSession(session: AccountSessionIdentity): Boolean =
+    commitIfCurrentAccountSession(session) {}

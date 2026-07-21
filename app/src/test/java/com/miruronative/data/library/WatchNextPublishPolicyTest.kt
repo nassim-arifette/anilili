@@ -30,6 +30,26 @@ class WatchNextPublishPolicyTest {
     }
 
     @Test
+    fun `first confirmed progress replaces a zero-position continuation immediately`() {
+        val pendingContinuation = WatchNextContent(
+            episodeNumber = 2.0,
+            provider = "allanime",
+            category = "sub",
+            isContinuationTarget = true,
+        )
+        val confirmedPlayback = pendingContinuation.copy(isContinuationTarget = false)
+
+        assertTrue(
+            shouldPublishWatchNext(
+                previous = WatchNextPublishState(pendingContinuation, publishedAtMs = 1_000L),
+                content = confirmedPlayback,
+                nowMs = 2_000L,
+                throttleMs = 60_000L,
+            ),
+        )
+    }
+
+    @Test
     fun `route changes bypass the progress throttle`() {
         val previous = WatchNextPublishState(episodeOne, publishedAtMs = 1_000L)
 
@@ -37,6 +57,41 @@ class WatchNextPublishPolicyTest {
             shouldPublishWatchNext(
                 previous,
                 episodeOne.copy(provider = "kaa", category = "dub"),
+                nowMs = 2_000L,
+                throttleMs = 60_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `continuation publishes the next episode route from zero without old duration`() {
+        val entry = HistoryEntry(
+            anilistId = 42,
+            title = "Test show",
+            cover = null,
+            episodeNumber = 1.0,
+            episodeTitle = "The first episode",
+            provider = "allanime",
+            category = "sub",
+            positionMs = 90_000L,
+            durationMs = 90_000L,
+            continuationEpisodeNumber = 2.0,
+        )
+
+        val request = WatchNextManager.preparePublish(entry)
+        val content = request.entry.watchNextContent()
+        val program = request.entry.watchNextProgramData()
+
+        assertEquals(2.0, content.episodeNumber, 0.0)
+        assertEquals(2.0, program.episodeNumber, 0.0)
+        assertEquals("2", program.episodeLabel)
+        assertEquals("Episode 2", program.episodeTitle)
+        assertEquals(0L, program.positionMs)
+        assertEquals(0L, program.durationMs)
+        assertTrue(
+            shouldPublishWatchNext(
+                previous = WatchNextPublishState(episodeOne, publishedAtMs = 1_000L),
+                content = content,
                 nowMs = 2_000L,
                 throttleMs = 60_000L,
             ),

@@ -2,6 +2,7 @@ package com.miruronative.ui.watch
 
 import android.content.ComponentName
 import android.content.ContextWrapper
+import android.graphics.Rect
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
@@ -69,9 +70,6 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import android.content.Context
 import android.view.ContextThemeWrapper
-import android.view.LayoutInflater
-import android.view.ViewGroup
-import androidx.media3.common.ViewProvider
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.cast.MediaRouteButtonFactory
 import androidx.mediarouter.app.MediaRouteButton
@@ -82,9 +80,6 @@ import androidx.mediarouter.app.MediaRouteChooserDialogFragment
 import androidx.mediarouter.app.MediaRouteControllerDialog
 import androidx.mediarouter.app.MediaRouteControllerDialogFragment
 import androidx.mediarouter.app.MediaRouteDialogFactory
-import com.google.common.util.concurrent.Futures
-import com.google.common.util.concurrent.ListenableFuture
-import com.google.common.util.concurrent.MoreExecutors
 import com.miruronative.R
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -106,9 +101,15 @@ import com.miruronative.data.settings.DefaultQuality
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.LocalPlaybackOwnerToken
+import com.miruronative.playback.CastSourceDecision
+import com.miruronative.playback.chooseCastSource
+import com.miruronative.playback.PictureInPictureSourceRect
+import com.miruronative.playback.EpisodeNavigatorPlaybackIdentity
 import com.miruronative.playback.PlaybackService
+import com.miruronative.playback.RemotePlaybackHistoryMetadata
 import com.miruronative.playback.SubtitleDelay
 import com.miruronative.playback.WatchPlaybackOwnerToken
+import com.miruronative.playback.putRemotePlaybackHistoryMetadata
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
@@ -125,27 +126,6 @@ private const val EXTRA_NATIVE_ANIME_ID = "com.miruronative.extra.NATIVE_ANIME_I
 private const val EXTRA_NATIVE_EPISODE_NUMBER = "com.miruronative.extra.NATIVE_EPISODE_NUMBER"
 
 /**
- * Same as media3's MediaRouteButtonViewProvider, but inflates the MediaRouteButton with an
- * AppCompat-derived theme. The activity keeps its framework theme, and MediaRouteButton (and the
- * route chooser/controller dialogs it opens) crash with "background can not be translucent: #0"
- * without AppCompat theme attributes — so both the button and its dialogs get a wrapped context.
- */
-@UnstableApi
-private class ThemedMediaRouteButtonViewProvider : ViewProvider {
-    override fun getView(parent: ViewGroup): ListenableFuture<View> {
-        val themedContext = ContextThemeWrapper(parent.context, R.style.Theme_MiruroNative_MediaRouter)
-        val button = LayoutInflater.from(themedContext)
-            .inflate(androidx.media3.cast.R.layout.media_route_button_view, parent, false) as MediaRouteButton
-        button.setDialogFactory(ThemedMediaRouteDialogFactory())
-        return Futures.transform(
-            MediaRouteButtonFactory.setUpMediaRouteButton(parent.context, button),
-            { button as View },
-            MoreExecutors.directExecutor(),
-        )
-    }
-}
-
-/**
  * The route chooser/controller dialog fragments create their dialogs from the hosting activity's
  * context; wrap it with the AppCompat-derived theme the same way as the button. Named (non-private)
  * fragment classes so the FragmentManager can re-instantiate them after configuration changes.
@@ -156,6 +136,11 @@ internal class ThemedMediaRouteChooserDialogFragment : MediaRouteChooserDialogFr
             ContextThemeWrapper(context, R.style.Theme_MiruroNative_MediaRouter),
             savedInstanceState,
         )
+
+    override fun onDismiss(dialog: android.content.DialogInterface) {
+        super.onDismiss(dialog)
+        CastChooserDismissEvents.notifyDismissed()
+    }
 }
 
 internal class ThemedMediaRouteControllerDialogFragment : MediaRouteControllerDialogFragment() {
@@ -173,6 +158,57 @@ private class ThemedMediaRouteDialogFactory : MediaRouteDialogFactory() {
     override fun onCreateControllerDialogFragment(): MediaRouteControllerDialogFragment =
         ThemedMediaRouteControllerDialogFragment()
 }
+
+private object CastChooserDismissEvents {
+    private val listeners = java.util.concurrent.CopyOnWriteArraySet<() -> Unit>()
+
+    fun add(listener: () -> Unit) {
+        listeners += listener
+    }
+
+    fun remove(listener: () -> Unit) {
+        listeners -= listener
+    }
+
+    fun notifyDismissed() {
+        listeners.forEach { it() }
+    }
+}
+
+private class GatedMediaRouteButton(context: Context) : MediaRouteButton(context) {
+    var onPrepareCast: (() -> Unit)? = null
+    var preparationEnabled: Boolean = true
+        set(value) {
+            field = value
+            refreshEnabledState()
+        }
+    private var setupReady = false
+
+    fun markSetupReady() {
+        setupReady = true
+        refreshEnabledState()
+    }
+
+    override fun showDialog(): Boolean {
+        if (!setupReady || !preparationEnabled) return false
+        val prepare = onPrepareCast ?: return super.showDialog()
+        prepare()
+        // MediaRouteButton.performClick() calls this override. Report the handled preparation;
+        // the real chooser is opened only after the target MediaItem is observable.
+        return true
+    }
+
+    fun showPreparedDialog(): Boolean = isAttachedToWindow && super.showDialog()
+
+    private fun refreshEnabledState() {
+        isEnabled = setupReady && preparationEnabled
+    }
+}
+
+private data class PendingCastDialogRequest(
+    val targetUrl: String,
+    val openDialog: () -> Boolean,
+)
 
 /** Makes PlayerView's own previous/next buttons navigate episodes, not its one-item playlist. */
 @OptIn(UnstableApi::class)
@@ -236,26 +272,35 @@ private const val EXTRA_NAV_STREAM_URL = "anilili.navigation.STREAM_URL"
 private const val EXTRA_NAV_MEDIA_ID = "anilili.navigation.MEDIA_ID"
 
 private fun MediaItem.playbackNavigationIdentityOrNull(): PlaybackNavigationIdentity? {
-    val extras = mediaMetadata.extras ?: return null
+    val extras = mediaMetadata.extras
     if (
-        !extras.containsKey(EXTRA_NAV_ANIME_ID) ||
-        !extras.containsKey(EXTRA_NAV_EPISODE_NUMBER) ||
-        !extras.containsKey(EXTRA_NAV_PROVIDER) ||
-        !extras.containsKey(EXTRA_NAV_CATEGORY) ||
-        !extras.containsKey(EXTRA_NAV_GENERATION) ||
-        !extras.containsKey(EXTRA_NAV_STREAM_URL) ||
-        !extras.containsKey(EXTRA_NAV_MEDIA_ID)
+        extras != null &&
+        extras.containsKey(EXTRA_NAV_ANIME_ID) &&
+        extras.containsKey(EXTRA_NAV_EPISODE_NUMBER) &&
+        extras.containsKey(EXTRA_NAV_PROVIDER) &&
+        extras.containsKey(EXTRA_NAV_CATEGORY) &&
+        extras.containsKey(EXTRA_NAV_GENERATION) &&
+        extras.containsKey(EXTRA_NAV_STREAM_URL) &&
+        extras.containsKey(EXTRA_NAV_MEDIA_ID) &&
+        extras.getString(EXTRA_NATIVE_PLAYBACK_ID) == mediaId
     ) {
-        return null
+        return PlaybackNavigationIdentity(
+            animeId = extras.getInt(EXTRA_NAV_ANIME_ID),
+            episodeNumber = extras.getDouble(EXTRA_NAV_EPISODE_NUMBER),
+            provider = extras.getString(EXTRA_NAV_PROVIDER) ?: return null,
+            category = Category.from(extras.getString(EXTRA_NAV_CATEGORY) ?: return null),
+            playbackGeneration = extras.getInt(EXTRA_NAV_GENERATION),
+            streamUrl = extras.getString(EXTRA_NAV_STREAM_URL),
+        )
     }
-    if (extras.getString(EXTRA_NAV_MEDIA_ID) != mediaId) return null
+    val retained = PlaybackService.registeredRemotePlaybackHistoryMetadata(mediaId) ?: return null
     return PlaybackNavigationIdentity(
-        animeId = extras.getInt(EXTRA_NAV_ANIME_ID),
-        episodeNumber = extras.getDouble(EXTRA_NAV_EPISODE_NUMBER),
-        provider = extras.getString(EXTRA_NAV_PROVIDER) ?: return null,
-        category = Category.from(extras.getString(EXTRA_NAV_CATEGORY) ?: return null),
-        playbackGeneration = extras.getInt(EXTRA_NAV_GENERATION),
-        streamUrl = extras.getString(EXTRA_NAV_STREAM_URL),
+        animeId = retained.animeId,
+        episodeNumber = retained.episodeNumber,
+        provider = retained.provider,
+        category = Category.from(retained.category),
+        playbackGeneration = retained.generation,
+        streamUrl = retained.navigationStreamUrl,
     )
 }
 
@@ -266,21 +311,28 @@ private const val EXTRA_PLAYBACK_MEDIA_ID = "anilili.playback.MEDIA_ID"
 
 /** Reads the history/progress identity from the MediaItem that actually emitted the callback. */
 private fun MediaItem.playbackIdentityOrNull(): PlaybackIdentity? {
-    val extras = mediaMetadata.extras ?: return null
+    val extras = mediaMetadata.extras
     if (
-        !extras.containsKey(EXTRA_PLAYBACK_ANIME_ID) ||
-        !extras.containsKey(EXTRA_PLAYBACK_EPISODE_NUMBER) ||
-        !extras.containsKey(EXTRA_PLAYBACK_GENERATION)
+        extras != null &&
+        extras.containsKey(EXTRA_PLAYBACK_ANIME_ID) &&
+        extras.containsKey(EXTRA_PLAYBACK_EPISODE_NUMBER) &&
+        extras.containsKey(EXTRA_PLAYBACK_GENERATION) &&
+        extras.getString(EXTRA_NATIVE_PLAYBACK_ID) == mediaId
     ) {
-        return null
+        val storedMediaId = extras.getString(EXTRA_PLAYBACK_MEDIA_ID) ?: return null
+        return PlaybackIdentity(
+            animeId = extras.getInt(EXTRA_PLAYBACK_ANIME_ID),
+            episodeNumber = extras.getDouble(EXTRA_PLAYBACK_EPISODE_NUMBER),
+            generation = extras.getInt(EXTRA_PLAYBACK_GENERATION),
+            mediaId = storedMediaId,
+        )
     }
-    val storedMediaId = extras.getString(EXTRA_PLAYBACK_MEDIA_ID) ?: return null
-    if (mediaId.isBlank() || storedMediaId != mediaId) return null
+    val retained = PlaybackService.registeredRemotePlaybackHistoryMetadata(mediaId) ?: return null
     return PlaybackIdentity(
-        animeId = extras.getInt(EXTRA_PLAYBACK_ANIME_ID),
-        episodeNumber = extras.getDouble(EXTRA_PLAYBACK_EPISODE_NUMBER),
-        generation = extras.getInt(EXTRA_PLAYBACK_GENERATION),
-        mediaId = mediaId,
+        animeId = retained.animeId,
+        episodeNumber = retained.episodeNumber,
+        generation = retained.generation,
+        mediaId = retained.mediaId,
     )
 }
 
@@ -295,6 +347,7 @@ internal fun PlayerSurface(
     skip: SkipTimes?,
     seriesTitle: String,
     episodeTitle: String,
+    historyEpisodeTitle: String?,
     artworkUrl: String?,
     animeId: Int,
     provider: String,
@@ -305,13 +358,15 @@ internal fun PlayerSurface(
     onEnded: (NativePlaybackCompletion, PlaybackNavigationIdentity) -> Unit,
     onNextEpisode: () -> Unit,
     onPlaybackIdentityChanged: (NativePlaybackIdentity) -> Unit,
-    onError: (PlaybackIdentity, String, String, Long) -> Unit,
+    onError: (PlaybackIdentity, String, String, Long, Set<String>) -> Unit,
     modifier: Modifier = Modifier,
     onToggleFullscreen: (() -> Unit)? = null,
     startPositionMs: Long = 0,
     onProgress: ((PlaybackIdentity, Long, Long, Boolean) -> Unit)? = null,
     onPreviousEpisode: (() -> Unit)? = null,
     hasNextEpisode: Boolean = true,
+    nextEpisodeNumber: Double? = null,
+    totalEpisodes: Int? = null,
     hasPreviousEpisode: Boolean = true,
     focusPlayerOnStart: Boolean = true,
     isFullscreen: Boolean = false,
@@ -322,9 +377,8 @@ internal fun PlayerSurface(
     val playbackSessionKey = playbackIdentity.nativePlaybackSessionKey()
     DisposableEffect(Unit) { onDispose { resetPlayerBrightness(context) } }
     val lifecycleOwner = remember(context) { context.findPlayerLifecycleOwner() }
+    var localPlaybackOwner by remember { mutableStateOf<LocalPlaybackOwnerToken?>(null) }
     DisposableEffect(lifecycleOwner) {
-        var localPlaybackOwner: LocalPlaybackOwnerToken? = null
-
         fun acquirePlaybackOwner() {
             if (localPlaybackOwner == null) {
                 localPlaybackOwner = PlaybackService.acquireLocalPlaybackOwner()
@@ -375,6 +429,15 @@ internal fun PlayerSurface(
     val currentOnEnded by rememberUpdatedState(onEnded)
     val currentOnPlaybackIdentityChanged by rememberUpdatedState(onPlaybackIdentityChanged)
     var activeStream by remember(playbackSessionKey) { mutableStateOf(stream) }
+    var castMediaItemSanitized by remember(playbackSessionKey) { mutableStateOf(false) }
+    var castRestoreStream by remember(playbackSessionKey) { mutableStateOf<StreamItem?>(null) }
+    var pendingCastDialog by remember(playbackSessionKey) {
+        mutableStateOf<PendingCastDialogRequest?>(null)
+    }
+    var castChooserDismissRevision by remember(playbackSessionKey) { mutableIntStateOf(0) }
+    val currentActiveStream by rememberUpdatedState(activeStream)
+    val currentCastMediaItemSanitized by rememberUpdatedState(castMediaItemSanitized)
+    val currentCastRestoreStream by rememberUpdatedState(castRestoreStream)
     var nextStartPositionMs by remember(playbackSessionKey) { mutableLongStateOf(startPositionMs) }
     var playbackIsPlaying by remember(playbackSessionKey) { mutableStateOf(false) }
     var confirmedPlaybackIdentity by remember(playbackSessionKey) { mutableStateOf<PlaybackIdentity?>(null) }
@@ -382,18 +445,101 @@ internal fun PlayerSurface(
         mutableStateOf<NativePlaybackIdentity?>(null)
     }
     var tracksRevision by remember(playbackSessionKey) { mutableIntStateOf(0) }
-    // One same-stream retry at a capped resolution before giving the provider up: weak TV
-    // decoders (Fire TV's OMX.MS.AVC) can die on 1080p with a codec error even though the
-    // format is nominally supported, and a provider failover for a device-side decode hiccup
-    // needlessly restarts the episode on another server.
-    // The listener below lives for the MediaController, not for a particular episode. Keep the
-    // retry allowance tied to each MediaItem installation so a new logical playback can retry
-    // even when its provider reuses the same URL as the previous episode.
-    val decoderRetryPolicy = remember { PlayerDecoderRetryPolicy() }
+    var pinnedVideoHeight by remember(controller, playbackSessionKey) { mutableStateOf<Int?>(null) }
+    var defaultQualityApplied by remember(playbackSessionKey) { mutableStateOf(false) }
+    // Weak TV decoders can reject a nominally supported high-resolution source. Keep recovery
+    // scoped to this logical playback so lower per-quality URLs are exhausted without looping,
+    // then grant the last URL one same-manifest retry capped at 720p.
+    val decoderRetryPolicy = remember(playbackSessionKey) {
+        PlayerDecoderRetryPolicy().apply { startSession(playbackSessionKey) }
+    }
     val nativeQualityStreams = remember(playbackSessionKey, stream, qualityStreams) {
         (listOf(stream) + qualityStreams)
             .filterNot(StreamItem::isEmbed)
             .distinctBy(StreamItem::url)
+    }
+    val currentNativeQualityStreams by rememberUpdatedState(nativeQualityStreams)
+    val castSourceDecision = remember(activeStream, nativeQualityStreams) {
+        chooseCastSource(activeStream, nativeQualityStreams)
+    }
+    // SubtitleItem cannot describe cookies or request headers. Never transfer side-loaded tracks
+    // to a stock receiver until a provider explicitly marks them public.
+    val activeSubtitles = if (castMediaItemSanitized) emptyList() else subtitles
+
+    DisposableEffect(playbackSessionKey) {
+        val listener: () -> Unit = {
+            castChooserDismissRevision++
+            Unit
+        }
+        CastChooserDismissEvents.add(listener)
+        onDispose { CastChooserDismissEvents.remove(listener) }
+    }
+
+    LaunchedEffect(castChooserDismissRevision, controller, playbackSessionKey) {
+        if (castChooserDismissRevision == 0 || !castMediaItemSanitized) return@LaunchedEffect
+        // Selection dismisses the chooser just before the controller reports REMOTE. Give the Cast
+        // session time to attach; a plain cancellation stays LOCAL and restores the exact source.
+        delay(2_000)
+        val activeController = controller ?: return@LaunchedEffect
+        val hasCastSession = runCatching {
+            CastContext.getSharedInstance(context).sessionManager.currentCastSession != null
+        }.getOrDefault(false)
+        if (
+            activeController.deviceInfo.playbackType == androidx.media3.common.DeviceInfo.PLAYBACK_TYPE_LOCAL &&
+            !hasCastSession
+        ) {
+            runIfPlaybackOwnerActive {
+                nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                activeStream = castRestoreStream ?: stream
+                castMediaItemSanitized = false
+                castRestoreStream = null
+                pendingCastDialog = null
+                DiagnosticsLog.event("PlayerSurface restored local source after Cast chooser dismissal")
+            }
+        }
+    }
+
+    LaunchedEffect(pendingCastDialog, controller, playbackSessionKey) {
+        val request = pendingCastDialog ?: return@LaunchedEffect
+        val activeController = controller ?: return@LaunchedEffect
+        repeat(100) {
+            val item = activeController.currentMediaItem
+            val targetInstalled = item?.mediaId == request.targetUrl &&
+                item.localConfiguration?.subtitleConfigurations.orEmpty().isEmpty()
+            if (targetInstalled) {
+                pendingCastDialog = null
+                if (!request.openDialog()) {
+                    runIfPlaybackOwnerActive {
+                        nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                        activeStream = castRestoreStream ?: stream
+                        castMediaItemSanitized = false
+                        castRestoreStream = null
+                    }
+                    android.widget.Toast.makeText(
+                        context,
+                        "The Cast device chooser could not be opened.",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return@LaunchedEffect
+            }
+            delay(50)
+        }
+        if (pendingCastDialog === request) {
+            pendingCastDialog = null
+            runIfPlaybackOwnerActive {
+                nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                activeStream = castRestoreStream ?: stream
+                castMediaItemSanitized = false
+                castRestoreStream = null
+            }
+            android.widget.Toast.makeText(
+                context,
+                "The Cast-compatible source could not be prepared.",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+            DiagnosticsLog.event("PlayerSurface timed out preparing Cast MediaItem")
+        }
     }
 
     DisposableEffect(controllerFuture) {
@@ -502,35 +648,90 @@ internal fun PlayerSurface(
                         DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
                         val failedItem = activeController.currentMediaItem
                         val failedIdentity = failedItem?.playbackIdentityOrNull()
-                        val failedMediaId = failedItem?.mediaId
+                        val failedMediaId = failedIdentity?.mediaId
+                        val failedStream = currentActiveStream
                         if (
                             failedIdentity == null ||
                             failedMediaId == null ||
-                            !isSamePlaybackSession(failedIdentity, playbackIdentity)
+                            !isSamePlaybackSession(failedIdentity, playbackIdentity) ||
+                            failedIdentity.mediaId != failedMediaId ||
+                            failedMediaId != failedStream.url
                         ) {
                             DiagnosticsLog.event("PlayerSurface ignored error without current playback identity")
-                        } else if (
-                            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED &&
-                            decoderRetryPolicy.tryConsumeRetry(failedMediaId)
-                        ) {
-                            val resumeAt = activeController.currentPosition.coerceAtLeast(0L)
-                            activeController.trackSelectionParameters = activeController.trackSelectionParameters
-                                .buildUpon()
-                                .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
-                                .setMaxVideoSize(1280, 720)
-                                .build()
-                            activeController.prepare()
-                            activeController.seekTo(resumeAt)
-                            activeController.play()
-                            DiagnosticsLog.event(
-                                "PlayerSurface decoder failed; retrying same stream capped at 720p resumeMs=$resumeAt",
+                        } else if (error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED) {
+                            val fallback = decoderRetryPolicy.onDecoderFailure(
+                                session = playbackSessionKey,
+                                failedMediaId = failedMediaId,
+                                failedHeight = failedStream.declaredVideoHeight()
+                                    ?: activeController.currentVideoHeight(),
+                                candidates = currentNativeQualityStreams.map { candidate ->
+                                    DecoderStreamCandidate(
+                                        mediaId = candidate.url,
+                                        height = candidate.declaredVideoHeight(),
+                                    )
+                                },
+                                positionMs = activeController.currentPosition,
                             )
+                            when (fallback) {
+                                is DecoderFallbackAction.SwitchStream -> {
+                                    val replacement = currentNativeQualityStreams.firstOrNull {
+                                        it.url == fallback.mediaId
+                                    }
+                                    if (replacement == null) {
+                                        currentOnError(
+                                            failedIdentity,
+                                            error.localizedMessage ?: "Playback failed",
+                                            failedMediaId,
+                                            fallback.resumePositionMs,
+                                            setOf(failedMediaId),
+                                        )
+                                    } else {
+                                        clearVideoSelection(activeController)
+                                        nextStartPositionMs = fallback.resumePositionMs
+                                        pinnedVideoHeight = fallback.height
+                                        defaultQualityApplied = true
+                                        activeStream = replacement
+                                        DiagnosticsLog.event(
+                                            "PlayerSurface decoder failed; switching to " +
+                                                "${fallback.height}p stream resumeMs=${fallback.resumePositionMs}",
+                                        )
+                                    }
+                                }
+                                is DecoderFallbackAction.RetryCurrentStreamCapped -> {
+                                    defaultQualityApplied = true
+                                    pinnedVideoHeight = fallback.maxHeight
+                                    activeController.trackSelectionParameters =
+                                        activeController.trackSelectionParameters
+                                            .buildUpon()
+                                            .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                                            .setMaxVideoSize(1280, fallback.maxHeight)
+                                            .build()
+                                    activeController.prepare()
+                                    activeController.seekTo(fallback.resumePositionMs)
+                                    activeController.play()
+                                    DiagnosticsLog.event(
+                                        "PlayerSurface decoder failed; retrying same stream capped at " +
+                                            "${fallback.maxHeight}p resumeMs=${fallback.resumePositionMs}",
+                                    )
+                                }
+                                is DecoderFallbackAction.Exhausted -> currentOnError(
+                                    failedIdentity,
+                                    error.localizedMessage ?: "Playback failed",
+                                    failedMediaId,
+                                    fallback.resumePositionMs,
+                                    fallback.attemptedMediaIds.ifEmpty { setOf(failedMediaId) },
+                                )
+                                is DecoderFallbackAction.IgnoreStaleSession -> DiagnosticsLog.event(
+                                    "PlayerSurface ignored decoder error for stale playback session",
+                                )
+                            }
                         } else {
                             currentOnError(
                                 failedIdentity,
                                 error.localizedMessage ?: "Playback failed",
                                 failedMediaId,
                                 activeController.currentPosition.coerceAtLeast(0L),
+                                setOf(failedMediaId),
                             )
                         }
                     }
@@ -549,6 +750,24 @@ internal fun PlayerSurface(
                             applyCategoryAudioPreference(activeController, currentCategory, currentProvider)
                         ) {
                             audioPreferenceAppliedFor = mediaId
+                        }
+                    }
+                }
+
+                override fun onDeviceInfoChanged(deviceInfo: androidx.media3.common.DeviceInfo) {
+                    if (
+                        deviceInfo.playbackType == androidx.media3.common.DeviceInfo.PLAYBACK_TYPE_LOCAL &&
+                        currentCastMediaItemSanitized
+                    ) {
+                        runIfPlaybackOwnerActive {
+                            nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                            activeStream = currentCastRestoreStream ?: currentActiveStream
+                            castMediaItemSanitized = false
+                            castRestoreStream = null
+                            pendingCastDialog = null
+                            DiagnosticsLog.event(
+                                "PlayerSurface restored local source after Cast",
+                            )
                         }
                     }
                 }
@@ -577,7 +796,13 @@ internal fun PlayerSurface(
         }
     }
 
-    LaunchedEffect(controller, activeStream.url, subtitles, playbackIdentity, playbackNavigationIdentity) {
+    LaunchedEffect(
+        controller,
+        activeStream.url,
+        activeSubtitles,
+        playbackIdentity,
+        playbackNavigationIdentity,
+    ) {
         val activeController = controller ?: return@LaunchedEffect
         if (!PlaybackService.isWatchPlaybackOwnerActive(playbackOwner)) {
             DiagnosticsLog.event("PlayerSurface ignored media item work for stale watch owner")
@@ -585,10 +810,10 @@ internal fun PlayerSurface(
         }
         val progressIdentity = playbackIdentity.copy(mediaId = activeStream.url)
         val currentItem = activeController.currentMediaItem
+        val currentProgressIdentity = currentItem?.playbackIdentityOrNull()
         val currentIdentity = currentItem?.nativePlaybackIdentity()
         if (
-            currentItem?.mediaId == activeStream.url &&
-            currentItem.playbackIdentityOrNull() == progressIdentity &&
+            currentProgressIdentity == progressIdentity &&
             currentItem.playbackNavigationIdentityOrNull() == playbackNavigationIdentity &&
             currentIdentity != null &&
             currentIdentity.animeId == playbackNavigationIdentity.animeId &&
@@ -606,7 +831,7 @@ internal fun PlayerSurface(
 
         DiagnosticsLog.event(
             "PlayerSurface prepare stream type=${activeStream.typeLabel()} host=${activeStream.host()} " +
-                "height=${activeStream.declaredVideoHeight() ?: "auto"} subtitles=${subtitles.size} " +
+                "height=${activeStream.declaredVideoHeight() ?: "auto"} subtitles=${activeSubtitles.size} " +
                 "startMs=$nextStartPositionMs",
         )
         val watchRoute = Routes.watch(animeId, provider, category, episode)
@@ -615,6 +840,23 @@ internal fun PlayerSurface(
             animeId = playbackNavigationIdentity.animeId,
             mediaId = activeStream.url,
             episodeNumber = playbackNavigationIdentity.episodeNumber,
+        )
+        val historyMetadata = RemotePlaybackHistoryMetadata(
+            playbackId = nativePlaybackIdentity.playbackId,
+            animeId = progressIdentity.animeId,
+            mediaId = activeStream.url,
+            episodeNumber = progressIdentity.episodeNumber,
+            generation = progressIdentity.generation,
+            watchOwnerGeneration = playbackOwner.generation,
+            seriesTitle = seriesTitle,
+            coverUrl = artworkUrl,
+            episodeTitle = historyEpisodeTitle,
+            provider = provider,
+            category = category,
+            navigationStreamUrl = playbackNavigationIdentity.streamUrl,
+            totalEpisodes = totalEpisodes,
+            hasNextEpisode = hasNextEpisode,
+            nextEpisodeNumber = nextEpisodeNumber,
         )
         val metadata = MediaMetadata.Builder()
             .setTitle(episodeTitle)
@@ -636,15 +878,19 @@ internal fun PlayerSurface(
                 putString(EXTRA_NATIVE_PLAYBACK_ID, nativePlaybackIdentity.playbackId)
                 putInt(EXTRA_NATIVE_ANIME_ID, nativePlaybackIdentity.animeId)
                 putDouble(EXTRA_NATIVE_EPISODE_NUMBER, nativePlaybackIdentity.episodeNumber)
+                putRemotePlaybackHistoryMetadata(historyMetadata)
             })
             .build()
         val item = MediaItem.Builder()
-            .setMediaId(activeStream.url)
+            // Media3's default Cast converter retains mediaId but drops MediaMetadata.extras.
+            // Use the unique playback ID as the Cast-safe registry key; the source URL remains
+            // the PlaybackIdentity mediaId in the extras and local configuration URI.
+            .setMediaId(nativePlaybackIdentity.playbackId)
             .setUri(activeStream.url)
             .setMediaMetadata(metadata)
             .apply { if (activeStream.isHls) setMimeType(MimeTypes.APPLICATION_M3U8) }
             .setSubtitleConfigurations(
-                subtitles.mapIndexed { index, subtitle ->
+                activeSubtitles.mapIndexed { index, subtitle ->
                     MediaItem.SubtitleConfiguration.Builder(Uri.parse(subtitle.url))
                         .setMimeType(mimeFor(subtitle.url))
                         .setLanguage(subtitle.language)
@@ -665,9 +911,9 @@ internal fun PlayerSurface(
         val surfaceAccepted = playbackSurfaceLease.runIfActive {
             ownerAccepted = runIfPlaybackOwnerActive {
                 PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
+                PlaybackService.registerRemotePlaybackHistoryMetadata(historyMetadata)
                 currentOnPlaybackIdentityChanged(nativePlaybackIdentity)
                 activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
-                decoderRetryPolicy.onMediaItemSet()
                 activeController.prepare()
                 activeController.playWhenReady = true
                 DiagnosticsLog.event("PlayerSurface prepare called playWhenReady=true")
@@ -703,7 +949,45 @@ internal fun PlayerSurface(
     }
 
     var playerView by remember { mutableStateOf<PlayerView?>(null) }
-    val mediaRouteButtonViewProvider = remember { ThemedMediaRouteButtonViewProvider() }
+    DisposableEffect(playerView, localPlaybackOwner) {
+        val view = playerView
+        val owner = localPlaybackOwner
+        if (view == null || owner == null) {
+            onDispose { }
+        } else {
+            fun publishSourceRect() {
+                val visibleRect = Rect()
+                if (
+                    view.isShown &&
+                    view.getGlobalVisibleRect(visibleRect) &&
+                    visibleRect.width() > 0 &&
+                    visibleRect.height() > 0
+                ) {
+                    PlaybackService.updatePictureInPictureSourceRect(
+                        token = owner,
+                        sourceRect = PictureInPictureSourceRect(
+                            left = visibleRect.left,
+                            top = visibleRect.top,
+                            right = visibleRect.right,
+                            bottom = visibleRect.bottom,
+                        ),
+                    )
+                } else {
+                    PlaybackService.clearPictureInPictureSourceRect(owner)
+                }
+            }
+
+            val layoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                publishSourceRect()
+            }
+            view.addOnLayoutChangeListener(layoutListener)
+            view.post { publishSourceRect() }
+            onDispose {
+                view.removeOnLayoutChangeListener(layoutListener)
+                PlaybackService.clearPictureInPictureSourceRect(owner)
+            }
+        }
+    }
     var controllerVisible by remember { mutableStateOf(false) }
     var tvControlsVisible by remember { mutableStateOf(false) }
     var tvControlsInteraction by remember { mutableIntStateOf(0) }
@@ -777,7 +1061,14 @@ internal fun PlayerSurface(
     }
 
     // Bridges notification, remote, and hardware media-key commands into episode resolution.
-    DisposableEffect(playbackOwner) {
+    val navigatorPlayback = remember(playbackNavigationIdentity) {
+        EpisodeNavigatorPlaybackIdentity(
+            animeId = playbackNavigationIdentity.animeId,
+            episodeNumber = playbackNavigationIdentity.episodeNumber,
+            playbackGeneration = playbackNavigationIdentity.playbackGeneration,
+        )
+    }
+    DisposableEffect(playbackOwner, navigatorPlayback) {
         val navigator: (Int) -> Unit = { direction ->
             DiagnosticsLog.event("PlayerSurface episode navigator direction=$direction")
             when {
@@ -785,13 +1076,17 @@ internal fun PlayerSurface(
                 direction < 0 && currentHasPrevious -> currentOnPreviousEpisode?.invoke()
             }
         }
-        val registered = PlaybackService.registerEpisodeNavigator(playbackOwner, navigator)
+        val registered = PlaybackService.registerEpisodeNavigator(
+            owner = playbackOwner,
+            playback = navigatorPlayback,
+            navigator = navigator,
+        )
         DiagnosticsLog.event(
             "PlayerSurface episode navigator registered=$registered " +
                 "hasPrev=$hasPreviousEpisode hasNext=$hasNextEpisode",
         )
         onDispose {
-            PlaybackService.clearEpisodeNavigator(playbackOwner)
+            PlaybackService.clearEpisodeNavigator(playbackOwner, navigatorPlayback)
             DiagnosticsLog.event("PlayerSurface episode navigator cleared")
         }
     }
@@ -807,7 +1102,6 @@ internal fun PlayerSurface(
         phoneControlsVisible = false
     }
     val captionStyle by SettingsStore.captionStyle.collectAsState()
-    var pinnedVideoHeight by remember(controller, playbackSessionKey) { mutableStateOf<Int?>(null) }
     fun changeVideoHeight(activeController: MediaController, height: Int?): Boolean {
         var applied = false
         val accepted = runIfPlaybackOwnerActive {
@@ -844,14 +1138,15 @@ internal fun PlayerSurface(
         return accepted && applied
     }
     val defaultQuality by SettingsStore.defaultQuality.collectAsState()
-    var defaultQualityApplied by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(controller, playbackSessionKey, tracksRevision, defaultQuality) {
         val activeController = controller ?: return@LaunchedEffect
         if (defaultQualityApplied || pinnedVideoHeight != null) return@LaunchedEffect
         if (defaultQuality == DefaultQuality.AUTO) return@LaunchedEffect
         // The controller is persistent across episodes, so its tracks may still describe the
         // previous media item; only apply once it is actually reporting this stream.
-        if (activeController.currentMediaItem?.mediaId != activeStream.url) return@LaunchedEffect
+        if (activeController.currentMediaItem?.playbackIdentityOrNull()?.mediaId != activeStream.url) {
+            return@LaunchedEffect
+        }
         // Never force a track override mid-preparation: on weak TV decoders a codec reconfigure
         // during the initial BUFFERING is exactly where OMX implementations wedge. Let playback
         // reach READY on the ABR pick first; the state listener re-triggers this effect then.
@@ -977,7 +1272,6 @@ internal fun PlayerSurface(
                     player = playerControls.takeIf {
                         PlaybackService.isWatchPlaybackOwnerActive(playbackOwner)
                     }
-                    setMediaRouteButtonViewProvider(mediaRouteButtonViewProvider)
                     // Phone and TV both draw their own controls (Compose bar / TvPlayerControls),
                     // so Media3's built-in controller is off everywhere.
                     useController = false
@@ -1026,9 +1320,6 @@ internal fun PlayerSurface(
                 it.isFocusableInTouchMode = !device.isTv
                 if (device.isTv) it.clearFocus()
                 it.applyCaptionStyle(captionStyle)
-                // Deliberately NOT re-setting the media route button provider here: every
-                // setMediaRouteButtonViewProvider call inflates a fresh button, so repeated
-                // update passes stack duplicate cast icons. The factory sets it once.
                 it.bindUnifiedSettingsButton { settingsExpanded = true }
                 DiagnosticsLog.event(
                     "PlayerSurface AndroidView update controller=${controller != null} " +
@@ -1133,7 +1424,50 @@ internal fun PlayerSurface(
                         }
                     },
                 )
-                CastButton(Modifier.size(48.dp))
+                CastButton(
+                    decision = castSourceDecision,
+                    preparationPending = pendingCastDialog != null,
+                    onPrepareCast = { ready, openDialog ->
+                        controller?.let { activeController ->
+                            if (
+                                activeController.deviceInfo.playbackType ==
+                                androidx.media3.common.DeviceInfo.PLAYBACK_TYPE_REMOTE
+                            ) {
+                                if (!openDialog()) {
+                                    DiagnosticsLog.event("CastButton failed to open controller dialog")
+                                }
+                            } else if (pendingCastDialog == null) {
+                                val sourceBeforeCast = activeStream
+                                castRestoreStream = sourceBeforeCast
+                                nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0L)
+                                castMediaItemSanitized = true
+                                activeStream = ready.stream
+                                pendingCastDialog = PendingCastDialogRequest(
+                                    targetUrl = ready.stream.url,
+                                    openDialog = openDialog,
+                                )
+                                if (ready.switchesSource || subtitles.isNotEmpty()) {
+                                    val sourceMessage = if (ready.switchesSource) {
+                                        "Using ${ready.stream.label} for Cast. "
+                                    } else {
+                                        ""
+                                    }
+                                    val subtitleMessage = if (subtitles.isNotEmpty()) {
+                                        "External subtitles are unavailable on the stock receiver."
+                                    } else {
+                                        ""
+                                    }
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        sourceMessage + subtitleMessage,
+                                        android.widget.Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                            }
+                        }
+                    },
+                    modifier = Modifier.size(48.dp),
+                )
                 PlayerControlIconButton(
                     if (isFullscreen) "Exit fullscreen" else "Fullscreen",
                     if (isFullscreen) Icons.Default.FullscreenExit else Icons.Default.Fullscreen,
@@ -1391,7 +1725,7 @@ private fun toggleSubtitles(controller: MediaController, trackNameProvider: Defa
 }
 
 /**
- * The Cast button as a Compose element. Media3's own controller is off, so we inflate the
+ * The Cast button as a Compose element. Media3's own controller is off, so we create the
  * MediaRouteButton ourselves (with the AppCompat-derived theme its dialogs require) and place it
  * in the custom control bar.
  *
@@ -1406,8 +1740,14 @@ private fun toggleSubtitles(controller: MediaController, trackNameProvider: Defa
  */
 @OptIn(UnstableApi::class)
 @Composable
-private fun CastButton(modifier: Modifier = Modifier) {
+private fun CastButton(
+    decision: CastSourceDecision,
+    preparationPending: Boolean,
+    onPrepareCast: (CastSourceDecision.Ready, () -> Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
+    val currentOnPrepareCast by rememberUpdatedState(onPrepareCast)
     val router = remember(context) { runCatching { MediaRouter.getInstance(context) }.getOrNull() }
     val selector = remember(context) {
         runCatching { CastContext.getSharedInstance(context).mergedSelector }.getOrNull()
@@ -1436,18 +1776,58 @@ private fun CastButton(modifier: Modifier = Modifier) {
         }
     }
 
-    if (castRoutesAvailable) {
+    if (castRoutesAvailable && decision is CastSourceDecision.Ready) {
         AndroidView(
             modifier = modifier,
             factory = { ctx ->
                 val themed = ContextThemeWrapper(ctx, R.style.Theme_MiruroNative_MediaRouter)
-                val button = LayoutInflater.from(themed)
-                    .inflate(androidx.media3.cast.R.layout.media_route_button_view, null, false) as MediaRouteButton
+                val button = GatedMediaRouteButton(themed)
                 button.setDialogFactory(ThemedMediaRouteDialogFactory())
+                button.preparationEnabled = !preparationPending
+                button.onPrepareCast = {
+                    currentOnPrepareCast(decision) { button.showPreparedDialog() }
+                }
                 runCatching { MediaRouteButtonFactory.setUpMediaRouteButton(ctx, button) }
+                    .onSuccess { setupFuture ->
+                        setupFuture.addListener(
+                            {
+                                runCatching { setupFuture.get() }
+                                    .onSuccess { button.markSetupReady() }
+                                    .onFailure {
+                                        DiagnosticsLog.throwable("CastButton setup failed", it)
+                                    }
+                            },
+                            ContextCompat.getMainExecutor(ctx),
+                        )
+                    }
+                    .onFailure { DiagnosticsLog.throwable("CastButton setup failed", it) }
                 button
             },
+            update = { button ->
+                button.preparationEnabled = !preparationPending
+                button.onPrepareCast = {
+                    currentOnPrepareCast(decision) { button.showPreparedDialog() }
+                }
+            },
         )
+    } else if (castRoutesAvailable && decision is CastSourceDecision.Blocked) {
+        androidx.compose.material3.IconButton(
+            onClick = {
+                android.widget.Toast.makeText(
+                    context,
+                    decision.reason.userMessage,
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+                openSystemCastPicker(context)
+            },
+            modifier = modifier,
+        ) {
+            androidx.compose.material3.Icon(
+                Icons.Default.Cast,
+                contentDescription = "Screen mirror this protected source",
+                tint = Color.White.copy(alpha = 0.55f),
+            )
+        }
     } else {
         androidx.compose.material3.IconButton(
             onClick = { openSystemCastPicker(context) },
@@ -1528,6 +1908,18 @@ private fun MediaController.videoSelectionBuilder(): TrackSelectionParameters.Bu
         .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
         .clearVideoSizeConstraints()
         .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, false)
+
+/** Best known height of the concrete video input that just failed to decode. */
+private fun MediaController.currentVideoHeight(): Int? =
+    videoSize.height.takeIf { it > 0 }
+        ?: currentTracks.groups.asSequence()
+            .filter { it.type == C.TRACK_TYPE_VIDEO }
+            .flatMap { group ->
+                (0 until group.length).asSequence()
+                    .filter(group::isTrackSelected)
+                    .map { index -> group.getTrackFormat(index).height }
+            }
+            .firstOrNull { it > 0 }
 
 private fun MediaController.hasVideoHeight(height: Int): Boolean = currentTracks.groups.any { group ->
     group.type == C.TRACK_TYPE_VIDEO && group.isSupported &&
@@ -1719,22 +2111,30 @@ internal val PlaybackSpeeds = listOf(
 )
 
 private fun MediaItem.nativePlaybackIdentity(): NativePlaybackIdentity? {
-    val extras = mediaMetadata.extras ?: return null
-    val playbackId = extras.getString(EXTRA_NATIVE_PLAYBACK_ID)?.takeIf(String::isNotBlank) ?: return null
+    val extras = mediaMetadata.extras
+    val playbackId = extras?.getString(EXTRA_NATIVE_PLAYBACK_ID)?.takeIf(String::isNotBlank)
     if (
-        !extras.containsKey(EXTRA_NATIVE_ANIME_ID) ||
-        !extras.containsKey(EXTRA_NATIVE_EPISODE_NUMBER) ||
-        mediaId.isBlank()
+        extras != null &&
+        playbackId != null &&
+        playbackId == mediaId &&
+        extras.containsKey(EXTRA_NATIVE_ANIME_ID) &&
+        extras.containsKey(EXTRA_NATIVE_EPISODE_NUMBER)
     ) {
-        return null
+        val episodeNumber = extras.getDouble(EXTRA_NATIVE_EPISODE_NUMBER)
+        if (!episodeNumber.isFinite()) return null
+        return NativePlaybackIdentity(
+            playbackId = playbackId,
+            animeId = extras.getInt(EXTRA_NATIVE_ANIME_ID),
+            mediaId = extras.getString(EXTRA_PLAYBACK_MEDIA_ID) ?: return null,
+            episodeNumber = episodeNumber,
+        )
     }
-    val episodeNumber = extras.getDouble(EXTRA_NATIVE_EPISODE_NUMBER)
-    if (!episodeNumber.isFinite()) return null
+    val retained = PlaybackService.registeredRemotePlaybackHistoryMetadata(mediaId) ?: return null
     return NativePlaybackIdentity(
-        playbackId = playbackId,
-        animeId = extras.getInt(EXTRA_NATIVE_ANIME_ID),
-        mediaId = mediaId,
-        episodeNumber = episodeNumber,
+        playbackId = retained.playbackId,
+        animeId = retained.animeId,
+        mediaId = retained.mediaId,
+        episodeNumber = retained.episodeNumber,
     )
 }
 

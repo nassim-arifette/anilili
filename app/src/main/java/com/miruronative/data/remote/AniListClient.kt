@@ -3,15 +3,15 @@ package com.miruronative.data.remote
 import com.miruronative.BuildConfig
 
 import com.miruronative.data.auth.AuthManager
-import com.miruronative.data.model.GqlMediaListResponse
 import com.miruronative.data.model.GqlDiscoverOptionsResponse
 import com.miruronative.data.model.GqlHomeCollectionsResponse
-import com.miruronative.data.model.GqlMediaResponse
 import com.miruronative.data.model.GqlPageResponse
 import com.miruronative.data.model.GqlViewerResponse
 import com.miruronative.data.model.GqlViewerFavouritesResponse
 import com.miruronative.data.model.GraphQLRequest
 import com.miruronative.data.model.Media
+import com.miruronative.data.model.SourceCompleteness
+import com.miruronative.data.model.nullableOrThrow
 import com.miruronative.data.model.HomeCollections
 import com.miruronative.data.model.DiscoverFilters
 import com.miruronative.data.model.DiscoverOptions
@@ -20,6 +20,7 @@ import com.miruronative.data.model.MediaPage
 import com.miruronative.data.model.Viewer
 import com.miruronative.diagnostics.DiagnosticsLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -28,8 +29,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -385,15 +389,19 @@ class AniListClient(
         }
     }
 
-    suspend fun animeInfo(id: Int): Media? = withContext(Dispatchers.IO) {
+    suspend fun animeInfo(id: Int): Media? = animeInfoCompleteness(id).nullableOrThrow()
+
+    /** Metadata fetch whose absence is authoritative only when GraphQL explicitly returns null. */
+    suspend fun animeInfoCompleteness(id: Int): SourceCompleteness<Media> = withContext(Dispatchers.IO) {
         val gql = """
             query (${'$'}id: Int) {
               Media(id: ${'$'}id, type: ANIME) { $mediaFullFields }
             }
         """.trimIndent()
         val vars = buildJsonObject { put("id", id) }
-        val text = post(gql, vars)
-        json.decodeFromString(GqlMediaResponse.serializer(), text).data?.media
+        completeSourceRequest("AniList media $id") {
+            parseAnimeInfoCompleteness(post(gql, vars), json)
+        }
     }
 
     /** Authenticated: the logged-in user's profile + stats. */
@@ -545,7 +553,17 @@ class AniListClient(
     }
 
     /** Authenticated: the user's anime lists (Watching + Planning) with per-entry progress. */
-    suspend fun userAnimeList(userId: Int): MediaListCollection? = withContext(Dispatchers.IO) {
+    suspend fun userAnimeList(
+        userId: Int,
+        authenticationToken: String? = null,
+    ): MediaListCollection? =
+        userAnimeListCompleteness(userId, authenticationToken).nullableOrThrow()
+
+    /** Authenticated list fetch that preserves missing-field and explicit-null semantics. */
+    suspend fun userAnimeListCompleteness(
+        userId: Int,
+        authenticationToken: String? = null,
+    ): SourceCompleteness<MediaListCollection> = withContext(Dispatchers.IO) {
         val gql = """
             query (${'$'}userId: Int) {
               MediaListCollection(userId: ${'$'}userId, type: ANIME, status_in: [CURRENT, REPEATING, PLANNING, PAUSED, COMPLETED, DROPPED]) {
@@ -559,8 +577,23 @@ class AniListClient(
             }
         """.trimIndent()
         val vars = buildJsonObject { put("userId", userId) }
-        val text = post(gql, vars, authenticated = true)
-        json.decodeFromString(GqlMediaListResponse.serializer(), text).data?.collection
+        completeSourceRequest("AniList media list for user $userId") {
+            parseUserAnimeListCompleteness(
+                post(gql, vars, authenticated = true, authenticationToken = authenticationToken),
+                json,
+            )
+        }
+    }
+
+    private suspend fun <T> completeSourceRequest(
+        source: String,
+        request: suspend () -> SourceCompleteness<T>,
+    ): SourceCompleteness<T> = try {
+        request()
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        SourceCompleteness.Incomplete("$source could not be fetched", error)
     }
 
     /** Update watched progress without regressing progress or overwriting user-owned list states. */
@@ -587,8 +620,14 @@ class AniListClient(
      * Mirrors the device Save button without damaging an existing AniList status/progress.
      * New saves become PLANNING; unsaving only removes entries that are still PLANNING.
      */
-    suspend fun syncSavedAnime(mediaId: Int, saved: Boolean) = withContext(Dispatchers.IO) {
-        val current = mediaListEntry(mediaId)
+    suspend fun syncSavedAnime(
+        mediaId: Int,
+        saved: Boolean,
+        authenticationToken: String? = null,
+        shouldContinue: () -> Boolean = { true },
+    ) = withContext(Dispatchers.IO) {
+        val current = mediaListEntry(mediaId, authenticationToken)
+        if (!shouldContinue()) return@withContext
         when {
             saved && current == null -> {
                 val mutation = """
@@ -596,7 +635,12 @@ class AniListClient(
                       SaveMediaListEntry(mediaId: ${'$'}mediaId, status: PLANNING) { id status }
                     }
                 """.trimIndent()
-                post(mutation, buildJsonObject { put("mediaId", mediaId) }, authenticated = true)
+                post(
+                    mutation,
+                    buildJsonObject { put("mediaId", mediaId) },
+                    authenticated = true,
+                    authenticationToken = authenticationToken,
+                )
             }
             !saved && current?.status == "PLANNING" -> {
                 val mutation = """
@@ -604,37 +648,61 @@ class AniListClient(
                       DeleteMediaListEntry(id: ${'$'}id) { deleted }
                     }
                 """.trimIndent()
-                post(mutation, buildJsonObject { put("id", current.id) }, authenticated = true)
+                post(
+                    mutation,
+                    buildJsonObject { put("id", current.id) },
+                    authenticated = true,
+                    authenticationToken = authenticationToken,
+                )
             }
         }
     }
 
     /** Reconcile all device saves in one list read plus small mutation batches. */
-    suspend fun syncSavedAnime(mediaIds: Collection<Int>, viewerId: Int) = withContext(Dispatchers.IO) {
+    suspend fun syncSavedAnime(
+        mediaIds: Collection<Int>,
+        viewerId: Int,
+        authenticationToken: String? = null,
+        shouldContinue: () -> Boolean = { true },
+    ) = withContext(Dispatchers.IO) {
         val requested = mediaIds.filter { it > 0 }.distinct()
         if (requested.isEmpty()) return@withContext
-        val existingIds = userAnimeList(viewerId)?.lists.orEmpty()
+        val existingIds = userAnimeList(viewerId, authenticationToken)?.lists.orEmpty()
             .flatMap { it.entries }
             .mapNotNull { it.media?.id }
             .toHashSet()
         requested.filterNot(existingIds::contains).chunked(SAVED_SYNC_BATCH_SIZE).forEach { batch ->
+            if (!shouldContinue()) return@withContext
             val declarations = batch.indices.joinToString { index -> "${'$'}id$index: Int" }
             val fields = batch.indices.joinToString("\n") { index ->
                 "save$index: SaveMediaListEntry(mediaId: ${'$'}id$index, status: PLANNING) { id status }"
             }
             val mutation = "mutation ($declarations) {\n$fields\n}"
             val variables = buildJsonObject { batch.forEachIndexed { index, id -> put("id$index", id) } }
-            post(mutation, variables, authenticated = true)
+            post(
+                mutation,
+                variables,
+                authenticated = true,
+                authenticationToken = authenticationToken,
+            )
         }
     }
 
-    private suspend fun mediaListEntry(mediaId: Int): MediaListProgressSnapshot? {
+    private suspend fun mediaListEntry(
+        mediaId: Int,
+        authenticationToken: String? = null,
+    ): MediaListProgressSnapshot? {
         val query = """
             query (${'$'}mediaId: Int) {
               Media(id: ${'$'}mediaId, type: ANIME) { mediaListEntry { id status progress } }
             }
         """.trimIndent()
-        val text = post(query, buildJsonObject { put("mediaId", mediaId) }, authenticated = true)
+        val text = post(
+            query,
+            buildJsonObject { put("mediaId", mediaId) },
+            authenticated = true,
+            authenticationToken = authenticationToken,
+        )
         val entry = json.parseToJsonElement(text).jsonObject["data"]?.jsonObject
             ?.get("Media")?.jsonObject
             ?.get("mediaListEntry") as? JsonObject ?: return null
@@ -649,7 +717,12 @@ class AniListClient(
      * the Retry-After header and retry instead of surfacing the error, so bursts (list sync,
      * fast browsing) and interactive saves recover on their own.
      */
-    private suspend fun post(query: String, variables: JsonObject, authenticated: Boolean = false): String {
+    private suspend fun post(
+        query: String,
+        variables: JsonObject,
+        authenticated: Boolean = false,
+        authenticationToken: String? = null,
+    ): String {
         val payload = json.encodeToString(GraphQLRequest.serializer(), GraphQLRequest(query, variables))
         var attempt = 0
         while (true) {
@@ -660,7 +733,8 @@ class AniListClient(
                 .header("Accept", "application/json")
                 .header("User-Agent", USER_AGENT)
             if (authenticated) {
-                val token = AuthManager.current() ?: throw IOException("Sign in to AniList again to continue")
+                val token = authenticationToken ?: AuthManager.current()
+                    ?: throw IOException("Sign in to AniList again to continue")
                 builder.header("Authorization", "Bearer $token")
             }
             var retryAfterMs = -1L
@@ -802,6 +876,67 @@ internal fun graphQlErrorMessages(body: String): List<String> = runCatching {
         if (status == null) message else "$message ($status)"
     }
 }.getOrDefault(emptyList())
+
+internal fun parseAnimeInfoCompleteness(
+    body: String,
+    json: Json,
+): SourceCompleteness<Media> = parseNullableDataField(
+    body = body,
+    fieldName = "Media",
+    serializer = Media.serializer(),
+    json = json,
+)
+
+internal fun parseUserAnimeListCompleteness(
+    body: String,
+    json: Json,
+): SourceCompleteness<MediaListCollection> = parseNullableDataField(
+    body = body,
+    fieldName = "MediaListCollection",
+    serializer = MediaListCollection.serializer(),
+    json = json,
+)
+
+/**
+ * GraphQL distinguishes a selected nullable field containing null from a field omitted because a
+ * response was truncated or changed shape. Kotlin serialization defaults erase that distinction,
+ * so completeness-sensitive reads inspect the raw response envelope before decoding the value.
+ */
+private fun <T> parseNullableDataField(
+    body: String,
+    fieldName: String,
+    serializer: DeserializationStrategy<T>,
+    json: Json,
+): SourceCompleteness<T> {
+    return try {
+        val errors = graphQlErrorMessages(body)
+        if (errors.isNotEmpty()) {
+            return SourceCompleteness.Incomplete("AniList GraphQL error: ${errors.joinToString("; ")}")
+        }
+        val root = json.parseToJsonElement(body) as? JsonObject
+            ?: return SourceCompleteness.Incomplete("AniList response root is not an object")
+        if (!root.containsKey("data")) {
+            return SourceCompleteness.Incomplete("AniList response omitted data")
+        }
+        val data = root["data"]
+        if (data == null || data is JsonNull) {
+            return SourceCompleteness.Incomplete("AniList response data is null")
+        }
+        val dataObject = data as? JsonObject
+            ?: return SourceCompleteness.Incomplete("AniList response data is not an object")
+        if (!dataObject.containsKey(fieldName)) {
+            return SourceCompleteness.Incomplete("AniList response omitted data.$fieldName")
+        }
+        val value = dataObject[fieldName]
+        if (value == null || value is JsonNull) {
+            SourceCompleteness.DefinitiveAbsence
+        } else {
+            SourceCompleteness.Present(json.decodeFromJsonElement(serializer, value))
+        }
+    } catch (error: Exception) {
+        SourceCompleteness.Incomplete("AniList response could not decode data.$fieldName", error)
+    }
+}
 
 private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { continuation ->
     var deliveredResponse: Response? = null

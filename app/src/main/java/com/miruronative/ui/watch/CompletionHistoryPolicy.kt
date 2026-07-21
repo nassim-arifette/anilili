@@ -16,3 +16,16 @@ internal fun isConfirmedFinalSeriesEpisode(
     val integralEpisode = episodeNumber.toInt()
     return episodeNumber == integralEpisode.toDouble() && integralEpisode == totalEpisodes
 }
+
+/**
+ * Selects the episode Continue Watching should open after a verified natural end. The tracked
+ * history episode remains unchanged so library progress still reflects what was actually watched.
+ */
+internal fun continuationEpisodeAfterNaturalEnd(
+    currentEpisodeNumber: Double,
+    nextEpisodeNumber: Double?,
+    completedFinalEpisode: Boolean,
+): Double? {
+    if (completedFinalEpisode || !currentEpisodeNumber.isFinite()) return null
+    return nextEpisodeNumber?.takeIf { it.isFinite() && it != currentEpisodeNumber }
+}

@@ -3,6 +3,7 @@ package com.miruronative.data.settings
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
@@ -11,8 +12,11 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import com.miruronative.diagnostics.CrashReporter
+import com.miruronative.data.LatestMutationTracker
+import com.miruronative.data.MutationTicket
 import java.io.IOException
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -21,6 +25,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
 
 enum class MenuLanguage(val storedValue: String) {
     SYSTEM("system"),
@@ -66,6 +71,11 @@ const val DEFAULT_PREFERRED_PROVIDER = "auto"
 object SettingsStore {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var store: DataStore<Preferences>
+    private val snapshotLock = Any()
+    private val writeVersions = LatestMutationTracker<SettingField>()
+    private val writeQueue = Channel<SettingsMutation>(Channel.UNLIMITED)
+    private var persistedSnapshot = SettingsSnapshot()
+    private var desiredSnapshot = SettingsSnapshot()
 
     private val _autoplay = MutableStateFlow(true)
     val autoplay = _autoplay.asStateFlow()
@@ -107,7 +117,8 @@ object SettingsStore {
 
     private val _preferredProvider = MutableStateFlow(DEFAULT_PREFERRED_PROVIDER)
     val preferredProvider = _preferredProvider.asStateFlow()
-    private val loaded = MutableStateFlow(false)
+    private val _isLoaded = MutableStateFlow(false)
+    val isLoaded = _isLoaded.asStateFlow()
 
     fun init(context: Context) {
         val app = context.applicationContext
@@ -116,27 +127,81 @@ object SettingsStore {
             produceFile = { app.preferencesDataStoreFile("anilili_settings") },
         )
         scope.launch {
-            runCatching { migrateLegacyPreferences(app) }
-                .onFailure { CrashReporter.logNonFatal("Settings migration failed", it) }
+            try {
+                migrateLegacyPreferences(app)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                CrashReporter.logNonFatal("Settings migration failed", error)
+            }
             store.data
                 .catch { error ->
+                    if (error is CancellationException) throw error
                     // A settings read must never take the process down; fall back to defaults.
                     if (error !is IOException) CrashReporter.logNonFatal("Settings read failed", error)
                     emit(emptyPreferences())
                 }
                 .collect(::applyPreferences)
         }
+        scope.launch {
+            awaitLoaded()
+            for (mutation in writeQueue) persistMutation(mutation)
+        }
     }
 
-    fun setAutoplay(value: Boolean) = save(AUTOPLAY, value, _autoplay)
-    fun setAutoSyncAniList(value: Boolean) = save(AUTO_SYNC, value, _autoSyncAniList)
-    fun setPreferDub(value: Boolean) = save(PREFER_DUB, value, _preferDub)
-    fun setReleaseNotifications(value: Boolean) = save(RELEASE_NOTIFICATIONS, value, _releaseNotifications)
-    fun setSyncSavedToAniList(value: Boolean) = save(SYNC_SAVED_TO_ANILIST, value, _syncSavedToAniList)
-    fun setAutoSkipIntroOutro(value: Boolean) = save(AUTO_SKIP_INTRO_OUTRO, value, _autoSkipIntroOutro)
-    fun setHideAdultContent(value: Boolean) = save(HIDE_ADULT_CONTENT, value, _hideAdultContent)
-    fun setSubtitlesWithDub(value: Boolean) = save(SUBTITLES_WITH_DUB, value, _subtitlesWithDub)
-    fun setUpdateCheckOnLaunch(value: Boolean) = save(UPDATE_CHECK_ON_LAUNCH, value, _updateCheckOnLaunch)
+    fun setAutoplay(value: Boolean) = mutate(
+        SettingField.AUTOPLAY,
+        update = { it.copy(autoplay = value) },
+        write = { it[AUTOPLAY] = value },
+    )
+
+    fun setAutoSyncAniList(value: Boolean) = mutate(
+        SettingField.AUTO_SYNC_ANILIST,
+        update = { it.copy(autoSyncAniList = value) },
+        write = { it[AUTO_SYNC] = value },
+    )
+
+    fun setPreferDub(value: Boolean) = mutate(
+        SettingField.PREFER_DUB,
+        update = { it.copy(preferDub = value) },
+        write = { it[PREFER_DUB] = value },
+    )
+
+    fun setReleaseNotifications(value: Boolean) = mutate(
+        SettingField.RELEASE_NOTIFICATIONS,
+        update = { it.copy(releaseNotifications = value) },
+        write = { it[RELEASE_NOTIFICATIONS] = value },
+    )
+
+    fun setSyncSavedToAniList(value: Boolean) = mutate(
+        SettingField.SYNC_SAVED_TO_ANILIST,
+        update = { it.copy(syncSavedToAniList = value) },
+        write = { it[SYNC_SAVED_TO_ANILIST] = value },
+    )
+
+    fun setAutoSkipIntroOutro(value: Boolean) = mutate(
+        SettingField.AUTO_SKIP_INTRO_OUTRO,
+        update = { it.copy(autoSkipIntroOutro = value) },
+        write = { it[AUTO_SKIP_INTRO_OUTRO] = value },
+    )
+
+    fun setHideAdultContent(value: Boolean) = mutate(
+        SettingField.HIDE_ADULT_CONTENT,
+        update = { it.copy(hideAdultContent = value) },
+        write = { it[HIDE_ADULT_CONTENT] = value },
+    )
+
+    fun setSubtitlesWithDub(value: Boolean) = mutate(
+        SettingField.SUBTITLES_WITH_DUB,
+        update = { it.copy(subtitlesWithDub = value) },
+        write = { it[SUBTITLES_WITH_DUB] = value },
+    )
+
+    fun setUpdateCheckOnLaunch(value: Boolean) = mutate(
+        SettingField.UPDATE_CHECK_ON_LAUNCH,
+        update = { it.copy(updateCheckOnLaunch = value) },
+        write = { it[UPDATE_CHECK_ON_LAUNCH] = value },
+    )
 
     fun setCaptionBackgroundOpacity(percent: Int) =
         editCaptionStyle { it.copy(backgroundOpacityPercent = percent.coerceIn(0, 100)) }
@@ -149,42 +214,50 @@ object SettingsStore {
     fun resetCaptionStyle() = editCaptionStyle { CaptionStyle() }
 
     fun setDefaultQuality(value: DefaultQuality) {
-        _defaultQuality.value = value
-        scope.launch { store.edit { it[DEFAULT_QUALITY] = value.storedValue } }
+        mutate(
+            SettingField.DEFAULT_QUALITY,
+            update = { it.copy(defaultQuality = value) },
+            write = { it[DEFAULT_QUALITY] = value.storedValue },
+        )
     }
 
     fun setMenuLanguage(value: MenuLanguage) {
-        _menuLanguage.value = value
-        scope.launch { store.edit { it[MENU_LANGUAGE] = value.storedValue } }
+        mutate(
+            SettingField.MENU_LANGUAGE,
+            update = { it.copy(menuLanguage = value) },
+            write = { it[MENU_LANGUAGE] = value.storedValue },
+        )
     }
     fun setPreferredProvider(value: String) {
         val storedValue = value.trim().lowercase().ifBlank { DEFAULT_PREFERRED_PROVIDER }
-        _preferredProvider.value = storedValue
-        scope.launch { store.edit { it[PREFERRED_PROVIDER] = storedValue } }
+        mutate(
+            SettingField.PREFERRED_PROVIDER,
+            update = { it.copy(preferredProvider = storedValue) },
+            write = { it[PREFERRED_PROVIDER] = storedValue },
+        )
     }
 
     /** Guarantees cold-start consumers see the persisted preference instead of the in-memory default. */
     suspend fun awaitLoaded() {
-        loaded.first { it }
-    }
-
-    private fun save(key: Preferences.Key<Boolean>, value: Boolean, state: MutableStateFlow<Boolean>) {
-        state.value = value
-        scope.launch { store.edit { it[key] = value } }
+        awaitSettingsReady(isLoaded)
     }
 
     private fun editCaptionStyle(transform: (CaptionStyle) -> CaptionStyle) {
-        val next = transform(_captionStyle.value)
-        _captionStyle.value = next
-        scope.launch {
-            store.edit { prefs ->
+        lateinit var next: CaptionStyle
+        mutate(
+            SettingField.CAPTION_STYLE,
+            update = { snapshot ->
+                next = transform(snapshot.captionStyle)
+                snapshot.copy(captionStyle = next)
+            },
+            write = { prefs ->
                 prefs[CAPTION_BACKGROUND_OPACITY] = next.backgroundOpacityPercent
                 prefs[CAPTION_BACKGROUND_COLOR] = next.backgroundColor.storedValue
                 prefs[CAPTION_TEXT_SCALE] = next.textScalePercent
                 prefs[CAPTION_TEXT_COLOR] = next.textColor.storedValue
                 prefs[CAPTION_EDGE_STYLE] = next.edgeStyle.storedValue
-            }
-        }
+            },
+        )
     }
 
     internal fun readCaptionStyle(prefs: Preferences): CaptionStyle = CaptionStyle(
@@ -198,22 +271,91 @@ object SettingsStore {
     )
 
     private fun applyPreferences(prefs: Preferences) {
-        _autoplay.value = prefs[AUTOPLAY] ?: true
-        _autoSyncAniList.value = prefs[AUTO_SYNC] ?: true
-        _preferDub.value = prefs[PREFER_DUB] ?: false
-        _releaseNotifications.value = prefs[RELEASE_NOTIFICATIONS] ?: true
-        _syncSavedToAniList.value = prefs[SYNC_SAVED_TO_ANILIST] ?: true
-        _autoSkipIntroOutro.value = prefs[AUTO_SKIP_INTRO_OUTRO] ?: false
-        _hideAdultContent.value = prefs[HIDE_ADULT_CONTENT] ?: true
-        _subtitlesWithDub.value = prefs[SUBTITLES_WITH_DUB] ?: false
-        _updateCheckOnLaunch.value = prefs[UPDATE_CHECK_ON_LAUNCH] ?: true
-        _captionStyle.value = readCaptionStyle(prefs)
-        _menuLanguage.value = MenuLanguage.fromStored(prefs[MENU_LANGUAGE])
-        _defaultQuality.value = DefaultQuality.fromStored(prefs[DEFAULT_QUALITY])
-        _preferredProvider.value =
-            prefs[PREFERRED_PROVIDER]?.takeIf(String::isNotBlank) ?: DEFAULT_PREFERRED_PROVIDER
-        loaded.value = true
+        val persisted = snapshotFromPreferences(prefs)
+        synchronized(snapshotLock) {
+            prefs[LAST_APPLIED_MUTATION]?.let(writeVersions::acknowledge)
+            persistedSnapshot = persisted
+            overlayPendingSettings(persisted, desiredSnapshot, writeVersions.pendingKeys())
+                .also { desiredSnapshot = it }
+                .also(::publishSnapshot)
+        }
+        _isLoaded.value = true
     }
+
+    private fun mutate(
+        field: SettingField,
+        update: (SettingsSnapshot) -> SettingsSnapshot,
+        write: (MutablePreferences) -> Unit,
+    ) {
+        val mutation = synchronized(snapshotLock) {
+            desiredSnapshot = update(desiredSnapshot)
+            SettingsMutation(writeVersions.begin(listOf(field)), write)
+                .also { publishSnapshot(desiredSnapshot) }
+        }
+        if (writeQueue.trySend(mutation).isFailure) {
+            failMutation(mutation, IllegalStateException("Settings write queue is unavailable"))
+        }
+    }
+
+    private suspend fun persistMutation(mutation: SettingsMutation) {
+        try {
+            store.edit { prefs ->
+                mutation.write(prefs)
+                prefs[LAST_APPLIED_MUTATION] = mutation.ticket.persistenceToken
+            }
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            failMutation(mutation, error)
+        }
+    }
+
+    private fun failMutation(mutation: SettingsMutation, error: Throwable) {
+        CrashReporter.logNonFatal("Settings write failed", error)
+        synchronized(snapshotLock) {
+            writeVersions.complete(mutation.ticket)
+            overlayPendingSettings(persistedSnapshot, desiredSnapshot, writeVersions.pendingKeys())
+                .also { desiredSnapshot = it }
+                .also(::publishSnapshot)
+        }
+    }
+
+    private fun snapshotFromPreferences(prefs: Preferences): SettingsSnapshot = SettingsSnapshot(
+        autoplay = prefs[AUTOPLAY] ?: true,
+        autoSyncAniList = prefs[AUTO_SYNC] ?: true,
+        preferDub = prefs[PREFER_DUB] ?: false,
+        releaseNotifications = prefs[RELEASE_NOTIFICATIONS] ?: true,
+        syncSavedToAniList = prefs[SYNC_SAVED_TO_ANILIST] ?: true,
+        autoSkipIntroOutro = prefs[AUTO_SKIP_INTRO_OUTRO] ?: false,
+        hideAdultContent = prefs[HIDE_ADULT_CONTENT] ?: true,
+        subtitlesWithDub = prefs[SUBTITLES_WITH_DUB] ?: false,
+        updateCheckOnLaunch = prefs[UPDATE_CHECK_ON_LAUNCH] ?: true,
+        captionStyle = readCaptionStyle(prefs),
+        menuLanguage = MenuLanguage.fromStored(prefs[MENU_LANGUAGE]),
+        defaultQuality = DefaultQuality.fromStored(prefs[DEFAULT_QUALITY]),
+        preferredProvider = prefs[PREFERRED_PROVIDER]?.takeIf(String::isNotBlank)
+            ?: DEFAULT_PREFERRED_PROVIDER,
+    )
+
+    private fun publishSnapshot(snapshot: SettingsSnapshot) {
+        _autoplay.value = snapshot.autoplay
+        _autoSyncAniList.value = snapshot.autoSyncAniList
+        _preferDub.value = snapshot.preferDub
+        _releaseNotifications.value = snapshot.releaseNotifications
+        _syncSavedToAniList.value = snapshot.syncSavedToAniList
+        _autoSkipIntroOutro.value = snapshot.autoSkipIntroOutro
+        _hideAdultContent.value = snapshot.hideAdultContent
+        _subtitlesWithDub.value = snapshot.subtitlesWithDub
+        _updateCheckOnLaunch.value = snapshot.updateCheckOnLaunch
+        _captionStyle.value = snapshot.captionStyle
+        _menuLanguage.value = snapshot.menuLanguage
+        _defaultQuality.value = snapshot.defaultQuality
+        _preferredProvider.value = snapshot.preferredProvider
+    }
+
+    private data class SettingsMutation(
+        val ticket: MutationTicket<SettingField>,
+        val write: (MutablePreferences) -> Unit,
+    )
 
     private suspend fun migrateLegacyPreferences(context: Context) {
         val current = store.data.first()
@@ -248,5 +390,6 @@ object SettingsStore {
     private val MENU_LANGUAGE = stringPreferencesKey("menu_language")
     private val DEFAULT_QUALITY = stringPreferencesKey("default_quality")
     private val PREFERRED_PROVIDER = stringPreferencesKey("preferred_provider")
+    private val LAST_APPLIED_MUTATION = stringPreferencesKey("last_applied_mutation")
     private val MIGRATED = booleanPreferencesKey("migrated_from_shared_preferences")
 }

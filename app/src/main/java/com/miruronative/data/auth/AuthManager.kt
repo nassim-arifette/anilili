@@ -39,6 +39,9 @@ object AuthManager {
             _token.value = token
             if (token == null) tokenStore.clear()
         }
+        if (restoredToken == null) {
+            AniListNotificationPushManager.resetAccountState(appContext)
+        }
     }
 
     fun current(): String? = tokenSession.current(
@@ -46,7 +49,7 @@ object AuthManager {
         clearExpired = {
             tokenStore.clear()
             _token.value = null
-            AniListNotificationPushManager.clearDelivered(appContext)
+            AniListNotificationPushManager.resetAccountState(appContext)
         },
     )
 
@@ -74,7 +77,7 @@ object AuthManager {
             _token.value = token
         }
         if (!committed) return false
-        AniListNotificationPushManager.clearDelivered(appContext)
+        AniListNotificationPushManager.resetAccountState(appContext)
         ReleaseSyncScheduler.runNow(appContext)
         return true
     }
@@ -104,12 +107,18 @@ object AuthManager {
             tokenStore.clear()
             _token.value = null
         }
-        AniListNotificationPushManager.clearDelivered(appContext)
+        AniListNotificationPushManager.resetAccountState(appContext)
         if (scheduleSync) ReleaseSyncScheduler.runNow(appContext)
     }
 
     /** Auth generation used to reject UI results loaded for a replaced account. */
     internal fun sessionGeneration(): Long? = tokenSession.authenticatedGeneration()
+
+    /** A captured token for one generation; it can never silently become another account's. */
+    internal fun tokenForSession(generation: Long): String? {
+        current() ?: return null
+        return tokenSession.tokenForGeneration(generation)
+    }
 
     /** Compares the generation and publishes [change] under the auth-session lock. */
     internal fun commitIfSessionCurrent(generation: Long, change: () -> Unit): Boolean =
