@@ -128,10 +128,23 @@ fun WatchScreen(
         vm.start(animeId, provider, category, episode)
     }
     val state by vm.state.collectAsState()
+    var webFallback by remember { mutableStateOf(false) }
+    val successfulData = (state as? UiState.Success)?.data
+    val chosenStream = successfulData?.chosenStream
+    val usesNativePlayer = successfulData?.let { data ->
+        chosenStream != null &&
+            !chosenStream.isEmbed &&
+            !ProviderCatalog.isEmbed(data.provider)
+    } == true
+    val shouldStopNativePlayback = shouldStopNativePlaybackForWatchState(
+        isSuccess = successfulData != null,
+        hasChosenStream = chosenStream != null,
+        usesNativePlayer = usesNativePlayer,
+        isWebFallback = webFallback,
+    )
     val watchlist by LibraryStore.watchlist.collectAsState()
     val context = LocalContext.current
     val device = LocalAppDeviceProfile.current
-    var webFallback by remember { mutableStateOf(false) }
     // TV plays fullscreen from the start; Back drops to the episode/source screen.
     var fullscreen by remember(animeId, showEpisodeListInitially, device.isTv) {
         mutableStateOf(device.isTv && !showEpisodeListInitially)
@@ -153,9 +166,16 @@ fun WatchScreen(
         }
     }
 
-    LaunchedEffect(webFallback) {
+    // PlaybackService outlives this composable. When resolution replaces WatchContent with a
+    // loading/error/no-source/embed state, the native PlayerSurface disappears but the service
+    // keeps playing unless it is stopped explicitly. Key this to the actual state transition so
+    // consecutive unavailable states still reassert the terminal state if anything completed late.
+    LaunchedEffect(state, webFallback) {
         DiagnosticsLog.event("WatchScreen webFallback=$webFallback")
-        if (webFallback) PlaybackService.stopActivePlayback()
+        if (shouldStopNativePlayback) {
+            DiagnosticsLog.event("WatchScreen stopping playback because no native surface is available")
+            PlaybackService.stopActivePlayback()
+        }
     }
 
     LaunchedEffect(state, webFallback) {
