@@ -23,4 +23,13 @@ class EmbedSeekScriptTest {
         assertTrue(script.contains("frames[i].contentDocument"))
         assertTrue(script.contains("d.querySelector('video')"))
     }
+
+    @Test
+    fun `auto skip accepts only an actual JavaScript success result`() {
+        assertTrue(javascriptBooleanResult("true"))
+        assertTrue(javascriptBooleanResult("  true  "))
+        assertFalse(javascriptBooleanResult("false"))
+        assertFalse(javascriptBooleanResult("\"true\""))
+        assertFalse(javascriptBooleanResult(null))
+    }
 }
