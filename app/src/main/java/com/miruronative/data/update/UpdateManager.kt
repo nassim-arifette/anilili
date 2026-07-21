@@ -8,6 +8,9 @@ import androidx.core.content.FileProvider
 import com.miruronative.BuildConfig
 import com.miruronative.data.AppGraph
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,10 +25,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import okhttp3.Request
 
 /**
- * In-app updates for a sideloaded install: polls the rolling GitHub release
- * (`nassim-arifette/anilili`, tag `APK-release`), downloads the APK asset, and hands it
- * to the system package installer. Android rejects the install unless the new APK
- * is signed with the same key, so a hijacked release can't replace the app.
+ * In-app updates for a sideloaded install: polls the latest GitHub release in
+ * `nassim-arifette/anilili`, downloads its signed AniLili+ APK, and hands it to the system
+ * package installer. Android rejects the install unless the new APK is signed with the same key,
+ * so a hijacked release cannot replace the app.
  */
 object UpdateManager {
     data class UpdateInfo(
@@ -33,6 +36,7 @@ object UpdateManager {
         val changelog: String,
         val apkUrl: String,
         val sizeBytes: Long,
+        val sha256: String,
     )
 
     sealed interface State {
@@ -62,12 +66,21 @@ object UpdateManager {
 
     /** Throttled startup check; only surfaces a prompt when an update exists. */
     fun autoCheckIfDue(context: Context) {
+        if (!BuildConfig.UPDATE_ENABLED) return
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (System.currentTimeMillis() - prefs.getLong(KEY_LAST_CHECK, 0L) < CHECK_INTERVAL_MS) return
         check(context, manual = false)
     }
 
     fun check(context: Context, manual: Boolean) {
+        if (!BuildConfig.UPDATE_ENABLED) {
+            _state.value = if (manual) {
+                State.Failed("In-app updates are available only in signed release builds")
+            } else {
+                State.Idle
+            }
+            return
+        }
         val current = _state.value
         if (current is State.Checking || current is State.Downloading) return
         _state.value = State.Checking
@@ -78,7 +91,7 @@ object UpdateManager {
                     appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                         .edit().putLong(KEY_LAST_CHECK, System.currentTimeMillis()).apply()
                     _state.value = when {
-                        info != null && isNewer(info.version) -> State.Available(info)
+                        isNewer(info.version) -> State.Available(info)
                         manual -> State.UpToDate
                         else -> State.Idle
                     }
@@ -97,7 +110,6 @@ object UpdateManager {
             runCatching { downloadApk(appContext, info) }
                 .onSuccess { file ->
                     _state.value = State.ReadyToInstall(info, file)
-                    install(appContext)
                 }
                 .onFailure { error ->
                     _state.value = State.Failed(error.message ?: "Download failed")
@@ -122,7 +134,7 @@ object UpdateManager {
                 .recoverCatching { context.startActivity(generic) }
                 .onFailure {
                     _state.value = State.Failed(
-                        "Android blocked the install. Allow \"install unknown apps\" for Anilili in system settings, then try again.",
+                        "Android blocked the install. Allow \"install unknown apps\" for this app in system settings, then try again.",
                     )
                 }
             return
@@ -143,27 +155,52 @@ object UpdateManager {
         if (_state.value !is State.Downloading) _state.value = State.Idle
     }
 
-    private fun fetchLatest(): UpdateInfo? {
+    private fun fetchLatest(): UpdateInfo {
         val request = Request.Builder()
             .url(RELEASES_LATEST)
             .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
             .build()
         AppGraph.httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) error("Update check failed (HTTP ${response.code})")
             val release = json.parseToJsonElement(response.body?.string().orEmpty()).jsonObject
-            val name = release["name"]?.jsonPrimitive?.content.orEmpty()
             val tag = release["tag_name"]?.jsonPrimitive?.content.orEmpty()
             val body = release["body"]?.jsonPrimitive?.content.orEmpty()
-            val version = parseVersion(name) ?: parseVersion(tag) ?: parseVersion(body) ?: return null
-            val apk = release["assets"]?.jsonArray
+            val version = UpdateReleasePolicy.parseReleaseTag(tag)
+                ?: error("Latest GitHub Release tag must use vMAJOR.MINOR.PATCH")
+            val assets = release["assets"]?.jsonArray
                 ?.map { it.jsonObject }
-                ?.firstOrNull { it["name"]?.jsonPrimitive?.content.orEmpty().endsWith(".apk") }
-                ?: return null
+                ?.filter { it["state"]?.jsonPrimitive?.content == "uploaded" }
+                .orEmpty()
+            val selectedAssetName = UpdateReleasePolicy.selectApkAsset(
+                assets.map { it["name"]?.jsonPrimitive?.content.orEmpty() },
+                version,
+            ) ?: error(
+                "Latest GitHub Release must contain exactly one ${UpdateReleasePolicy.expectedApkName(version)} asset",
+            )
+            val apk = assets.firstOrNull {
+                it["name"]?.jsonPrimitive?.content.orEmpty() == selectedAssetName
+            }
+                ?: error("Latest GitHub Release APK metadata is missing")
+            val apkUrl = apk["browser_download_url"]?.jsonPrimitive?.content
+                ?: error("Latest GitHub Release APK has no download URL")
+            if (!UpdateReleasePolicy.isAllowedDownloadUrl(apkUrl, selectedAssetName)) {
+                error("Latest GitHub Release APK has an unexpected download URL")
+            }
+            val sizeBytes = apk["size"]?.jsonPrimitive?.content?.toLongOrNull()
+                ?: error("Latest GitHub Release APK has no size")
+            if (sizeBytes !in 1..UpdateReleasePolicy.MAX_APK_BYTES) {
+                error("Latest GitHub Release APK size is invalid")
+            }
+            val sha256 = UpdateReleasePolicy.parseSha256Digest(
+                apk["digest"]?.jsonPrimitive?.content.orEmpty(),
+            ) ?: error("Latest GitHub Release APK has no valid SHA-256 digest")
             return UpdateInfo(
                 version = version,
                 changelog = body,
-                apkUrl = apk["browser_download_url"]?.jsonPrimitive?.content ?: return null,
-                sizeBytes = apk["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: -1L,
+                apkUrl = apkUrl,
+                sizeBytes = sizeBytes,
+                sha256 = sha256,
             )
         }
     }
@@ -171,47 +208,81 @@ object UpdateManager {
     private fun downloadApk(context: Context, info: UpdateInfo): File {
         val dir = File(context.cacheDir, "updates").apply { mkdirs() }
         dir.listFiles()?.forEach { it.delete() }
-        val file = File(dir, "anilili-${info.version}.apk")
-        // No call timeout: the release APK takes longer than the API client's 45s cap on slow links.
-        val client = AppGraph.httpClient.newBuilder()
-            .cache(null)
-            .callTimeout(0, TimeUnit.SECONDS)
-            .build()
-        client.newCall(Request.Builder().url(info.apkUrl).build()).execute().use { response ->
-            if (!response.isSuccessful) error("Download failed (HTTP ${response.code})")
-            val responseBody = response.body ?: error("Download failed (empty response)")
-            val total = responseBody.contentLength().takeIf { it > 0 } ?: info.sizeBytes
-            responseBody.byteStream().use { input ->
-                file.outputStream().use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    var written = 0L
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        output.write(buffer, 0, read)
-                        written += read
-                        if (total > 0) {
-                            _state.value = State.Downloading(info, (written.toFloat() / total).coerceIn(0f, 1f))
+        val file = File(dir, "anilili-plus-${info.version}.apk")
+        val partial = File(dir, "${file.name}.part")
+        val digest = MessageDigest.getInstance("SHA-256")
+        try {
+            // No call timeout: the release APK takes longer than the API client's 45s cap on slow links.
+            val client = AppGraph.httpClient.newBuilder()
+                .cache(null)
+                .callTimeout(0, TimeUnit.SECONDS)
+                .build()
+            client.newCall(Request.Builder().url(info.apkUrl).build()).execute().use { response ->
+                if (!response.isSuccessful) error("Download failed (HTTP ${response.code})")
+                val responseBody = response.body ?: error("Download failed (empty response)")
+                val responseSize = responseBody.contentLength().takeIf { it > 0 }
+                if (responseSize != null && responseSize > UpdateReleasePolicy.MAX_APK_BYTES) {
+                    error("Downloaded APK is too large")
+                }
+                val total = responseSize ?: info.sizeBytes
+                responseBody.byteStream().use { input ->
+                    partial.outputStream().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        var written = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            digest.update(buffer, 0, read)
+                            written += read
+                            if (written > UpdateReleasePolicy.MAX_APK_BYTES) {
+                                error("Downloaded APK is too large")
+                            }
+                            _state.value = State.Downloading(
+                                info,
+                                (written.toFloat() / total).coerceIn(0f, 1f),
+                            )
+                        }
+                        val expectedSizes = listOfNotNull(
+                            responseSize,
+                            info.sizeBytes,
+                        ).distinct()
+                        if (expectedSizes.any { it != written }) {
+                            error("Download size mismatch ($written bytes received)")
                         }
                     }
-                    if (total > 0 && written < total) error("Download incomplete ($written of $total bytes)")
                 }
             }
+            val actualSha256 = digest.digest().joinToString("") { byte ->
+                "%02x".format(byte.toInt() and 0xff)
+            }
+            if (!actualSha256.equals(info.sha256, ignoreCase = true)) {
+                error("Downloaded APK checksum does not match the GitHub release")
+            }
+            promoteDownload(partial, file)
+            ApkUpdateValidator.validate(context, file, info.version)
+            return file
+        } catch (error: Throwable) {
+            partial.delete()
+            file.delete()
+            throw error
         }
-        return file
     }
 
-    private fun parseVersion(text: String): String? =
-        Regex("""v?(\d+(?:\.\d+)+)""").find(text)?.groupValues?.get(1)
+    private fun promoteDownload(partial: File, target: File) {
+        runCatching {
+            Files.move(
+                partial.toPath(),
+                target.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        }.recoverCatching {
+            Files.move(partial.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }.getOrThrow()
+    }
 
     private fun isNewer(remote: String): Boolean {
-        val remoteParts = remote.split('.').map { it.toIntOrNull() ?: 0 }
-        val currentParts = currentVersion.split('.').map { it.toIntOrNull() ?: 0 }
-        for (i in 0 until maxOf(remoteParts.size, currentParts.size)) {
-            val r = remoteParts.getOrElse(i) { 0 }
-            val c = currentParts.getOrElse(i) { 0 }
-            if (r != c) return r > c
-        }
-        return false
+        return UpdateReleasePolicy.isNewer(remote, currentVersion)
     }
 }

@@ -27,13 +27,13 @@ data class MalExportFile(
 object MalExport {
     fun fromEntries(username: String?, entries: List<MalExportEntry>, skippedCount: Int): MalExportFile {
         val date = LocalDate.now()
-        val fileName = "anilili-mal-export-${date.format(DateTimeFormatter.BASIC_ISO_DATE)}.xml"
+        val fileName = "anilili-plus-mal-export-${date.format(DateTimeFormatter.BASIC_ISO_DATE)}.xml"
         val xml = buildString {
             appendLine("""<?xml version="1.0" encoding="UTF-8" ?>""")
             appendLine("<myanimelist>")
             appendLine("  <myinfo>")
             appendLine("    <user_id>0</user_id>")
-            appendLine("    <user_name>${xml(username ?: "Anilili")}</user_name>")
+            appendLine("    <user_name>${xml(username ?: "AniLili+")}</user_name>")
             appendLine("    <user_export_type>1</user_export_type>")
             appendLine("  </myinfo>")
             entries.forEach { entry ->

@@ -66,6 +66,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | AUTH-003 | [x] | Reject profile, watchlist hydration, refresh, and delayed login errors after logout, account replacement, or a newer load. | `fix/profile-session-generation` |
 | SYNC-001 | [x] | Replace release alarms only from a complete successful release snapshot. | `fix/release-sync-atomic-snapshot` |
 | UPDATE-001 | [x] | Point release checks and repository links to `nassim-arifette/anilili`. | `fix/fork-update-source` |
+| UPDATE-002 | [x] | Give the fork its own Android identity and add a stable-key GitHub Release workflow so future AniLili+ APKs can update existing installations. | `feature/anilili-plus-auto-updates` |
 
 ## Remaining issues
 
@@ -132,6 +133,27 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   metadata can still be treated as definitive absence; the sync needs an explicit completeness
   signal from every source.
 
+- [ ] **OPEN-017 - Physical-device update validation.** The updater and signed release pipeline
+  have automated coverage, but a complete older-APK to newer-APK install should still be verified
+  on at least one phone and one Android TV device before treating the distribution path as proven.
+
+- [ ] **OPEN-018 - Rebrand artwork and screenshots.** The installed label and TV banner use
+  AniLili+, but the inherited phone launcher artwork and repository screenshots still resemble or
+  display the original brand. Add a distinct launcher badge and refresh all device captures.
+
+- [ ] **OPEN-019 - Independent OAuth registrations.** AniLili+ still uses the inherited AniList and
+  MyAnimeList client registrations. Register and test fork-owned clients so login does not depend on
+  credentials that the upstream owner can rotate or revoke.
+
+- [ ] **OPEN-020 - Upstream-data migration.** The fork-specific Android application id allows
+  side-by-side installation but cannot read the original app's private history, settings, tokens,
+  reminders, or TV rows. Add an explicit encrypted export/import flow before promising migration.
+
+- [ ] **OPEN-021 - Legacy provider request identity.** Flixcloud playback still sends
+  `X-Requested-With: com.miruronative`. It may be required by the provider rather than represent the
+  installed application id. Test both identities against real streams before changing it, because
+  an unverified rename could break playback.
+
 ## Superseded branches intentionally not merged
 
 These early candidates remain as local branches for audit history, but merging them would restore
@@ -152,7 +174,13 @@ bugs that their replacements fixed:
 - [x] Run the complete `testDebugUnitTest` suite on the final merged tree (`BUILD SUCCESSFUL`,
   July 21, 2026).
 - [x] Build the final debug APK with SDK 36 (`assembleDebug`, `BUILD SUCCESSFUL`) and verify
-  `app/build/outputs/apk/debug/anilili.apk` with Android's APK signer.
+  `app/build/outputs/apk/debug/anilili-plus-debug.apk` with Android's APK signer.
+- [x] Run `testDebugUnitTest`, `lintRelease`, and an unsigned `assembleRelease` using the same
+  release tasks as GitHub Actions (`BUILD SUCCESSFUL`, July 21, 2026).
+- [x] Build the locally signed AniLili+ release APK and verify application id, version `0.2.0`
+  (`versionCode 29`), 16 KiB ZIP alignment, one signer, and the pinned release certificate.
+- [ ] Publish and download the first GitHub Release, then verify its checksum, package metadata,
+  alignment, and signer independently from the workflow artifact.
 - [ ] Validate rapid Watch A -> B transitions, embed/native handoff, pause/seek/exit resume,
   intro/outro, an airing show's latest episode, the actual series finale, Cast, renderer loss,
   account replacement, and provider exhaustion on a real device or emulator.

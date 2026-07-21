@@ -55,11 +55,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import com.miruronative.R
 import com.miruronative.data.auth.AccountService
 import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.auth.MalAuthManager
@@ -314,7 +316,8 @@ private fun ProfileHero(
             Column(Modifier.fillMaxWidth().padding(20.dp)) {
                 Text("Your anime, in one place", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Black)
                 Text(
-                    "Connect AniList or MyAnimeList to browse every list, score, and episode progress from Anilili.",
+                    "Connect AniList or MyAnimeList to browse every list, score, and episode progress from " +
+                        "${stringResource(R.string.app_name)}.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 5.dp),

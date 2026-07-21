@@ -384,7 +384,7 @@ fun SettingsScreen(
             item {
                 SettingSwitch(
                     "Check for updates on launch",
-                    "Prompt when a new version is available each time the app opens",
+                    "Periodically prompt when a newer signed GitHub Release is available",
                     updateCheckOnLaunch,
                     SettingsStore::setUpdateCheckOnLaunch,
                 )
@@ -415,19 +415,6 @@ fun SettingsScreen(
                 )
             }
             item { SectionDivider() }
-            item {
-                SettingsAction(
-                    title = "Join Telegram Group",
-                    icon = { Icon(painterResource(R.drawable.ic_telegram), contentDescription = null) },
-                    enabled = true,
-                    onClick = {
-                        runCatching {
-                            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/anililiapk"))
-                            context.startActivity(intent)
-                        }
-                    },
-                )
-            }
             item {
                 SettingsAction(
                     title = "GitHub Repository",

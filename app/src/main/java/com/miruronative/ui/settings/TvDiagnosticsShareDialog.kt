@@ -149,7 +149,7 @@ private fun ShareInstructions(url: String) {
             )
             Text("1. Connect your phone or computer to the same Wi-Fi network as this TV.")
             Text("2. Scan the QR code with your phone camera, or type the address into a browser.")
-            Text("3. The diagnostics file downloads automatically — send it to the developers, for example in the Telegram group linked in Settings.")
+            Text("3. The diagnostics file downloads automatically — send it to the maintainers when reporting the issue.")
             Text(
                 "Only devices on your home network can reach this address, and sharing stops " +
                     "when you close this dialog.",

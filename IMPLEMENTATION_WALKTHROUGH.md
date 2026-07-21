@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This change brings the reference app's useful interaction patterns into Anilili without copying its branding or making the interface visually busy. The result stays aligned with Anilili's dark, minimal theme and adapts the same flows for touch phones and D-pad televisions.
+This change brings the reference app's useful interaction patterns into AniLili+ without copying its branding or making the interface visually busy. The result stays aligned with AniLili+'s dark, minimal theme and adapts the same flows for touch phones and D-pad televisions.
 
 The work covers:
 
@@ -204,26 +204,18 @@ Results:
 
 The generated APK is:
 
-`C:\Users\Admin\Documents\miruro-apk\app\build\outputs\apk\debug\anilili.apk`
-
-## Emulator Evidence
-
-- Phone watch metadata: `C:\Users\Admin\.codex\visualizations\2026\07\19\019f7974-a165-7942-a082-12fd9795f60b\phone-watch-final.png`
-- TV watch layout: `C:\Users\Admin\.codex\visualizations\2026\07\19\019f7974-a165-7942-a082-12fd9795f60b\tv-static-final2.png`
-- TV expanded description after Center: `C:\Users\Admin\.codex\visualizations\2026\07\19\019f7974-a165-7942-a082-12fd9795f60b\tv-center-static.png`
-- TV server dialog with focused first option: `C:\Users\Admin\.codex\visualizations\2026\07\19\019f7974-a165-7942-a082-12fd9795f60b\tv-dialog-static-final.png`
+`app/build/outputs/apk/debug/anilili-plus-debug.apk`
 
 ## Pending / Known Follow-up
 
 1. **Phone cold-start retest after emulator recovery.** The final phone emulator became overloaded after repeated dual-emulator installs. Android's `system_server`, sensor service, and Google services caused startup ANRs before the app completed `Application.onCreate`. The phone UI had already been exercised and captured before that degradation, and the final code passes unit tests, lint, and assembly. A clean phone emulator boot is still recommended for one final cold-start smoke test.
 2. **First-load source timing.** Slow provider endpoints can take a few seconds to become visible because the app now confirms a source before showing it. This is expected and prevents dead servers from being offered.
-3. **Version-control handoff.** The changes and tests remain unstaged and uncommitted so they can be reviewed as one working-tree update.
 
 ## Suggested Final Phone Smoke Test
 
 After starting a clean phone emulator:
 
-1. Install `anilili.apk`.
+1. Install `anilili-plus-debug.apk`.
 2. Open Home and confirm Search appears only in the top bar.
 3. Scroll a list and confirm both top and bottom bars hide, then return after scrolling stops.
 4. Open an anime, switch among Home, Episodes, and Related, and confirm Episodes has no source/audio controls.

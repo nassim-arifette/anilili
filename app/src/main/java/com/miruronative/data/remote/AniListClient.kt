@@ -1,5 +1,7 @@
 package com.miruronative.data.remote
 
+import com.miruronative.BuildConfig
+
 import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.model.GqlMediaListResponse
 import com.miruronative.data.model.GqlDiscoverOptionsResponse
@@ -729,7 +731,7 @@ class AniListClient(
         /** Episode start must be at least this old (~25 min runtime + 1 h for links to appear). */
         private const val NEWEST_AIRED_BUFFER_SEC = 90L * 60
         private const val SAVED_SYNC_BATCH_SIZE = 10
-        private const val USER_AGENT = "Anilili/0.1.14 Android (AniList client 45552)"
+        private val USER_AGENT = "AniLiliPlus/${BuildConfig.VERSION_NAME} Android (AniList client 45552)"
     }
 }
 

@@ -1,5 +1,6 @@
 package com.miruronative.data.library
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -55,6 +56,9 @@ object WatchNextManager {
         }
     }
 
+    // androidx.tvprovider annotates this builder as restricted even though it is the supported
+    // integration point for publishing a program to an Android TV launcher's Watch Next row.
+    @SuppressLint("RestrictedApi")
     private fun publishProgram(context: Context, entry: HistoryEntry, engagementAtMs: Long): Boolean =
         runCatching {
             val app = context.applicationContext

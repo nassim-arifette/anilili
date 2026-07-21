@@ -18,6 +18,7 @@ import android.view.ViewTreeObserver
 import android.webkit.WebView
 import androidx.core.content.FileProvider
 import com.miruronative.BuildConfig
+import com.miruronative.R
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -33,7 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 object DiagnosticsLog {
     private const val LOG_DIR = "diagnostics"
     private const val LOG_FILE = "diagnostics.txt"
-    private const val SHARE_FILE = "anilili-diagnostics.txt"
+    private const val SHARE_FILE = "anilili-plus-diagnostics.txt"
     private const val MAX_BYTES = 900_000L
     private const val TRIM_TO_BYTES = 650_000
 
@@ -229,11 +230,15 @@ object DiagnosticsLog {
         )
         val send = Intent(Intent.ACTION_SEND)
             .setType("text/plain")
-            .putExtra(Intent.EXTRA_SUBJECT, "Anilili diagnostics")
-            .putExtra(Intent.EXTRA_TEXT, "Anilili diagnostics are attached.")
+            .putExtra(Intent.EXTRA_SUBJECT, "${context.getString(R.string.app_name)} diagnostics")
+            .putExtra(Intent.EXTRA_TEXT, "${context.getString(R.string.app_name)} diagnostics are attached.")
             .putExtra(Intent.EXTRA_STREAM, uri)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        send.clipData = ClipData.newUri(context.contentResolver, "Anilili diagnostics", uri)
+        send.clipData = ClipData.newUri(
+            context.contentResolver,
+            "${context.getString(R.string.app_name)} diagnostics",
+            uri,
+        )
         val chooser = Intent.createChooser(send, "Share diagnostics")
         if (context !is Activity) chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(chooser)
@@ -282,7 +287,7 @@ object DiagnosticsLog {
      * with a file manager or over USB. Timestamped so repeated shares don't shadow each other.
      */
     fun saveToDownloads(context: Context, snapshot: File): Result<String> = runCatching {
-        val name = "anilili-diagnostics-" +
+        val name = "anilili-plus-diagnostics-" +
             SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date()) + ".txt"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val resolver = context.contentResolver
@@ -313,7 +318,7 @@ object DiagnosticsLog {
         synchronized(lock) {
             snapshot.writeText(
                 buildString {
-                    appendLine("Anilili diagnostics")
+                    appendLine("${context.getString(R.string.app_name)} diagnostics")
                     appendLine("generated: ${timestamp()}")
                     appendLine("app: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) ${BuildConfig.BUILD_TYPE}")
                     appendLine("device: ${Build.MANUFACTURER} ${Build.MODEL}")

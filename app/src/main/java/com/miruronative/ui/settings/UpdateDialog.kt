@@ -17,8 +17,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.miruronative.R
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.data.update.UpdateManager
 
@@ -29,6 +31,7 @@ import com.miruronative.data.update.UpdateManager
 @Composable
 fun UpdatePromptHost() {
     val context = LocalContext.current
+    val appName = stringResource(R.string.app_name)
     val state by UpdateManager.state.collectAsState()
 
     when (val s = state) {
@@ -42,7 +45,7 @@ fun UpdatePromptHost() {
                         .verticalScroll(rememberScrollState()),
                 ) {
                     Text(
-                        "Anilili v${s.update.version} (you have v${UpdateManager.currentVersion})",
+                        "$appName v${s.update.version} (you have v${UpdateManager.currentVersion})",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Medium,
                     )
@@ -80,7 +83,7 @@ fun UpdatePromptHost() {
             text = {
                 Column {
                     Text(
-                        "Anilili v${s.update.version}",
+                        "$appName v${s.update.version}",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     LinearProgressIndicator(
@@ -99,8 +102,8 @@ fun UpdatePromptHost() {
             title = { Text("Ready to install", fontWeight = FontWeight.Black) },
             text = {
                 Text(
-                    "Anilili v${s.update.version} is downloaded. If nothing happened, allow installs " +
-                        "from this app when Android asks, then tap Install again.",
+                    "$appName v${s.update.version} is downloaded. Tap Install. If Android asks, " +
+                        "allow installs from this app, return here, and tap Install again.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
             },
