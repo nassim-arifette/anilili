@@ -95,10 +95,12 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   from reading the actual `<video>` inside many provider iframes. Progress, resume, intro/outro,
   natural end, speed, and caption control remain unavailable there. A reliable solution needs a
   provider `postMessage` contract, a native stream, or an app-controlled player page. The app also
-  cannot enumerate or pause two independent media elements inside an active cross-origin iframe;
-  only whole-WebView pause and blanking during transitions are guaranteed. AniSkip is intentionally
-  not queried without a real duration on these embeds. Provider markers are retained, but without
-  observable telemetry they cannot drive app-controlled manual or automatic seeking.
+  cannot enumerate or pause two independent media elements inside an active cross-origin iframe.
+  During transitions it can only request an instance-level WebView pause and replace the outgoing
+  document with `about:blank`; it cannot confirm that inaccessible iframe media stopped before the
+  blank document commits. AniSkip is intentionally not queried without a real duration on these
+  embeds. Provider markers are retained, but without observable telemetry they cannot drive
+  app-controlled manual or automatic seeking.
 
 - [x] **OPEN-002 - Generic web fallback identity.** Generic fallback pages are now explicitly
   unmanaged: they cannot write route-owned progress/history, and cross-origin controls expose only
