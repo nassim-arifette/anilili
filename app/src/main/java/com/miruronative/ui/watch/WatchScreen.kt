@@ -68,6 +68,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -125,16 +126,24 @@ fun WatchScreen(
     onBack: () -> Unit,
     vm: WatchViewModel = viewModel(),
 ) {
-    LaunchedEffect(animeId, provider, category, episode) {
-        DiagnosticsLog.event("WatchScreen composed id=$animeId provider=$provider category=$category episode=$episode")
-        vm.start(animeId, provider, category, episode)
-    }
     val state by vm.state.collectAsState()
-    var webFallback by remember { mutableStateOf(false) }
+    var webFallback by remember(animeId, provider, category, episode) { mutableStateOf(false) }
+    val routeAlreadyStarted = vm.isStartedFor(animeId, provider, category, episode)
+    var startAuthorized by remember(vm, animeId, provider, category, episode) {
+        mutableStateOf(routeAlreadyStarted)
+    }
+    var startIssued by remember(vm, animeId, provider, category, episode) {
+        mutableStateOf(routeAlreadyStarted)
+    }
+    var stateBeforeStart by remember(vm, animeId, provider, category, episode) {
+        mutableStateOf<UiState<WatchData>?>(null)
+    }
     val successfulData = (state as? UiState.Success)?.data
     val chosenStream = successfulData?.chosenStream
     val usesNativePlayer = successfulData?.let { data ->
         chosenStream != null &&
+            !data.isResolving &&
+            data.playbackTeardownGeneration == null &&
             !chosenStream.isEmbed &&
             !ProviderCatalog.isEmbed(data.provider)
     } == true
@@ -152,7 +161,8 @@ fun WatchScreen(
         mutableStateOf(device.isTv && !showEpisodeListInitially)
     }
     val successData = (state as? UiState.Success)?.data
-    val requestedPlayerMode = when {
+    val desiredPlayerMode = when {
+        !startAuthorized -> WatchPlayerMode.INACTIVE
         webFallback -> WatchPlayerMode.EMBED
         successData == null -> WatchPlayerMode.INACTIVE
         successData.anilistId != animeId -> WatchPlayerMode.INACTIVE
@@ -161,6 +171,11 @@ fun WatchScreen(
         successData.chosenStream.isEmbed || ProviderCatalog.isEmbed(successData.provider) -> WatchPlayerMode.EMBED
         else -> WatchPlayerMode.NATIVE
     }
+    val requestedPlayerMode = playerModeForPlaybackTransition(
+        desiredMode = desiredPlayerMode,
+        isResolving = successData?.isResolving == true,
+        teardownGeneration = successData?.playbackTeardownGeneration,
+    )
     var playbackOwner by remember(animeId, provider, category, episode) {
         mutableStateOf<WatchPlaybackOwnerToken?>(null)
     }
@@ -190,6 +205,75 @@ fun WatchScreen(
     var embeddedPlaybackStopper by remember { mutableStateOf<(() -> Unit)?>(null) }
     val currentEmbeddedPlaybackStopper by rememberUpdatedState(embeddedPlaybackStopper)
     val currentPlaybackOwner by rememberUpdatedState(playbackOwner)
+
+    // A new route first claims an owner and commits one surface-free frame. Only then may start()
+    // launch source work: on same-anime route changes the old Success state would otherwise briefly
+    // recreate player A under owner B while the replacement resolver was already running.
+    LaunchedEffect(
+        animeId,
+        provider,
+        category,
+        episode,
+        startIssued,
+        playbackOwner,
+        renderedPlayerMode,
+    ) {
+        if (startIssued || renderedPlayerMode != WatchPlayerMode.INACTIVE) return@LaunchedEffect
+        val owner = playbackOwner ?: return@LaunchedEffect
+        runCatching { currentEmbeddedPlaybackStopper?.invoke() }
+            .onFailure { DiagnosticsLog.throwable("WatchScreen route-change embed stop failed", it) }
+        if (!PlaybackService.stopActivePlayback(owner)) {
+            DiagnosticsLog.event("WatchScreen route start withheld for stale playback owner")
+            return@LaunchedEffect
+        }
+        DiagnosticsLog.event(
+            "WatchScreen starting id=$animeId provider=$provider category=$category episode=$episode",
+        )
+        stateBeforeStart = state
+        startIssued = true
+        vm.start(animeId, provider, category, episode)
+    }
+    LaunchedEffect(startIssued, startAuthorized, stateBeforeStart, state) {
+        if (!startIssued || startAuthorized) return@LaunchedEffect
+        val previousState = stateBeforeStart
+        if (
+            !canAuthorizeStartedRoute(
+                previousStateWasSuccess = previousState is UiState.Success,
+                replacementStateObserved = previousState !== state,
+            )
+        ) {
+            return@LaunchedEffect
+        }
+        // Keep the placeholder through the frame that observed Loading/new state. This makes the
+        // ordering independent of StateFlow collector scheduling inside the start side effect.
+        withFrameNanos { }
+        startAuthorized = true
+    }
+
+    // launchResolve already banked the last identity-checked native/embed tick before publishing
+    // this generation. Once Compose has committed INACTIVE, make both playback backends terminal
+    // and only then release the resolver waiting behind PlaybackTransitionBarrier.
+    val teardownGeneration = successData?.playbackTeardownGeneration
+    val teardownCanBeAcknowledged = canAcknowledgePlaybackTeardown(
+        teardownGeneration = teardownGeneration,
+        requestedMode = requestedPlayerMode,
+        renderedMode = renderedPlayerMode,
+    )
+    LaunchedEffect(teardownGeneration, teardownCanBeAcknowledged, playbackOwner) {
+        val generation = teardownGeneration ?: return@LaunchedEffect
+        val owner = playbackOwner ?: return@LaunchedEffect
+        if (!teardownCanBeAcknowledged) return@LaunchedEffect
+        runCatching { currentEmbeddedPlaybackStopper?.invoke() }
+            .onFailure { DiagnosticsLog.throwable("WatchScreen transition embed stop failed", it) }
+        if (!PlaybackService.stopActivePlayback(owner)) {
+            DiagnosticsLog.event(
+                "WatchScreen playback teardown withheld for stale owner generation=$generation",
+            )
+            return@LaunchedEffect
+        }
+        DiagnosticsLog.event("WatchScreen playback teardown complete generation=$generation")
+        vm.onPlaybackTeardownComplete(generation)
+    }
     // YouTube-style leave: native playback PAUSES (media stays loaded, so the notification can
     // resume it and re-entering the episode continues in place); the position is committed past
     // the periodic-save throttle so "continue watching" lands exactly where the user left off.
@@ -323,6 +407,14 @@ fun WatchScreen(
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 com.miruronative.ui.components.NoFaceLoadingIndicator(size = 72.dp)
             }
+            BackButton(pauseAndBack, Modifier.align(Alignment.TopStart))
+            return@Box
+        }
+
+        // renderedPlayerMode is INACTIVE here. Keep WatchContent (and even the unmanaged fallback)
+        // out of the composition until the gated resolver publishes a replacement or rollback.
+        if (successData?.isResolving == true || successData?.playbackTeardownGeneration != null) {
+            LoadingBox(message = successData.notice ?: "Finding a source for this episode…")
             BackButton(pauseAndBack, Modifier.align(Alignment.TopStart))
             return@Box
         }

@@ -8,6 +8,8 @@ import com.miruronative.data.model.ProviderData
 import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.SourcesResult
 import com.miruronative.data.model.StreamItem
+import com.miruronative.data.SourceResolutionMode
+import com.miruronative.data.resolveHiddenMediaIfAllowed
 import com.miruronative.data.model.SubtitleItem
 import com.miruronative.diagnostics.DiagnosticsLog
 import java.net.URI
@@ -126,7 +128,11 @@ class AnivexaClient(
         }
     }
 
-    suspend fun getSources(episodeId: String, seedMedia: Media? = null): SourcesResult = withContext(Dispatchers.IO) {
+    suspend fun getSources(
+        episodeId: String,
+        seedMedia: Media? = null,
+        mode: SourceResolutionMode = SourceResolutionMode.PLAYBACK,
+    ): SourcesResult = withContext(Dispatchers.IO) {
         val request = NativeProviderParsers.episodeRequest(episodeId)
             ?: error("Invalid native provider episode id: $episodeId")
         seedMedia?.let { mediaCache[request.anilistId] = it }
@@ -138,7 +144,7 @@ class AnivexaClient(
             "allanime" -> allAnime.sources(media, request.audio, request.episode)
             "animekai" -> animeKai.sources(media, request.audio, request.episode)
             "kaa" -> kickAssAnime.sources(media, request.audio, request.episode)
-            "reanime" -> reanime(media, request.audio, request.episode)
+            "reanime" -> reanime(media, request.audio, request.episode, mode)
             "anizone" -> anizone(media, request.episode)
             "animegg" -> animegg(media, request.audio, request.episode)
             "anineko" -> anineko(media, request.audio, request.episode)
@@ -514,7 +520,12 @@ class AnivexaClient(
 
     // ---- ReAnime --------------------------------------------------------------------------
 
-    private suspend fun reanime(media: Media, audio: String, episode: Int): SourcesResult {
+    private suspend fun reanime(
+        media: Media,
+        audio: String,
+        episode: Int,
+        mode: SourceResolutionMode,
+    ): SourcesResult {
         if (audio == "dub" && (media.id to episode) in REANIME_BAD_DUB_MUXES) {
             error("ReAnime episode $episode DUB has a known unsynchronized audio track")
         }
@@ -543,8 +554,15 @@ class AnivexaClient(
         val embedHtml = runCatching { getText(primary.url, mapOf("Referer" to "$base/")) }.getOrDefault("")
         val subtitles = ReanimeFlixcloudParser.subtitles(embedHtml, audio)
         val skip = ReanimeFlixcloudParser.skip(embedHtml)
-        val nativeHls = runCatching { FlixcloudBridge.resolve(primary.url, "$base/") }
-            .getOrNull()
+        val nativeHls = resolveHiddenMediaIfAllowed(mode) {
+            runCatching { FlixcloudBridge.resolve(primary.url, "$base/") }.getOrNull()
+        }
+        if (!mode.allowsHiddenMediaResolver) {
+            DiagnosticsLog.event(
+                "ReAnime background validation skipped hidden Flixcloud media resolver " +
+                    "episode=$episode audio=$audio",
+            )
+        }
 
         val streams = mutableListOf<StreamItem>()
         if (nativeHls != null) {

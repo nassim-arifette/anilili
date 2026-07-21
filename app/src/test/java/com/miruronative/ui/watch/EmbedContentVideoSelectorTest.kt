@@ -1,6 +1,7 @@
 package com.miruronative.ui.watch
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -44,6 +45,56 @@ class EmbedContentVideoSelectorTest {
     }
 
     @Test
+    fun `playing plausible video replaces an unverified paused DOM first lock`() {
+        val domFirst = candidate("dom-first", playing = false)
+        val userStarted = candidate("episode", playing = true)
+
+        assertEquals(
+            "episode",
+            selectEmbedContentVideo(
+                listOf(domFirst, userStarted),
+                lockedId = "dom-first",
+                lockedVerified = false,
+            )?.id,
+        )
+    }
+
+    @Test
+    fun `verified paused sub lock rejects later equal background dub playback`() {
+        val establishedSub = candidate("sub", playing = false)
+        val backgroundDub = candidate("dub", playing = true)
+
+        assertEquals(
+            "sub",
+            selectEmbedContentVideo(
+                listOf(establishedSub, backgroundDub),
+                lockedId = "sub",
+                lockedVerified = true,
+            )?.id,
+        )
+    }
+
+    @Test
+    fun `verified 720p sub lock rejects later higher score 1080p background dub`() {
+        val establishedSub = candidate("sub", pixels = 1_280L * 720L, playing = false)
+        val backgroundDub = candidate(
+            "dub",
+            duration = 1_800.0,
+            pixels = 1_920L * 1_080L,
+            playing = true,
+        )
+
+        assertEquals(
+            "sub",
+            selectEmbedContentVideo(
+                listOf(establishedSub, backgroundDub),
+                lockedId = "sub",
+                lockedVerified = true,
+            )?.id,
+        )
+    }
+
+    @Test
     fun `invalid lock is replaced and all invalid candidates return null`() {
         assertEquals(
             "episode",
@@ -59,9 +110,85 @@ class EmbedContentVideoSelectorTest {
     fun `browser selector scans all videos and keeps a content lock`() {
         val script = embedContentVideoSelectorJs()
 
-        assertTrue(script.contains("querySelectorAll('video')"))
+        assertTrue(script.contains("__aniliCollectMedia(root, 'video', out)"))
         assertTrue(script.contains("__aniliLooksLikeAd"))
         assertTrue(script.contains("duration < 120.0"))
         assertTrue(script.contains("window.__aniliContentVideo"))
+        assertTrue(script.contains("__aniliPauseCompetingMedia"))
+        assertTrue(script.contains("candidate.addEventListener('play'"))
+        assertTrue(script.contains("__aniliVisualOverlapRatio"))
+        assertTrue(script.contains("__aniliSetCompetingVideoSuppressed"))
+        assertTrue(script.contains("!lockedVerified && bestPlaying"))
+        assertTrue(script.contains("lockedScore !== null && lockedVerified"))
+        assertTrue(script.contains("window.__aniliContentVideoVerified = true"))
+        assertTrue(script.contains("if (!selectionVerified)"))
+        assertTrue(script.contains("first.ownerDocument !== second.ownerDocument"))
+        assertTrue(script.contains("visibility', 'hidden', 'important"))
+    }
+
+    @Test
+    fun `only plausible substantially overlapping video is visually suppressed`() {
+        val selected = EmbedVideoBounds(0.0, 0.0, 1_000.0, 600.0)
+        val mostlyOverlapping = EmbedVideoBounds(100.0, 0.0, 1_000.0, 600.0)
+        val separate = EmbedVideoBounds(1_100.0, 0.0, 2_000.0, 600.0)
+
+        assertTrue(
+            shouldSuppressCompetingEmbedVideo(
+                candidate("duplicate"),
+                selected,
+                mostlyOverlapping,
+            ),
+        )
+        assertFalse(
+            shouldSuppressCompetingEmbedVideo(
+                candidate("separate"),
+                selected,
+                separate,
+            ),
+        )
+        assertFalse(
+            shouldSuppressCompetingEmbedVideo(
+                candidate("preroll", duration = 30.0),
+                selected,
+                mostlyOverlapping,
+            ),
+        )
+        assertFalse(
+            shouldSuppressCompetingEmbedVideo(
+                candidate("iframe-video"),
+                selected,
+                mostlyOverlapping,
+                sameOwnerDocument = false,
+            ),
+        )
+        assertFalse(
+            shouldSuppressCompetingEmbedVideo(
+                candidate("unverified-competitor"),
+                selected,
+                mostlyOverlapping,
+                selectionVerified = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `terminal silence pauses video and audio in nested reachable frames`() {
+        val script = silenceEmbedMediaForTeardownJs()
+
+        assertTrue(script.contains("querySelectorAll('video,audio')"))
+        assertTrue(script.contains("media[i].pause()"))
+        assertTrue(script.contains("media[i].muted = true"))
+        assertTrue(script.contains("silenceMedia(child)"))
+    }
+
+    @Test
+    fun `lifecycle pause is reversible and never changes audio settings`() {
+        val script = pauseEmbedMediaForLifecycleJs()
+
+        assertTrue(script.contains("querySelectorAll('video,audio')"))
+        assertTrue(script.contains("media[i].pause()"))
+        assertTrue(script.contains("pauseMedia(child)"))
+        assertFalse(script.contains("muted"))
+        assertFalse(script.contains("volume"))
     }
 }

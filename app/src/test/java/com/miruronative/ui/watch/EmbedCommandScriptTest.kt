@@ -26,5 +26,7 @@ class EmbedCommandScriptTest {
         assertTrue(script.contains("catch(function() { report(false, video); })"))
         assertTrue(script.contains("playing = !!video && !video.paused"))
         assertTrue(script.contains("'capability', '18', '10'"))
+        assertTrue(script.contains("__aniliPauseCompetingMedia(video)"))
+        assertTrue(script.contains("__aniliPauseAllMedia()"))
     }
 }

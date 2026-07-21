@@ -173,6 +173,67 @@ internal class EmbedNavigationGuard {
     }
 }
 
+/**
+ * Serializes replacement of the document hosted by the reusable player WebView.
+ *
+ * A new episode is not allowed to load until `about:blank` has committed for its generation. This
+ * removes the outgoing document (and Chromium's media surfaces) before the incoming one can create
+ * another player. Rapid A -> B -> C transitions cannot let B's late blank callback start B.
+ */
+internal class EmbedDocumentTransitionGate {
+    private var awaitingBlankGeneration = NO_GENERATION
+    private var requestedBlankGeneration = NO_GENERATION
+
+    @Synchronized
+    fun begin(session: EmbedNavigationSession) {
+        awaitingBlankGeneration = session.generation
+        requestedBlankGeneration = NO_GENERATION
+    }
+
+    /** Marks that this generation, rather than an older transition, actually requested blank. */
+    @Synchronized
+    fun markBlankRequested(session: EmbedNavigationSession): Boolean {
+        if (awaitingBlankGeneration != session.generation) return false
+        requestedBlankGeneration = session.generation
+        return true
+    }
+
+    @Synchronized
+    fun acceptBlankFinished(
+        session: EmbedNavigationSession,
+        callbackUrl: String?,
+        visibleUrl: String?,
+    ): Boolean {
+        if (
+            awaitingBlankGeneration != session.generation ||
+            requestedBlankGeneration != session.generation ||
+            !sameDocumentUrl(callbackUrl, BLANK_DOCUMENT_URL) ||
+            !sameDocumentUrl(callbackUrl, visibleUrl)
+        ) {
+            return false
+        }
+        awaitingBlankGeneration = NO_GENERATION
+        requestedBlankGeneration = NO_GENERATION
+        return true
+    }
+
+    @Synchronized
+    fun invalidate(session: EmbedNavigationSession) {
+        if (awaitingBlankGeneration == session.generation) {
+            awaitingBlankGeneration = NO_GENERATION
+            requestedBlankGeneration = NO_GENERATION
+        }
+    }
+
+    private companion object {
+        const val NO_GENERATION = 0L
+    }
+}
+
+internal const val EMBED_BLANK_DOCUMENT_URL = "about:blank"
+
+private const val BLANK_DOCUMENT_URL = EMBED_BLANK_DOCUMENT_URL
+
 internal const val REVOKE_EMBED_NAVIGATION_JS =
     "window.__aniliNavigationRevoked = true;"
 

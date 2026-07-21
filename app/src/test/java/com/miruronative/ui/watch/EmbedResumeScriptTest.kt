@@ -10,7 +10,7 @@ class EmbedResumeScriptTest {
     fun `resume finds videos in the document and same origin iframes`() {
         val script = embedResumeWhenReadyJs(targetSec = 42.5, navigationGeneration = 17L)
 
-        assertTrue(script.contains("root.querySelectorAll('video')"))
+        assertTrue(script.contains("__aniliCollectMedia(root, 'video', out)"))
         assertTrue(script.contains("root.querySelectorAll('iframe')"))
         assertTrue(script.contains("frames[j].contentDocument"))
         assertTrue(script.contains("findContentVideo()"))

@@ -596,8 +596,9 @@ class MiruroRepository(
         provider: String,
         category: Category,
         anilistId: Int,
+        mode: SourceResolutionMode = SourceResolutionMode.PLAYBACK,
     ): SourcesResult = when (ProviderCatalog.sourceOf(provider)) {
-        ProviderCatalog.Source.ANIVEXA -> anivexa.getSources(pipeId, animeInfo(anilistId))
+        ProviderCatalog.Source.ANIVEXA -> anivexa.getSources(pipeId, animeInfo(anilistId), mode)
         ProviderCatalog.Source.MIRURO -> pipe.getSources(pipeId, provider, category, anilistId)
     }
 
@@ -624,6 +625,7 @@ class MiruroRepository(
         episodes: EpisodesResult,
         excludedProviders: Set<String> = emptySet(),
         maxAttempts: Int = 5,
+        mode: SourceResolutionMode = SourceResolutionMode.PLAYBACK,
     ): SourceResolution {
         currentCoroutineContext().ensureActive()
         val ordered = providerAttemptOrder(preferred, episodes.providerNames)
@@ -636,7 +638,7 @@ class MiruroRepository(
             val provider = episodes.provider(name) ?: continue
             val ep = provider.episodes(category).firstOrNull { it.number == number } ?: continue
             attempts++
-            val result = runCatching { sources(ep.pipeId, name, category, anilistId) }
+            val result = runCatching { sources(ep.pipeId, name, category, anilistId, mode) }
                 .onFailure {
                     it.rethrowIfCancellation()
                     DiagnosticsLog.throwable(

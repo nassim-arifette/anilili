@@ -179,6 +179,56 @@ class EmbedNavigationGuardTest {
     }
 
     @Test
+    fun replacementDocumentWaitsForItsOwnBlankCommit() {
+        val navigationGuard = EmbedNavigationGuard()
+        val transitionGate = EmbedDocumentTransitionGate()
+        val navigationA = navigationGuard.begin(request("https://player.example/episode-a"))
+        transitionGate.begin(navigationA)
+        val navigationB = navigationGuard.begin(request("https://player.example/episode-b"))
+        transitionGate.begin(navigationB)
+
+        // A blank started by A may finish after B becomes current. B must not treat it as its own
+        // teardown until B has actually requested a blank navigation.
+        assertFalse(
+            transitionGate.acceptBlankFinished(
+                navigationB,
+                EMBED_BLANK_DOCUMENT_URL,
+                EMBED_BLANK_DOCUMENT_URL,
+            ),
+        )
+        assertFalse(transitionGate.markBlankRequested(navigationA))
+        assertTrue(transitionGate.markBlankRequested(navigationB))
+        assertFalse(
+            transitionGate.acceptBlankFinished(
+                navigationA,
+                EMBED_BLANK_DOCUMENT_URL,
+                EMBED_BLANK_DOCUMENT_URL,
+            ),
+        )
+        assertFalse(
+            transitionGate.acceptBlankFinished(
+                navigationB,
+                "https://player.example/episode-a",
+                "https://player.example/episode-a",
+            ),
+        )
+        assertTrue(
+            transitionGate.acceptBlankFinished(
+                navigationB,
+                EMBED_BLANK_DOCUMENT_URL,
+                EMBED_BLANK_DOCUMENT_URL,
+            ),
+        )
+        assertFalse(
+            transitionGate.acceptBlankFinished(
+                navigationB,
+                EMBED_BLANK_DOCUMENT_URL,
+                EMBED_BLANK_DOCUMENT_URL,
+            ),
+        )
+    }
+
+    @Test
     fun injectedProgressAndCommandsCarryAndRecheckTheNavigationCapability() {
         val progressScript = progressPollJs(42L)
         val commandGuard = embedNavigationJsGuard(42L)

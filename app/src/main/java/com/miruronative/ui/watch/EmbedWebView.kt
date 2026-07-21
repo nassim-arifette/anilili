@@ -8,7 +8,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.KeyEvent
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
@@ -40,6 +39,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -154,6 +154,7 @@ fun EmbedWebView(
         usesIframeShell = usesAllAnimeIframeShell,
     )
     val navigationGuard = remember { EmbedNavigationGuard() }
+    val documentTransitionGate = remember { EmbedDocumentTransitionGate() }
     var rendererGeneration by remember { mutableIntStateOf(0) }
     // remember() runs as soon as Compose observes a logical playback, URL, or referer change. This
     // revokes the preceding capability before AndroidView's later update reuses the WebView. A
@@ -178,6 +179,7 @@ fun EmbedWebView(
     val currentOnPlaybackEnded by rememberUpdatedState(onPlaybackEnded)
     val currentOnPreviousEpisode by rememberUpdatedState(onPreviousEpisode)
     val currentOnNextEpisode by rememberUpdatedState(onNextEpisode)
+    val currentPlaybackKey by rememberUpdatedState(playbackKey)
     val currentHasPreviousEpisode by rememberUpdatedState(hasPreviousEpisode)
     val currentHasNextEpisode by rememberUpdatedState(hasNextEpisode)
     // The bridge is process-wide and visible to every frame. Its random capability prevents a
@@ -560,6 +562,22 @@ fun EmbedWebView(
         )
     }
 
+    // Once the app can identify and command the content video, it owns the control surface. Hide
+    // only known provider control bars (and the selected video's native controls) so the two sets
+    // are not drawn on top of each other. Cross-origin players never reach this state and retain
+    // their own controls.
+    LaunchedEffect(touchControlsActive, webView, navigationSession.generation) {
+        val web = webView ?: return@LaunchedEffect
+        if (!navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
+        web.evaluateJavascript(
+            providerControlsVisibilityJs(
+                hidden = touchControlsActive,
+                navigationGeneration = navigationSession.generation,
+            ),
+            null,
+        )
+    }
+
     DisposableEffect(lifecycleOwner, webView) {
         val owner = lifecycleOwner
         val web = webView
@@ -570,15 +588,13 @@ fun EmbedWebView(
                 when (event) {
                     Lifecycle.Event.ON_PAUSE,
                     Lifecycle.Event.ON_STOP -> {
-                        runCatching { web.evaluateJavascript(PAUSE_VIDEO_JS, null) }
+                        runCatching { web.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
                         // Keep lifecycle changes instance-local; timers are global to all WebViews.
                         web.onPause()
                     }
-                    Lifecycle.Event.ON_RESUME,
-                    Lifecycle.Event.ON_START -> {
+                    else -> if (shouldResumeEmbedForLifecycleEvent(event)) {
                         web.onResume()
                     }
-                    else -> Unit
                 }
             }
             owner.lifecycle.addObserver(observer)
@@ -779,11 +795,11 @@ fun EmbedWebView(
                                         return true
                                     }
                                     event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT && currentHasNextEpisode -> {
-                                        currentOnNextEpisode?.invoke(playbackKey)
+                                        currentOnNextEpisode?.invoke(currentPlaybackKey)
                                         return true
                                     }
                                     event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS && currentHasPreviousEpisode -> {
-                                        currentOnPreviousEpisode?.invoke(playbackKey)
+                                        currentOnPreviousEpisode?.invoke(currentPlaybackKey)
                                         return true
                                     }
                                 }
@@ -895,112 +911,155 @@ fun EmbedWebView(
                 if (lastRequestedGeneration.value != navigationSession.generation) {
                     lastRequestedGeneration.value = navigationSession.generation
                     web.tag = navigationSession
-                    // Stop both the old document and its app-facing capability before installing
-                    // callbacks for the replacement navigation.
-                    runCatching { web.evaluateJavascript(REVOKE_EMBED_NAVIGATION_JS, null) }
-                    web.stopLoading()
                     webPlaybackAvailable = false
                     webIsPlaying = false
                     webMediaIdentity = null
                     loadError = null
                     finishedUrl = null
-                    web.webViewClient = EmbedNavigationWebViewClient(
-                        session = navigationSession,
-                        guard = navigationGuard,
-                        onPageStartedAccepted = { startedUrl ->
-                            loadError = null
-                            finishedUrl = null
+                    documentTransitionGate.begin(navigationSession)
+
+                    val handleRendererGone = { goneView: WebView?, detail: RenderProcessGoneDetail? ->
+                        DiagnosticsLog.event(
+                            "EmbedWebView render process gone generation=${navigationSession.generation} " +
+                                "didCrash=${detail?.didCrash()} priority=${detail?.rendererPriorityAtExit()}",
+                        )
+                        // Revoke the dead document immediately. Changing both keys disposes this
+                        // AndroidView and creates a fresh Chromium renderer + navigation capability.
+                        documentTransitionGate.invalidate(navigationSession)
+                        navigationGuard.invalidate(navigationSession)
+                        if (webView === goneView || goneView == null) webView = null
+                        rendererGeneration++
+                        currentOnPlaybackError?.invoke(
+                            playbackKey,
+                            "Video server renderer stopped",
+                            navigationSession.request.streamUrl,
+                            currentPositionMs,
+                        )
+                        Unit
+                    }
+
+                    fun loadRequestedDocument(targetWeb: WebView) {
+                        if (
+                            targetWeb.tag !== navigationSession ||
+                            !navigationGuard.isCurrent(navigationSession)
+                        ) {
                             DiagnosticsLog.event(
-                                "EmbedWebView page started generation=${navigationSession.generation} " +
-                                    "host=${startedUrl.hostOrNone()}",
+                                "EmbedWebView ignored stale post-blank load " +
+                                    "generation=${navigationSession.generation}",
                             )
-                        },
-                        onPageFinishedAccepted = { finishedView, loadedUrl ->
-                            finishedUrl = loadedUrl
-                            DiagnosticsLog.event(
-                                "EmbedWebView page finished generation=${navigationSession.generation} " +
-                                    "host=${loadedUrl.hostOrNone()} title=${finishedView.title ?: "none"}",
-                            )
-                            if (playbackMode.exposesNativeBridge) {
-                                val navigationSetupJs = buildString {
-                                    appendLine(
-                                        authenticatedProgressPollJs(
-                                            navigationSession.generation,
-                                            progressBridgeToken,
-                                        ),
-                                    )
-                                    if (navigationSession.request.resumePositionMs > 0L) {
-                                        append(
-                                            embedResumeWhenReadyJs(
-                                                navigationSession.request.resumePositionMs / 1000.0,
+                            return
+                        }
+                        targetWeb.webViewClient = EmbedNavigationWebViewClient(
+                            session = navigationSession,
+                            guard = navigationGuard,
+                            onPageStartedAccepted = { startedUrl ->
+                                loadError = null
+                                finishedUrl = null
+                                DiagnosticsLog.event(
+                                    "EmbedWebView page started generation=${navigationSession.generation} " +
+                                        "host=${startedUrl.hostOrNone()}",
+                                )
+                            },
+                            onPageFinishedAccepted = { finishedView, loadedUrl ->
+                                finishedUrl = loadedUrl
+                                DiagnosticsLog.event(
+                                    "EmbedWebView page finished generation=${navigationSession.generation} " +
+                                        "host=${loadedUrl.hostOrNone()} title=${finishedView.title ?: "none"}",
+                                )
+                                if (playbackMode.exposesNativeBridge) {
+                                    val navigationSetupJs = buildString {
+                                        appendLine(
+                                            authenticatedProgressPollJs(
                                                 navigationSession.generation,
+                                                progressBridgeToken,
                                             ),
                                         )
+                                        if (navigationSession.request.resumePositionMs > 0L) {
+                                            append(
+                                                embedResumeWhenReadyJs(
+                                                    navigationSession.request.resumePositionMs / 1000.0,
+                                                    navigationSession.generation,
+                                                ),
+                                            )
+                                        }
                                     }
+                                    // One evaluation preserves setup order: the document receives
+                                    // its capability before the capability-scoped resume timer.
+                                    finishedView.evaluateJavascript(navigationSetupJs, null)
                                 }
-                                // One evaluation preserves setup order: the document receives its
-                                // capability before the capability-scoped resume timer starts.
-                                finishedView.evaluateJavascript(navigationSetupJs, null)
-                            }
-                        },
-                        onMainFrameErrorAccepted = { message ->
-                            loadError = message
-                            currentOnPlaybackError?.invoke(
-                                playbackKey,
-                                message,
-                                navigationSession.request.streamUrl,
-                                currentPositionMs,
+                            },
+                            onMainFrameErrorAccepted = { message ->
+                                loadError = message
+                                currentOnPlaybackError?.invoke(
+                                    playbackKey,
+                                    message,
+                                    navigationSession.request.streamUrl,
+                                    currentPositionMs,
+                                )
+                            },
+                            onRenderProcessGoneAccepted = handleRendererGone,
+                        )
+                        targetWeb.webChromeClient = EmbedNavigationWebChromeClient(
+                            session = navigationSession,
+                            guard = navigationGuard,
+                            onFullscreenChanged = { fullscreen ->
+                                currentOnFullscreenChanged(fullscreen)
+                            },
+                        )
+                        DiagnosticsLog.event(
+                            "EmbedWebView loadUrl after blank host=${activeUrl.hostOrNone()} " +
+                                "generation=${navigationSession.generation} " +
+                                "headers=${headers.keys.joinToString()}",
+                        )
+                        if (shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState)) {
+                            targetWeb.onResume()
+                        }
+                        if (usesAllAnimeIframeShell) {
+                            // OK.ru returns a blank document when opened as a top-level WebView
+                            // page. AllAnime supplies the iframe navigation metadata and referer.
+                            targetWeb.loadDataWithBaseURL(
+                                activeReferer,
+                                allAnimeIframeShell(activeUrl),
+                                "text/html",
+                                "UTF-8",
+                                null,
                             )
-                        },
-                        onRenderProcessGoneAccepted = { goneView, detail ->
-                            DiagnosticsLog.event(
-                                "EmbedWebView render process gone generation=${navigationSession.generation} " +
-                                    "didCrash=${detail?.didCrash()} priority=${detail?.rendererPriorityAtExit()}",
-                            )
-                            // Revoke the dead document immediately. Changing both keys disposes
-                            // this AndroidView and creates a fresh Chromium renderer + navigation
-                            // capability on the next committed composition.
-                            navigationGuard.invalidate(navigationSession)
-                            if (webView === goneView || goneView == null) webView = null
-                            rendererGeneration++
-                            currentOnPlaybackError?.invoke(
-                                playbackKey,
-                                "Video server renderer stopped",
-                                navigationSession.request.streamUrl,
-                                currentPositionMs,
-                            )
-                        },
-                    )
-                    web.webChromeClient = EmbedNavigationWebChromeClient(
+                        } else {
+                            targetWeb.loadUrl(activeUrl, headers)
+                        }
+                    }
+
+                    // A reused WebView does not synchronously remove its old media document when
+                    // loadUrl(new) is called. Silence it first, commit a blank document, and only
+                    // then install the next episode. This prevents two Chromium media surfaces (or
+                    // their audio) from coexisting during Next/SUB-DUB/source transitions.
+                    web.webChromeClient = WebChromeClient()
+                    web.webViewClient = EmbedTeardownWebViewClient(
                         session = navigationSession,
                         guard = navigationGuard,
-                        onFullscreenChanged = { fullscreen ->
-                            currentOnFullscreenChanged(fullscreen)
+                        transitionGate = documentTransitionGate,
+                        onBlankCommitted = { blankView ->
+                            loadRequestedDocument(blankView)
                         },
+                        onRenderProcessGoneAccepted = handleRendererGone,
                     )
                     DiagnosticsLog.event(
-                        "EmbedWebView loadUrl host=${activeUrl.hostOrNone()} " +
-                            "generation=${navigationSession.generation} headers=${headers.keys.joinToString()}",
+                        "EmbedWebView teardown before navigation generation=${navigationSession.generation}",
                     )
-                    if (usesAllAnimeIframeShell) {
-                        // OK.ru returns a blank document when opened as a top-level WebView page.
-                        // The captured browser flow loads it as an iframe from AllAnime, which
-                        // also supplies the required iframe navigation metadata and referer.
-                        web.loadDataWithBaseURL(
-                            activeReferer,
-                            allAnimeIframeShell(activeUrl),
-                            "text/html",
-                            "UTF-8",
-                            null,
-                        )
-                    } else {
-                        web.loadUrl(activeUrl, headers)
-                    }
+                    beginEmbedDocumentTeardown(
+                        webView = web,
+                        session = navigationSession,
+                        guard = navigationGuard,
+                        transitionGate = documentTransitionGate,
+                    )
                 }
             },
             onRelease = { view ->
                 val web = view as? WebView ?: return@AndroidView
-                (web.tag as? EmbedNavigationSession)?.let(navigationGuard::invalidate)
+                (web.tag as? EmbedNavigationSession)?.let { releasedSession ->
+                    documentTransitionGate.invalidate(releasedSession)
+                    navigationGuard.invalidate(releasedSession)
+                }
                 if (webView === web) webView = null
                 val releasedUrl = runCatching { web.url }.getOrNull()
                 DiagnosticsLog.event(
@@ -1067,20 +1126,19 @@ fun EmbedWebView(
             },
         )
 
-        // The same starvation for servers we cannot script: web players only raise their chrome on
-        // interaction, so swallowing taps is what keeps the provider's bar down and leaves ours the
-        // only one on screen. A tap while our bar is already up is handed to the page instead —
-        // that summons the provider's controls, the sole way to scrub on these servers, and the
-        // screen stays theirs until the pass-through window closes.
+        // For cross-origin players we cannot identify or command the content video. Never synthesize
+        // a blind tap at an arbitrary coordinate: Kiwi-like pages may place a second player or ad
+        // there. The first tap only removes our overlay; the viewer's next real tap reaches the
+        // provider's own controls unchanged.
         if (fallbackControlsActive && !providerControlsMode) Box(
             Modifier
                 .fillMaxSize()
                 .pointerInput(navigationSession.generation) {
-                    detectTapGestures { offset ->
+                    detectTapGestures {
                         if (fallbackControlsVisible) {
                             fallbackControlsVisible = false
                             providerControlsMode = true
-                            dispatchWebTap(webView, offset.x, offset.y)
+                            webView?.requestFocus()
                         } else {
                             fallbackControlsVisible = true
                             fallbackInteraction++
@@ -1177,14 +1235,13 @@ fun EmbedWebView(
                     onClick = { currentOnPreviousEpisode?.invoke(playbackKey) },
                 )
                 PlayerControlIconButton(
-                    "Play or pause",
-                    Icons.Default.PlayArrow,
+                    "Use provider controls",
+                    Icons.Default.TouchApp,
                     onClick = {
-                        DiagnosticsLog.event("EmbedWebView fallback playPause")
-                        // Nothing scripted reaches this player, but a touch does, so press the
-                        // picture where a finger would. Dead centre is where providers park their
-                        // own next-episode overlay, hence the aim above it.
-                        dispatchWebTapAt(webView, 0.5f, 0.32f)
+                        DiagnosticsLog.event("EmbedWebView exposing cross-origin provider controls")
+                        fallbackControlsVisible = false
+                        providerControlsMode = true
+                        webView?.requestFocus()
                         fallbackInteraction++
                     },
                 )
@@ -1417,7 +1474,10 @@ private fun authenticatedProgressPollJs(
         }
         try {
           var v = findContentVideo();
-          if (v) observeVideo(v);
+          __aniliPauseCompetingMedia(v);
+          if (v) {
+            observeVideo(v);
+          }
           if (v && !window.__aniliVideoReported) {
             window.__aniliVideoReported = true;
             AniliProgress.onVideoAvailable(capabilityToken, navigationToken);
@@ -1506,6 +1566,65 @@ internal fun captionCss(style: CaptionStyle): String {
 private const val DOM_CAPTION_SELECTORS =
     ".plyr__caption, .vjs-text-track-cue > div, .jw-text-track-cue, .art-subtitle"
 
+private const val APP_PROVIDER_CONTROLS_STYLE_ID = "anili-provider-controls-style"
+
+private const val PROVIDER_CONTROL_SELECTORS =
+    ".plyr__controls, .vjs-control-bar, .jw-controlbar, .art-controls, " +
+        ".dplayer-controller, .media-control, .mejs__controls"
+
+/** Hides provider chrome only in documents where AniLili can control the selected content video. */
+internal fun providerControlsVisibilityJs(
+    hidden: Boolean,
+    navigationGeneration: Long,
+): String {
+    val css = if (hidden) {
+        "$PROVIDER_CONTROL_SELECTORS { opacity: 0 !important; visibility: hidden !important; " +
+            "pointer-events: none !important; }"
+    } else {
+        ""
+    }
+    return """
+        (function() {
+          ${embedNavigationJsGuard(navigationGeneration)}
+          ${embedContentVideoSelectorJs()}
+          var css = ${css.toJsStringLiteral()};
+          function apply(doc) {
+            if (!doc) return;
+            var style = doc.getElementById('$APP_PROVIDER_CONTROLS_STYLE_ID');
+            if (!css) {
+              if (style && style.parentNode) style.parentNode.removeChild(style);
+            } else {
+              if (!style) {
+                style = doc.createElement('style');
+                style.id = '$APP_PROVIDER_CONTROLS_STYLE_ID';
+                (doc.head || doc.documentElement).appendChild(style);
+              }
+              style.textContent = css;
+            }
+            var frames = doc.querySelectorAll('iframe');
+            for (var i = 0; i < frames.length; i++) {
+              try { apply(frames[i].contentDocument); } catch (e) { /* cross-origin */ }
+            }
+          }
+          apply(document);
+          var video = findContentVideo();
+          if (video) {
+            if (css) {
+              if (video.__aniliHadNativeControls === undefined) {
+                video.__aniliHadNativeControls = video.hasAttribute('controls');
+              }
+              video.controls = false;
+              video.removeAttribute('controls');
+            } else if (video.__aniliHadNativeControls !== undefined) {
+              if (video.__aniliHadNativeControls) video.setAttribute('controls', '');
+              video.controls = !!video.__aniliHadNativeControls;
+              delete video.__aniliHadNativeControls;
+            }
+          }
+        })();
+    """.trimIndent()
+}
+
 private fun CaptionEdgeStyle.toCssTextShadow(): String = when (this) {
     CaptionEdgeStyle.NONE -> "none"
     CaptionEdgeStyle.OUTLINE ->
@@ -1549,6 +1668,7 @@ internal fun togglePlaybackCommandJs(
           report(false, video); return;
         }
         if (video.paused || video.ended) {
+          __aniliPauseCompetingMedia(video);
           var playResult = video.play();
           if (playResult && typeof playResult.then === 'function') {
             playResult.then(function() { report(!video.paused, video); })
@@ -1557,7 +1677,7 @@ internal fun togglePlaybackCommandJs(
             setTimeout(function() { report(!video.paused, video); }, 0);
           }
         } else {
-          video.pause();
+          __aniliPauseAllMedia();
           setTimeout(function() { report(video.paused, video); }, 0);
         }
         setTimeout(function() { report(false, video); }, 1200);
@@ -1742,59 +1862,116 @@ private fun applyDeviceVolume(audioManager: android.media.AudioManager?, value: 
 }
 
 /**
- * Presses the page the way a finger would. A cross-origin embed refuses every scripted route into
- * its player, but a real touch on the WebView reaches whatever sits under it, iframe or not — so
- * this is how the app's own bar relays play/pause, and how it hands a tap back to the provider.
+ * Revokes and silences the committed document before asking Chromium to replace it with blank.
+ * The callback is capability-checked because a faster Next/source request may supersede this one
+ * while JavaScript from the outgoing page is still completing.
  */
-private fun dispatchWebTap(webView: WebView?, x: Float, y: Float) {
-    val web = webView ?: return
-    val downAt = SystemClock.uptimeMillis()
-    val down = MotionEvent.obtain(downAt, downAt, MotionEvent.ACTION_DOWN, x, y, 0)
-    val up = MotionEvent.obtain(downAt, downAt + 48L, MotionEvent.ACTION_UP, x, y, 0)
-    runCatching {
-        web.dispatchTouchEvent(down)
-        web.dispatchTouchEvent(up)
+private fun beginEmbedDocumentTeardown(
+    webView: WebView,
+    session: EmbedNavigationSession,
+    guard: EmbedNavigationGuard,
+    transitionGate: EmbedDocumentTransitionGate,
+) {
+    var blankRequested = false
+    fun requestBlankIfCurrent() {
+        if (
+            blankRequested ||
+            !guard.isCurrent(session) ||
+            webView.tag !== session ||
+            !transitionGate.markBlankRequested(session)
+        ) {
+            return
+        }
+        blankRequested = true
+        runCatching { webView.stopLoading() }
+        runCatching { webView.loadUrl(EMBED_BLANK_DOCUMENT_URL) }
     }
-    down.recycle()
-    up.recycle()
-}
 
-/** [dispatchWebTap] aimed at a fraction of the view's own box, for callers without pixels. */
-private fun dispatchWebTapAt(webView: WebView?, xFraction: Float, yFraction: Float) {
-    val web = webView ?: return
-    if (web.width <= 0 || web.height <= 0) return
-    dispatchWebTap(web, web.width * xFraction, web.height * yFraction)
+    val teardownScript = "$REVOKE_EMBED_NAVIGATION_JS\n$SILENCE_EMBED_MEDIA_JS"
+    // onPause is instance-local and immediately suspends cross-origin media that JavaScript cannot
+    // reach. The target document is resumed only after the blank commit.
+    runCatching { webView.onPause() }
+    val dispatched = runCatching {
+        webView.evaluateJavascript(teardownScript) { requestBlankIfCurrent() }
+    }.isSuccess
+    if (!dispatched) requestBlankIfCurrent()
+    webView.postDelayed({ requestBlankIfCurrent() }, EMBED_TEARDOWN_JS_MAX_WAIT_MS)
 }
 
 private fun stopWebPlayback(webView: WebView) {
     DiagnosticsLog.event("EmbedWebView stop playback url=${webView.url ?: "none"}")
-    runCatching { webView.evaluateJavascript(PAUSE_VIDEO_JS, null) }
     // pauseTimers() is process-wide and can freeze OAuth and hidden resolver WebViews.
-    webView.onPause()
-    webView.stopLoading()
-    webView.loadUrl("about:blank")
+    runCatching { webView.onPause() }
+    var blankRequested = false
+    fun finishStop() {
+        if (blankRequested) return
+        blankRequested = true
+        runCatching { webView.stopLoading() }
+        runCatching { webView.loadUrl(EMBED_BLANK_DOCUMENT_URL) }
+    }
+    val dispatched = runCatching {
+        webView.evaluateJavascript(SILENCE_EMBED_MEDIA_JS) { finishStop() }
+    }.isSuccess
+    if (!dispatched) finishStop()
+    webView.postDelayed({ finishStop() }, EMBED_TEARDOWN_JS_MAX_WAIT_MS)
 }
 
-private val PAUSE_VIDEO_JS = """
+/** A paused Activity remains STARTED; WebView media may resume only with a truly resumed owner. */
+internal fun shouldResumeEmbedForLifecycleState(state: Lifecycle.State?): Boolean =
+    state == null || state.isAtLeast(Lifecycle.State.RESUMED)
+
+internal fun shouldResumeEmbedForLifecycleEvent(event: Lifecycle.Event): Boolean =
+    event == Lifecycle.Event.ON_RESUME
+
+/** Reversible lifecycle pause: never changes mute or volume state. */
+internal fun pauseEmbedMediaForLifecycleJs(): String = """
     (function() {
-      function pauseVideos(root) {
-        var videos = root.querySelectorAll('video');
-        for (var i = 0; i < videos.length; i++) {
-          videos[i].pause();
+      function pauseMedia(root) {
+        var media = root.querySelectorAll('video,audio');
+        for (var i = 0; i < media.length; i++) {
+          try { media[i].pause(); } catch (e) { /* detached media */ }
         }
-      }
-      try {
-        pauseVideos(document);
-        var frames = document.querySelectorAll('iframe');
-        for (var i = 0; i < frames.length; i++) {
+        var frames = root.querySelectorAll('iframe');
+        for (var j = 0; j < frames.length; j++) {
           try {
-            var d = frames[i].contentDocument;
-            if (d) pauseVideos(d);
+            var child = frames[j].contentDocument;
+            if (child) pauseMedia(child);
           } catch (e) { /* cross-origin */ }
         }
-      } catch (e) { /* ignored */ }
+      }
+      try { pauseMedia(document); } catch (e) { /* ignored */ }
     })();
 """.trimIndent()
+
+/** Terminal teardown: pause and silence every reachable media element before blanking. */
+internal fun silenceEmbedMediaForTeardownJs(): String = """
+    (function() {
+      function silenceMedia(root) {
+        var media = root.querySelectorAll('video,audio');
+        for (var i = 0; i < media.length; i++) {
+          try {
+            media[i].pause();
+            media[i].defaultMuted = true;
+            media[i].muted = true;
+            media[i].volume = 0;
+          } catch (e) { /* detached media */ }
+        }
+        var frames = root.querySelectorAll('iframe');
+        for (var j = 0; j < frames.length; j++) {
+          try {
+            var child = frames[j].contentDocument;
+            if (child) silenceMedia(child);
+          } catch (e) { /* cross-origin */ }
+        }
+      }
+      try { silenceMedia(document); } catch (e) { /* ignored */ }
+    })();
+""".trimIndent()
+
+private val PAUSE_EMBED_MEDIA_JS = pauseEmbedMediaForLifecycleJs()
+private val SILENCE_EMBED_MEDIA_JS = silenceEmbedMediaForTeardownJs()
+
+private const val EMBED_TEARDOWN_JS_MAX_WAIT_MS = 250L
 
 private tailrec fun Context.findLifecycleOwner(): LifecycleOwner? = when (this) {
     is LifecycleOwner -> this
@@ -1810,6 +1987,51 @@ private fun isInSkipWindow(positionMs: Long, startMs: Long?, endMs: Long?): Bool
 
 private fun String?.hostOrNone(): String =
     this?.let { runCatching { Uri.parse(it).host }.getOrNull() } ?: "none"
+
+/** Client used only while the outgoing episode is being replaced by `about:blank`. */
+private class EmbedTeardownWebViewClient(
+    private val session: EmbedNavigationSession,
+    private val guard: EmbedNavigationGuard,
+    private val transitionGate: EmbedDocumentTransitionGate,
+    private val onBlankCommitted: (WebView) -> Unit,
+    private val onRenderProcessGoneAccepted: (WebView?, RenderProcessGoneDetail?) -> Unit,
+) : WebViewClient() {
+    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+        if (request?.isForMainFrame != true) return false
+        return request.url?.toString() != EMBED_BLANK_DOCUMENT_URL
+    }
+
+    override fun onPageFinished(view: WebView?, url: String?) {
+        val blank = view ?: return
+        if (
+            guard.isCurrent(session) &&
+            blank.tag === session &&
+            transitionGate.acceptBlankFinished(session, url, blank.url)
+        ) {
+            DiagnosticsLog.event(
+                "EmbedWebView blank committed generation=${session.generation}",
+            )
+            onBlankCommitted(blank)
+        } else {
+            DiagnosticsLog.event(
+                "EmbedWebView ignored stale/non-blank teardown finish " +
+                    "generation=${session.generation} callback=${url.hostOrNone()}",
+            )
+        }
+    }
+
+    override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+        if (guard.isCurrent(session)) {
+            transitionGate.invalidate(session)
+            onRenderProcessGoneAccepted(view, detail)
+        } else {
+            DiagnosticsLog.event(
+                "EmbedWebView ignored stale teardown renderer callback generation=${session.generation}",
+            )
+        }
+        return true
+    }
+}
 
 private class EmbedNavigationWebChromeClient(
     private val session: EmbedNavigationSession,
