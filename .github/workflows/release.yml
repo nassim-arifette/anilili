@@ -236,7 +236,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: Publish immutable GitHub Release
+    name: Publish verified GitHub Release
     needs:
       - build
       - sign
@@ -259,7 +259,7 @@ jobs:
           apk_name="anilili-plus-v${{ needs.build.outputs.version }}.apk"
           sha256sum --check "${apk_name}.sha256"
 
-      - name: Create immutable GitHub Release
+      - name: Create GitHub Release without replacing an existing tag
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
