@@ -56,17 +56,28 @@ base64 -w 0 release-signing.jks
 
 1. Increase both `versionCode` and `versionName` in `app/build.gradle.kts`.
 2. Merge and push the change to `main`.
-3. Run **Actions > Publish signed APK > Run workflow** from `main`. The workflow creates the
+3. Enable repository release immutability once, before publishing the first protected release:
+
+   ```bash
+   gh api --method PUT \
+     -H "X-GitHub-Api-Version: 2026-03-10" \
+     repos/nassim-arifette/anilili/immutable-releases
+   ```
+
+   Verify the same endpoint returns `"enabled": true`. This setting protects future releases;
+   it does not retroactively make `v0.2.0` immutable.
+4. Run **Actions > Publish signed APK > Run workflow** from `main`. The workflow creates the
    matching version tag after all verification succeeds.
-4. Confirm that the workflow tests the app and publishes exactly one release APK plus its SHA-256
-   checksum.
+5. Confirm that the workflow tests the app and publishes exactly one release APK plus its SHA-256
+   checksum, and that the release API reports `"immutable": true`.
 
 The workflow only accepts the exact current `main` commit and a three-part numeric version. It
 builds and tests without access to the signing key, aligns and signs in a separate protected job
 that never executes repository code, refuses to replace an existing release, and requires both
 `versionCode` and the semantic `versionName` to exceed the preceding release. It checks the
-application id, version code, version name, alignment, single signer, and pinned signing certificate
-before creating `AniLili+ v<version>`.
+application id, version code, version name, alignment, single signer, and pinned signing certificate,
+then uploads both assets to a draft, verifies their GitHub digests, and publishes the completed draft
+as the immutable `AniLili+ v<version>` release.
 
 The in-app updater requires the matching exact APK asset and GitHub SHA-256 digest, then checks the
 downloaded package, version code, and signing certificate before enabling Android's installer.
