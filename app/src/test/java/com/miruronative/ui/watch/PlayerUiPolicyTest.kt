@@ -59,6 +59,54 @@ class PlayerUiPolicyTest {
     }
 
     @Test
+    fun `skip action has a reserved non-overlapping slot at supported player geometries`() {
+        val cases = listOf(
+            Triple(320f, 180f, PlayerChromeLayout.MINIMAL),
+            Triple(390f, 220f, PlayerChromeLayout.COMPACT),
+            Triple(520f, 280f, PlayerChromeLayout.CINEMA),
+            Triple(840f, 390f, PlayerChromeLayout.CINEMA),
+        )
+
+        cases.forEach { (widthDp, heightDp, expectedLayout) ->
+            assertEquals(expectedLayout, playerChromeLayout(widthDp, heightDp))
+            assertEquals(true, playerTransportClearsFooter(widthDp, heightDp))
+            assertEquals(true, playerActionClearsReservedChrome(widthDp, heightDp))
+        }
+        assertEquals(
+            PlayerChromeActionPresentation.ICON_ONLY,
+            playerChromeActionPresentation(widthDp = 320f, heightDp = 180f),
+        )
+        listOf(390f to 220f, 520f to 280f, 840f to 390f).forEach { (widthDp, heightDp) ->
+            assertEquals(
+                PlayerChromeActionPresentation.LABELED,
+                playerChromeActionPresentation(widthDp, heightDp),
+            )
+        }
+    }
+
+    @Test
+    fun `minimal action keeps full accessible labels while larger chrome shows them`() {
+        val labels = listOf(
+            "Skip Intro",
+            "Skip Outro",
+            "Skip Mixed Opening",
+            "Skip Mixed Ending",
+            "Skip Recap",
+            "Next Episode",
+        )
+
+        labels.forEach { label ->
+            val minimal = playerChromeActionContent(label, PlayerChromeActionPresentation.ICON_ONLY)
+            assertEquals(null, minimal.visibleLabel)
+            assertEquals(label, minimal.contentDescription)
+
+            val labeled = playerChromeActionContent(label, PlayerChromeActionPresentation.LABELED)
+            assertEquals(label.uppercase(), labeled.visibleLabel)
+            assertEquals(label, labeled.contentDescription)
+        }
+    }
+
+    @Test
     fun `settings only expose capabilities supported by active player`() {
         val sections = availablePlayerSettingsSections(
             PlayerSettingsAvailability(

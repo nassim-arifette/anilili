@@ -56,6 +56,7 @@ internal fun EmbedTouchControls(
     isFullscreen: Boolean = false,
     onFullscreen: (() -> Unit)? = null,
     onInteract: () -> Unit = {},
+    primaryAction: PlayerChromeAction? = null,
 ) {
     PlayerControlsScaffold(
         isPlaying = isPlaying,
@@ -73,6 +74,7 @@ internal fun EmbedTouchControls(
         episodeTitle = episodeTitle,
         onExitFullscreen = if (isFullscreen) onFullscreen else null,
         onInteract = onInteract,
+        primaryAction = primaryAction,
         modifier = modifier,
     ) {
         PlayerControlIconButton(

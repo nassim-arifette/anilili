@@ -11,6 +11,41 @@ internal enum class PlayerChromeLayout {
     CINEMA,
 }
 
+/**
+ * The skip/next action shares the header row with metadata on layouts that can show a readable
+ * label. Minimal inline chrome reserves one 48 dp corner target instead: its title metadata is
+ * already hidden and the icon stays horizontally clear of the centred transport cluster.
+ */
+internal enum class PlayerChromeActionPresentation {
+    ICON_ONLY,
+    LABELED,
+}
+
+internal fun playerChromeActionPresentation(
+    widthDp: Float,
+    heightDp: Float,
+    fontScale: Float = 1f,
+): PlayerChromeActionPresentation = when (playerChromeLayout(widthDp, heightDp, fontScale)) {
+    PlayerChromeLayout.MINIMAL -> PlayerChromeActionPresentation.ICON_ONLY
+    PlayerChromeLayout.COMPACT,
+    PlayerChromeLayout.CINEMA,
+    -> PlayerChromeActionPresentation.LABELED
+}
+
+internal data class PlayerChromeActionContent(
+    val visibleLabel: String?,
+    val contentDescription: String,
+)
+
+/** Minimal chrome may hide only the glyph's text; assistive technology always gets the full label. */
+internal fun playerChromeActionContent(
+    label: String,
+    presentation: PlayerChromeActionPresentation,
+): PlayerChromeActionContent = PlayerChromeActionContent(
+    visibleLabel = label.uppercase().takeIf { presentation == PlayerChromeActionPresentation.LABELED },
+    contentDescription = label,
+)
+
 internal fun playerChromeLayout(
     widthDp: Float,
     heightDp: Float,
@@ -57,7 +92,9 @@ internal fun playerChromeVerticalMetrics(layout: PlayerChromeLayout): PlayerChro
     )
     PlayerChromeLayout.CINEMA -> PlayerChromeVerticalMetrics(
         transportSizeDp = 70f,
-        transportOffsetDp = 0f,
+        // At the smallest cinema geometry (520 x 280), centring the 70 dp play target at y=140
+        // intruded into the 112 dp timeline/footer reservation. Eight dp upward keeps both clear.
+        transportOffsetDp = -8f,
         footerHeightDp = 112f,
     )
 }
@@ -72,6 +109,41 @@ internal fun playerTransportClearsFooter(
     val transportBottom = heightDp / 2f + metrics.transportOffsetDp + metrics.transportSizeDp / 2f
     val footerTop = heightDp - metrics.footerHeightDp
     return transportBottom <= footerTop
+}
+
+/**
+ * Mirrors the action/header placement in [PlayerControlsScaffold]. Labeled actions are measured as
+ * part of the header row, so Row allocation keeps them disjoint from metadata. Minimal chrome has
+ * vertical overlap with transport by design; this check proves that its 48 dp end-corner slot is
+ * horizontally disjoint from the three-button transport cluster and vertically above the footer.
+ */
+internal fun playerActionClearsReservedChrome(
+    widthDp: Float,
+    heightDp: Float,
+    fontScale: Float = 1f,
+): Boolean {
+    val layout = playerChromeLayout(widthDp, heightDp, fontScale)
+    val metrics = playerChromeVerticalMetrics(layout)
+    val horizontalPadding = when (layout) {
+        PlayerChromeLayout.MINIMAL -> 8f
+        PlayerChromeLayout.COMPACT -> 12f
+        PlayerChromeLayout.CINEMA -> 24f
+    }
+    val headerTop = if (layout == PlayerChromeLayout.CINEMA) 12f else 4f
+    val actionBottom = headerTop + 48f
+    val footerTop = heightDp - metrics.footerHeightDp
+    if (actionBottom > footerTop) return false
+
+    val transportTop = heightDp / 2f + metrics.transportOffsetDp - metrics.transportSizeDp / 2f
+    if (actionBottom <= transportTop) return true
+
+    // Only minimal chrome is allowed to rely on horizontal separation. Its cluster contains the
+    // 48 dp rewind/forward targets, a 52 dp play target, and two 2 dp gaps.
+    if (layout != PlayerChromeLayout.MINIMAL) return false
+    val actionStart = widthDp - horizontalPadding - 48f
+    val transportWidth = 48f + 2f + metrics.transportSizeDp + 2f + 48f
+    val transportEnd = widthDp / 2f + transportWidth / 2f
+    return transportEnd <= actionStart
 }
 
 internal enum class PlayerSettingsSection(val title: String) {
