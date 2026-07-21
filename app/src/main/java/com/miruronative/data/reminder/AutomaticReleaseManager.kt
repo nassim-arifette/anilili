@@ -5,10 +5,12 @@ import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -28,6 +30,7 @@ import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.library.LibraryStore
 import com.miruronative.data.model.Media
 import com.miruronative.data.settings.SettingsStore
+import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.nav.Routes
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
@@ -36,7 +39,7 @@ import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 
 @Serializable
-private data class ReleaseAlarm(
+internal data class ReleaseAlarm(
     val id: String,
     val mediaId: Int,
     val episode: Int,
@@ -65,9 +68,17 @@ object AutomaticReleaseManager {
         )
         val oldestUseful = System.currentTimeMillis() / 1000L - 24 * 60 * 60
         synchronized(lock) {
-            alarms = read().filter { it.airingAt >= oldestUseful }
-            alarms.forEach(::schedule)
-            persist(alarms)
+            val decoded = read()
+            // Migrate away from the old id.hashCode() PendingIntent identity. Application startup
+            // only loads state; the package-replaced receiver explicitly restores retained alarms.
+            decoded.forEach(::cancelLegacy)
+            // One media has exactly one "next episode" release alarm. Keep the newest persisted
+            // record if an interrupted historical reconciliation left older identities behind.
+            val retained = decoded.filter { it.airingAt >= oldestUseful }.distinctBy { it.mediaId }
+            val retainedIds = retained.mapTo(hashSetOf(), ReleaseAlarm::id)
+            decoded.filterNot { it.id in retainedIds }.forEach(::cancel)
+            replaceAlarms(retained)
+            restoreAlarmsLocked(AlarmRestorationCause.PROCESS_START)
         }
     }
 
@@ -91,12 +102,20 @@ object AutomaticReleaseManager {
             )
         }.distinctBy { it.id }
 
-        val desiredIds = desired.mapTo(hashSetOf()) { it.id }
         synchronized(lock) {
-            alarms.filterNot { it.id in desiredIds }.forEach(::cancel)
-            desired.forEach(::schedule)
-            alarms = desired
-            persist(alarms)
+            val plan = planReleaseAlarmReconciliation(alarms, desired)
+            val previousIds = alarms.mapTo(hashSetOf(), ReleaseAlarm::id)
+            // Install every desired alarm before removing obsolete identities. If scheduling
+            // fails, the previous alarm remains available and WorkManager can retry safely.
+            plan.desired.forEach(::schedule)
+            if (!replaceAlarms(plan.desired, durable = true)) {
+                plan.desired.filterNot { it.id in previousIds }.forEach(::cancel)
+                error("Could not persist automatic release alarm reconciliation")
+            }
+            plan.obsolete.forEach {
+                cancel(it)
+                cancelLegacy(it)
+            }
         }
     }
 
@@ -104,16 +123,37 @@ object AutomaticReleaseManager {
         if (!::appContext.isInitialized) return
         synchronized(lock) {
             alarms.forEach(::cancel)
-            alarms = emptyList()
-            persist(alarms)
+            alarms.forEach(::cancelLegacy)
+            replaceAlarms(emptyList())
         }
     }
 
-    fun markDelivered(id: String?) {
-        if (id == null || !::appContext.isInitialized) return
-        synchronized(lock) {
-            alarms = alarms.filterNot { it.id == id }
-            persist(alarms)
+    /** Returns canonical persisted data only for the first durably claimed delivery. */
+    internal fun claimDelivery(id: String?): ReleaseAlarm? {
+        if (id == null || !::appContext.isInitialized) return null
+        return synchronized(lock) {
+            val claim = claimAlarmDelivery(alarms, id, ReleaseAlarm::id)
+            val delivered = claim.delivered ?: return@synchronized null
+            if (!replaceAlarms(claim.remaining, durable = true)) {
+                DiagnosticsLog.event("Automatic release durable claim failed id=$id")
+                return@synchronized null
+            }
+            cancel(delivered)
+            cancelLegacy(delivered)
+            delivered
+        }
+    }
+
+    /** Recreates alarms only for an explicit boot/package-replacement event, never process start. */
+    internal fun restoreAlarms() {
+        if (!::appContext.isInitialized) return
+        synchronized(lock) { restoreAlarmsLocked(AlarmRestorationCause.BOOT_OR_PACKAGE_REPLACEMENT) }
+    }
+
+    private fun restoreAlarmsLocked(cause: AlarmRestorationCause) {
+        alarmsForRestoration(alarms, cause).forEach { alarm ->
+            runCatching { schedule(alarm) }
+                .onFailure { DiagnosticsLog.throwable("Automatic release restore failed id=${alarm.id}", it) }
         }
     }
 
@@ -133,7 +173,23 @@ object AutomaticReleaseManager {
         }
     }
 
-    private fun pendingIntent(alarm: ReleaseAlarm, mode: Int): PendingIntent? = PendingIntent.getBroadcast(
+    private fun pendingIntent(alarm: ReleaseAlarm, mode: Int): PendingIntent? {
+        val identity = automaticReleaseIntentIdentity(alarm.mediaId, alarm.episode, alarm.airingAt)
+        return PendingIntent.getBroadcast(
+            appContext,
+            0,
+            Intent(appContext, AutomaticReleaseReceiver::class.java)
+                .setAction(identity.action)
+                .setData(Uri.parse(identity.data))
+                .putExtra("releaseId", alarm.id)
+                .putExtra("mediaId", alarm.mediaId)
+                .putExtra("episode", alarm.episode)
+                .putExtra("title", alarm.title),
+            mode or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    private fun legacyPendingIntent(alarm: ReleaseAlarm, mode: Int): PendingIntent? = PendingIntent.getBroadcast(
         appContext,
         alarm.id.hashCode(),
         Intent(appContext, AutomaticReleaseReceiver::class.java)
@@ -144,9 +200,25 @@ object AutomaticReleaseManager {
         mode or PendingIntent.FLAG_IMMUTABLE,
     )
 
-    private fun persist(value: List<ReleaseAlarm>) {
+    private fun cancelLegacy(alarm: ReleaseAlarm) {
+        legacyPendingIntent(alarm, PendingIntent.FLAG_NO_CREATE)?.let { pending ->
+            appContext.getSystemService(AlarmManager::class.java).cancel(pending)
+            pending.cancel()
+        }
+    }
+
+    @SuppressLint("ApplySharedPref") // Delivery claims must reach disk before notification.
+    private fun replaceAlarms(value: List<ReleaseAlarm>, durable: Boolean = false): Boolean {
         val raw = json.encodeToString(ListSerializer(ReleaseAlarm.serializer()), value)
-        appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_ALARMS, raw).apply()
+        val editor = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_ALARMS, raw)
+        val persisted = if (durable) editor.commit() else {
+            editor.apply()
+            true
+        }
+        if (persisted) alarms = value
+        return persisted
     }
 
     private fun read(): List<ReleaseAlarm> {
@@ -160,15 +232,16 @@ object AutomaticReleaseManager {
 
 class AutomaticReleaseReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        AutomaticReleaseManager.markDelivered(intent.getStringExtra("releaseId"))
-        ReleaseSyncScheduler.runNow(context)
+        val alarm = AutomaticReleaseManager.claimDelivery(intent.getStringExtra("releaseId")) ?: return
+        runCatching { ReleaseSyncScheduler.runNow(context) }
+            .onFailure { DiagnosticsLog.throwable("Release sync enqueue after delivery failed", it) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) return
 
-        val mediaId = intent.getIntExtra("mediaId", 0)
-        val episode = intent.getIntExtra("episode", 0)
-        val title = intent.getStringExtra("title") ?: "A saved anime"
+        val mediaId = alarm.mediaId
+        val episode = alarm.episode
+        val title = alarm.title
         val open = PendingIntent.getActivity(
             context,
             mediaId,
@@ -191,7 +264,7 @@ class AutomaticReleaseReceiver : BroadcastReceiver() {
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
         val manager = context.getSystemService(NotificationManager::class.java)
-        manager.notify(17 * mediaId + episode, notification)
+        manager.notify(automaticReleaseNotificationTag(alarm.id), 0, notification)
         // Group summary so multiple release alerts collapse into one expandable entry.
         manager.notify(
             -1002,
