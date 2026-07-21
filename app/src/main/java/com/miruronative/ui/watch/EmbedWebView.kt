@@ -484,8 +484,19 @@ fun EmbedWebView(
             }
         },
     )
+    val managedControlsReady: () -> Boolean = {
+        canUseManagedEmbedControls(
+            managedControlsDeclared = playbackMode.controlsPlayback,
+            bridgePlaybackAvailable = webPlaybackAvailable,
+            activeMediaIdentity = activeConcreteMediaIdentity,
+            reportedMediaIdentity = webMediaIdentity,
+        )
+    }
     val requestSeek: (Long?, ((Boolean) -> Unit)?) -> Boolean = { target, onResult ->
-        if (target == null) false else dispatchWebCommand(
+        if (target == null || !managedControlsReady()) {
+            onResult?.invoke(false)
+            false
+        } else dispatchWebCommand(
             webView = webView,
             session = navigationSession,
             guard = navigationGuard,
@@ -514,7 +525,7 @@ fun EmbedWebView(
         )
     }
     val requestTogglePlayback: () -> Boolean = {
-        dispatchWebCommand(
+        if (!managedControlsReady()) false else dispatchWebCommand(
             webView = webView,
             session = navigationSession,
             guard = navigationGuard,
@@ -573,12 +584,8 @@ fun EmbedWebView(
         onDispose { currentOnPlaybackStopperChanged?.invoke(null) }
     }
 
-    val canControlPlayback = canUseManagedEmbedControls(
-        managedControlsDeclared = playbackMode.controlsPlayback,
-        bridgePlaybackAvailable = webPlaybackAvailable,
-        activeMediaIdentity = activeConcreteMediaIdentity,
-        reportedMediaIdentity = webMediaIdentity,
-    )
+    val canControlPlayback = managedControlsReady()
+    val controlledMediaInstanceId = activeConcreteMediaIdentity?.mediaInstanceId
     val canAutomatePlayback = canControlPlayback && playbackMode.automatesEpisode
     // Full touch controls — seek bar and all — whenever the injected JS can reach the <video>.
     val touchControlsActive = canControlPlayback && !device.isTv && loadError == null
@@ -762,11 +769,23 @@ fun EmbedWebView(
     // (history.replaceState), which must not re-trigger the explicit app navigation.
     val lastRequestedGeneration = remember { object { var value: Long = 0L } }
 
-    LaunchedEffect(webPlaybackAvailable, playbackSpeed, webView, navigationSession.generation) {
+    LaunchedEffect(
+        canControlPlayback,
+        controlledMediaInstanceId,
+        playbackSpeed,
+        webView,
+        navigationSession.generation,
+    ) {
         val web = webView ?: return@LaunchedEffect
-        if (!webPlaybackAvailable || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
+        val expectedMedia = webMediaIdentity ?: return@LaunchedEffect
+        if (!canControlPlayback || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
         web.evaluateJavascript(
-            SET_PLAYBACK_SPEED_JS(playbackSpeed, navigationSession.generation),
+            setPlaybackSpeedJs(
+                speed = playbackSpeed,
+                navigationGeneration = navigationSession.generation,
+                expectedMediaIdentity = expectedMedia.mediaId,
+                expectedMediaGeneration = expectedMedia.generation,
+            ),
             null,
         )
     }
@@ -774,9 +793,15 @@ fun EmbedWebView(
     // Best-effort: reaches the main document and same-origin iframes only, exactly like the
     // progress poll. A cross-origin embed renders its own captions out of our reach, and some
     // providers burn subtitles into the video, where there is nothing to style at all.
-    LaunchedEffect(webPlaybackAvailable, captionStyle, webView, navigationSession.generation) {
+    LaunchedEffect(
+        canControlPlayback,
+        controlledMediaInstanceId,
+        captionStyle,
+        webView,
+        navigationSession.generation,
+    ) {
         val web = webView ?: return@LaunchedEffect
-        if (!webPlaybackAvailable || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
+        if (!canControlPlayback || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
         web.evaluateJavascript(
             CAPTION_STYLE_JS(captionStyle, navigationSession.generation),
             null,
@@ -1608,7 +1633,7 @@ fun EmbedWebView(
                 positionMs = positionMs,
                 durationMs = durationMs,
                 isPlaying = webIsPlaying,
-                isMuted = (if (webPlaybackAvailable) webVolume else deviceVolume) <= 0.001f,
+                isMuted = (if (canControlPlayback) webVolume else deviceVolume) <= 0.001f,
                 hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
                 playPauseFocusRequester = tvPlayPauseFocus,
@@ -1625,9 +1650,15 @@ fun EmbedWebView(
                 },
                 onNext = { currentOnNextEpisode?.invoke(playbackKey) },
                 onVolumeDown = {
-                    DiagnosticsLog.event("EmbedWebView TV control volumeDown available=$webPlaybackAvailable")
-                    if (webPlaybackAvailable) {
-                        adjustWebVolume(webView, -0.1f, navigationSession, navigationGuard) { volume ->
+                    DiagnosticsLog.event("EmbedWebView TV control volumeDown available=$canControlPlayback")
+                    if (canControlPlayback) {
+                        adjustWebVolume(
+                            webView = webView,
+                            delta = -0.1f,
+                            session = navigationSession,
+                            guard = navigationGuard,
+                            mediaIdentity = webMediaIdentity,
+                        ) { volume ->
                             webVolume = volume
                             if (volume > 0f) lastAudibleVolume = volume
                         }
@@ -1638,11 +1669,17 @@ fun EmbedWebView(
                     }
                 },
                 onToggleMute = {
-                    DiagnosticsLog.event("EmbedWebView TV control toggleMute available=$webPlaybackAvailable")
-                    if (webPlaybackAvailable) {
+                    DiagnosticsLog.event("EmbedWebView TV control toggleMute available=$canControlPlayback")
+                    if (canControlPlayback) {
                         if (webVolume > 0.001f) lastAudibleVolume = webVolume
                         val target = if (webVolume > 0.001f) 0f else lastAudibleVolume.coerceAtLeast(0.1f)
-                        setWebVolume(webView, target, navigationSession, navigationGuard) { webVolume = it }
+                        setWebVolume(
+                            webView = webView,
+                            volume = target,
+                            session = navigationSession,
+                            guard = navigationGuard,
+                            mediaIdentity = webMediaIdentity,
+                        ) { webVolume = it }
                     } else {
                         val current = readDeviceVolume(embedAudioManager)
                         if (current > 0.001f) lastAudibleVolume = current
@@ -1651,9 +1688,15 @@ fun EmbedWebView(
                     }
                 },
                 onVolumeUp = {
-                    DiagnosticsLog.event("EmbedWebView TV control volumeUp available=$webPlaybackAvailable")
-                    if (webPlaybackAvailable) {
-                        adjustWebVolume(webView, 0.1f, navigationSession, navigationGuard) { volume ->
+                    DiagnosticsLog.event("EmbedWebView TV control volumeUp available=$canControlPlayback")
+                    if (canControlPlayback) {
+                        adjustWebVolume(
+                            webView = webView,
+                            delta = 0.1f,
+                            session = navigationSession,
+                            guard = navigationGuard,
+                            mediaIdentity = webMediaIdentity,
+                        ) { volume ->
                             webVolume = volume
                             lastAudibleVolume = volume
                         }
@@ -1788,14 +1831,23 @@ private fun authenticatedProgressPollJs(
     })();
 """.trimIndent()
 
-/** Capability-scoped command; same-origin iframe limitations are unchanged. */
-private fun SET_PLAYBACK_SPEED_JS(speed: Float, navigationGeneration: Long): String = """
+/** Identity-scoped command; same-origin iframe limitations are unchanged. */
+internal fun setPlaybackSpeedJs(
+    speed: Float,
+    navigationGeneration: Long,
+    expectedMediaIdentity: String,
+    expectedMediaGeneration: Long,
+): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
       ${embedContentVideoSelectorJs()}
+      var expectedMediaIdentity = ${expectedMediaIdentity.toJsStringLiteral()};
+      var expectedMediaGeneration = $expectedMediaGeneration;
       try {
         var v = findContentVideo();
         if (!v) return false;
+        if (__aniliMediaIdentity(v) !== expectedMediaIdentity ||
+            __aniliMediaGeneration(v) !== expectedMediaGeneration) return false;
         v.defaultPlaybackRate = $speed;
         v.playbackRate = $speed;
         return Math.abs(v.playbackRate - $speed) < 0.01;
@@ -2045,12 +2097,13 @@ private fun dispatchWebCommand(
     onResolved: (EmbedCommandResolution) -> Unit,
 ): Boolean {
     val web = webView ?: return false
+    val expectedMedia = mediaIdentity?.takeIf { it.isValid } ?: return false
     if (!guard.isCurrent(session)) return false
     val command = coordinator.issue(
         navigationGeneration = session.generation,
         kind = kind,
         nowMs = SystemClock.uptimeMillis(),
-        mediaIdentity = mediaIdentity,
+        mediaIdentity = expectedMedia,
     )
     callbacks[command.id] = onResolved
     val dispatched = runCatching {
@@ -2077,20 +2130,24 @@ private fun adjustWebVolume(
     delta: Float,
     session: EmbedNavigationSession,
     guard: EmbedNavigationGuard,
+    mediaIdentity: EmbedVideoIdentity?,
     onChanged: (Float) -> Unit,
 ) {
     val web = webView ?: return
+    val expectedMedia = mediaIdentity?.takeIf { it.isValid } ?: return
     if (!guard.isCurrent(session)) return
     runCatching {
         web.evaluateJavascript(
-            WEB_VOLUME_JS(
+            webVolumeJs(
                 delta = delta,
                 absolute = null,
                 navigationGeneration = session.generation,
+                expectedMediaIdentity = expectedMedia.mediaId,
+                expectedMediaGeneration = expectedMedia.generation,
             ),
         ) { result ->
             if (guard.isCurrent(session)) {
-                result.toFloatOrNull()?.coerceIn(0f, 1f)?.let(onChanged)
+                result.toFloatOrNull()?.takeIf { it in 0f..1f }?.let(onChanged)
             }
         }
     }
@@ -2101,35 +2158,49 @@ private fun setWebVolume(
     volume: Float,
     session: EmbedNavigationSession,
     guard: EmbedNavigationGuard,
+    mediaIdentity: EmbedVideoIdentity?,
     onChanged: (Float) -> Unit,
 ) {
     val web = webView ?: return
+    val expectedMedia = mediaIdentity?.takeIf { it.isValid } ?: return
     if (!guard.isCurrent(session)) return
     runCatching {
         web.evaluateJavascript(
-            WEB_VOLUME_JS(
+            webVolumeJs(
                 delta = null,
                 absolute = volume,
                 navigationGeneration = session.generation,
+                expectedMediaIdentity = expectedMedia.mediaId,
+                expectedMediaGeneration = expectedMedia.generation,
             ),
         ) { result ->
             if (guard.isCurrent(session)) {
-                result.toFloatOrNull()?.coerceIn(0f, 1f)?.let(onChanged)
+                result.toFloatOrNull()?.takeIf { it in 0f..1f }?.let(onChanged)
             }
         }
     }
 }
 
-private fun WEB_VOLUME_JS(delta: Float?, absolute: Float?, navigationGeneration: Long): String {
+internal fun webVolumeJs(
+    delta: Float?,
+    absolute: Float?,
+    navigationGeneration: Long,
+    expectedMediaIdentity: String,
+    expectedMediaGeneration: Long,
+): String {
     val targetExpression = absolute?.coerceIn(0f, 1f)?.toString()
         ?: "Math.max(0, Math.min(1, v.volume + ${delta ?: 0f}))"
     return """
         (function() {
           ${embedNavigationJsGuard(navigationGeneration)}
           ${embedContentVideoSelectorJs()}
+          var expectedMediaIdentity = ${expectedMediaIdentity.toJsStringLiteral()};
+          var expectedMediaGeneration = $expectedMediaGeneration;
           try {
             var v = findContentVideo();
             if (!v) return -1;
+            if (__aniliMediaIdentity(v) !== expectedMediaIdentity ||
+                __aniliMediaGeneration(v) !== expectedMediaGeneration) return -1;
             v.volume = $targetExpression;
             v.muted = v.volume <= 0;
             return v.muted ? 0 : v.volume;
