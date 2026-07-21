@@ -639,13 +639,27 @@ fun PlayerSurface(
             return@LaunchedEffect
         }
 
-        if (
-            autoplay &&
-            !outroAutoHandled &&
-            isInSkipWindow(positionMs, outroStartMs, outroEndMs)
+        when (
+            outroSkipAction(
+                autoSkip = autoSkipIntroOutro,
+                autoplay = autoplay,
+                hasNextEpisode = hasNextEpisode,
+                isPlaying = activeController.isPlaying,
+                alreadyHandled = outroAutoHandled,
+                positionMs = positionMs,
+                startMs = outroStartMs,
+                endMs = outroEndMs,
+            )
         ) {
-            outroAutoHandled = true
-            onNextEpisode()
+            OutroSkipAction.NONE -> Unit
+            OutroSkipAction.SEEK_TO_END -> {
+                outroAutoHandled = true
+                activeController.seekTo(outroEndMs ?: return@LaunchedEffect)
+            }
+            OutroSkipAction.NEXT_EPISODE -> {
+                outroAutoHandled = true
+                onNextEpisode()
+            }
         }
     }
 
@@ -995,7 +1009,11 @@ fun PlayerSurface(
             introEndMs != null && positionMs in introStartMs..introEndMs ->
                 "Skip Intro" to { controller?.seekTo(introEndMs); Unit }
             outroStartMs != null && outroEndMs != null && positionMs in outroStartMs..outroEndMs ->
-                "Next Episode" to onNextEpisode
+                if (hasNextEpisode) {
+                    "Next Episode" to onNextEpisode
+                } else {
+                    "Skip Outro" to { controller?.seekTo(outroEndMs); Unit }
+                }
             else -> null
         }
         LaunchedEffect(action?.first, playerView, device.isTv, focusPlayerOnStart) {

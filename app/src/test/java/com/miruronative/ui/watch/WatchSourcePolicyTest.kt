@@ -152,6 +152,50 @@ class WatchSourcePolicyTest {
     }
 
     @Test
+    fun `auto skip seeks past outro when autoplay is disabled`() {
+        assertEquals(
+            OutroSkipAction.SEEK_TO_END,
+            outroSkipAction(true, false, true, true, false, 1_305_000, 1_300_000, 1_390_000),
+        )
+    }
+
+    @Test
+    fun `auto skip advances only when autoplay has a next episode`() {
+        assertEquals(
+            OutroSkipAction.NEXT_EPISODE,
+            outroSkipAction(true, true, true, true, false, 1_305_000, 1_300_000, 1_390_000),
+        )
+        assertEquals(
+            OutroSkipAction.SEEK_TO_END,
+            outroSkipAction(true, true, false, true, false, 1_305_000, 1_300_000, 1_390_000),
+        )
+    }
+
+    @Test
+    fun `outro policy ignores disabled handled and out of range cases`() {
+        assertEquals(
+            OutroSkipAction.NONE,
+            outroSkipAction(false, true, true, true, false, 1_305_000, 1_300_000, 1_390_000),
+        )
+        assertEquals(
+            OutroSkipAction.NONE,
+            outroSkipAction(true, true, true, true, true, 1_305_000, 1_300_000, 1_390_000),
+        )
+        assertEquals(
+            OutroSkipAction.NONE,
+            outroSkipAction(true, true, true, true, false, 1_200_000, 1_300_000, 1_390_000),
+        )
+    }
+
+    @Test
+    fun `paused playback never triggers automatic outro behavior`() {
+        assertEquals(
+            OutroSkipAction.NONE,
+            outroSkipAction(true, true, true, false, false, 1_305_000, 1_300_000, 1_390_000),
+        )
+    }
+
+    @Test
     fun `navigation spine removes duplicate rows and orders episode numbers`() {
         val preferred = ProviderData("bonk", listOf(episode(1), episode(2)), emptyList())
         val noisy = ProviderData("hop", listOf(episode(2), episode(1), episode(2), episode(3)), emptyList())

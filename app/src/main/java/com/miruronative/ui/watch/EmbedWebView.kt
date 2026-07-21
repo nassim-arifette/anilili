@@ -443,6 +443,7 @@ fun EmbedWebView(
     LaunchedEffect(
         autoSkipIntroOutro,
         autoplay,
+        webIsPlaying,
         webView,
         positionMs,
         introStartMs,
@@ -450,7 +451,7 @@ fun EmbedWebView(
         outroStartMs,
         outroEndMs,
     ) {
-        if (!autoSkipIntroOutro || positionMs <= 0L) return@LaunchedEffect
+        if (!autoSkipIntroOutro || !webIsPlaying || positionMs <= 0L) return@LaunchedEffect
 
         if (!introAutoSkipped && isInSkipWindow(positionMs, introStartMs, introEndMs)) {
             introAutoSkipped = true
@@ -458,14 +459,27 @@ fun EmbedWebView(
             return@LaunchedEffect
         }
 
-        if (
-            autoplay &&
-            !outroAutoHandled &&
-            currentOnNextEpisode != null &&
-            isInSkipWindow(positionMs, outroStartMs, outroEndMs)
+        when (
+            outroSkipAction(
+                autoSkip = autoSkipIntroOutro,
+                autoplay = autoplay,
+                hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
+                isPlaying = webIsPlaying,
+                alreadyHandled = outroAutoHandled,
+                positionMs = positionMs,
+                startMs = outroStartMs,
+                endMs = outroEndMs,
+            )
         ) {
-            outroAutoHandled = true
-            currentOnNextEpisode?.invoke()
+            OutroSkipAction.NONE -> Unit
+            OutroSkipAction.SEEK_TO_END -> {
+                outroAutoHandled = true
+                seekWebVideo(webView, outroEndMs)
+            }
+            OutroSkipAction.NEXT_EPISODE -> {
+                outroAutoHandled = true
+                currentOnNextEpisode?.invoke()
+            }
         }
     }
 
@@ -919,9 +933,12 @@ fun EmbedWebView(
                 "Skip Intro" to { seekWebVideo(webView, introEndMs) }
             outroStartMs != null &&
                 outroEndMs != null &&
-                currentOnNextEpisode != null &&
                 isInSkipWindow(positionMs, outroStartMs, outroEndMs) ->
-                "Next Episode" to { currentOnNextEpisode?.invoke() }
+                if (currentHasNextEpisode && currentOnNextEpisode != null) {
+                    "Next Episode" to { currentOnNextEpisode?.invoke() }
+                } else {
+                    "Skip Outro" to { seekWebVideo(webView, outroEndMs) }
+                }
             else -> null
         }
         action?.let { (label, onClick) ->
