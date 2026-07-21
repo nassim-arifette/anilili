@@ -146,7 +146,7 @@ object FlixcloudBridge {
                     val current = active
                     main.postDelayed({
                         if (current != null && active === current) {
-                            finishOnMain(current, FlixcloudResolvedStream(url), "request")
+                            finishOnMain(current, FlixcloudResolvedStream(url, playlistKey = null), "request")
                         }
                     }, 250)
                 } else if (isHlsUrl(url)) {
