@@ -117,6 +117,7 @@ fun EmbedWebView(
     onToggleFullscreen: (() -> Unit)? = null,
     onFullscreenChanged: (Boolean) -> Unit = {},
     onProgress: ((EmbedPlaybackKey, Long, Long) -> Unit)? = null,
+    onPlaybackEnded: ((EmbedPlaybackCompletion) -> Boolean)? = null,
     onPlaybackError: ((EmbedPlaybackKey, String, String, Long) -> Unit)? = null,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
 ) {
@@ -171,6 +172,7 @@ fun EmbedWebView(
     val currentOnPlaybackStopperChanged by rememberUpdatedState(onPlaybackStopperChanged)
     val currentOnFullscreenChanged by rememberUpdatedState(onFullscreenChanged)
     val currentOnProgress by rememberUpdatedState(onProgress)
+    val currentOnPlaybackEnded by rememberUpdatedState(onPlaybackEnded)
     val currentOnPreviousEpisode by rememberUpdatedState(onPreviousEpisode)
     val currentOnNextEpisode by rememberUpdatedState(onNextEpisode)
     val currentHasPreviousEpisode by rememberUpdatedState(hasPreviousEpisode)
@@ -261,16 +263,36 @@ fun EmbedWebView(
                     webIsPlaying = false
                     positionMs = sample.positionMs
                     durationMs = sample.durationMs
-                    currentOnProgress?.invoke(playbackKey, sample.positionMs, sample.durationMs)
-                    if (
-                        autoAdvanceGate.tryAdvance(
-                            navigationToken = navigationToken,
-                            autoplay = autoplay,
-                            hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
+                    val completion = EmbedPlaybackCompletion(
+                        playbackKey = playbackKey,
+                        reportedPositionMs = sample.positionMs,
+                        durationMs = sample.durationMs,
+                        observedPlayingSamples = sample.observedPlayingSamples,
+                    )
+                    val committed = finalizeEmbedCompletionThenNavigate(
+                        completion = completion,
+                        shouldNavigate =
+                            autoplay && currentHasNextEpisode && currentOnNextEpisode != null,
+                        commit = currentOnPlaybackEnded ?: { false },
+                        navigate = {
+                            if (
+                                autoAdvanceGate.tryAdvance(
+                                    navigationToken = navigationToken,
+                                    autoplay = true,
+                                    hasNextEpisode = true,
+                                )
+                            ) {
+                                DiagnosticsLog.event(
+                                    "EmbedWebView auto advance reason=ended token=$navigationToken",
+                                )
+                                currentOnNextEpisode?.invoke(playbackKey)
+                            }
+                        },
+                    )
+                    if (!committed) {
+                        DiagnosticsLog.event(
+                            "EmbedWebView withheld autoplay after uncommitted end token=$navigationToken",
                         )
-                    ) {
-                        DiagnosticsLog.event("EmbedWebView auto advance reason=ended token=$navigationToken")
-                        currentOnNextEpisode?.invoke(playbackKey)
                     }
                 }
             }

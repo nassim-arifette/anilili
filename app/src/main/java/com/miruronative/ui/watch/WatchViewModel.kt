@@ -672,6 +672,7 @@ class WatchViewModel : ViewModel() {
     private var confirmedHistoryIdentity: PlaybackIdentity? = null
     private var activeNativePlaybackIdentity: NativePlaybackIdentity? = null
     private var committedNativePlaybackIdentity: NativePlaybackIdentity? = null
+    private var committedEmbedPlaybackKey: EmbedPlaybackKey? = null
 
     fun onNativePlaybackIdentityChanged(identity: NativePlaybackIdentity) {
         val data = (_state.value as? UiState.Success)?.data ?: return
@@ -802,6 +803,72 @@ class WatchViewModel : ViewModel() {
         )
     }
 
+    /** Commits a verified WebView natural end to disk before the caller may autoplay Next. */
+    fun onEmbedPlaybackEnded(completion: EmbedPlaybackCompletion): Boolean {
+        val data = (_state.value as? UiState.Success)?.data ?: return false
+        if (data.isResolving) return false
+        val commit = planEmbedCompletionCommit(
+            completion = completion,
+            currentPlaybackKey = data.embedPlaybackKey(),
+            alreadyCommitted = committedEmbedPlaybackKey == completion.playbackKey,
+        ) ?: run {
+            DiagnosticsLog.event(
+                "Watch ignored stale/invalid embed end episode=${fmt(completion.playbackKey.episodeNumber)} " +
+                    "generation=${completion.playbackKey.sourceGeneration}",
+            )
+            return false
+        }
+        val entry = HistoryEntry(
+            anilistId = commit.playbackKey.animeId,
+            title = data.seriesTitle,
+            cover = data.artworkUrl,
+            episodeNumber = commit.playbackKey.episodeNumber,
+            episodeTitle = data.current.title,
+            provider = commit.playbackKey.provider,
+            category = commit.playbackKey.category,
+            positionMs = commit.positionMs,
+            durationMs = commit.durationMs,
+        )
+        if (!LibraryStore.upsertHistoryDurably(entry)) {
+            DiagnosticsLog.event(
+                "Watch embed end disk commit failed episode=${fmt(commit.playbackKey.episodeNumber)}",
+            )
+            return false
+        }
+        val persisted = LibraryStore.historyFor(commit.playbackKey.animeId)
+        if (
+            persisted == null ||
+            persisted.episodeNumber != commit.playbackKey.episodeNumber ||
+            persisted.positionMs != commit.positionMs ||
+            persisted.durationMs != commit.durationMs
+        ) {
+            DiagnosticsLog.event(
+                "Watch embed end persistence verification failed " +
+                    "episode=${fmt(commit.playbackKey.episodeNumber)}",
+            )
+            return false
+        }
+        val progressIdentity = PlaybackIdentity(
+            animeId = commit.playbackKey.animeId,
+            episodeNumber = commit.playbackKey.episodeNumber,
+            generation = commit.playbackKey.sourceGeneration,
+            mediaId = data.chosenStream?.url
+                ?: "embed:${commit.playbackKey.provider}:${commit.playbackKey.category}",
+        )
+        committedEmbedPlaybackKey = commit.playbackKey
+        confirmedHistoryIdentity = progressIdentity
+        lastKnownProgress = PlaybackProgress(progressIdentity, commit.positionMs, commit.durationMs)
+        lastProgressSaveIdentity = progressIdentity
+        lastProgressSave = SystemClock.elapsedRealtime()
+        maybeSyncAniListProgress(progressIdentity, commit.positionMs, commit.durationMs, totalEpisodes)
+        DiagnosticsLog.event(
+            "Watch embed end committed episode=${fmt(commit.playbackKey.episodeNumber)} " +
+                "positionMs=${commit.positionMs}",
+        )
+        _state.value = UiState.Success(data.copy(startPositionMs = commit.positionMs))
+        return true
+    }
+
     /** Native progress must identify the MediaItem that actually produced the callback. */
     fun onNativeProgress(
         identity: PlaybackIdentity,
@@ -874,6 +941,7 @@ class WatchViewModel : ViewModel() {
         lastProgressSaveIdentity = null
         lastKnownProgress = null
         confirmedHistoryIdentity = null
+        committedEmbedPlaybackKey = null
     }
 
     private fun WatchData.playbackTarget(): ActivePlaybackTarget = ActivePlaybackTarget(
