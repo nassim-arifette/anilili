@@ -303,7 +303,7 @@ fun PlayerSurface(
     onEnded: (NativePlaybackCompletion, PlaybackNavigationIdentity) -> Unit,
     onNextEpisode: () -> Unit,
     onPlaybackIdentityChanged: (NativePlaybackIdentity) -> Unit,
-    onError: (String, String, Long) -> Unit,
+    onError: (PlaybackIdentity, String, String, Long) -> Unit,
     modifier: Modifier = Modifier,
     onToggleFullscreen: (() -> Unit)? = null,
     startPositionMs: Long = 0,
@@ -374,6 +374,9 @@ fun PlayerSurface(
     var nextStartPositionMs by remember(playbackSessionKey) { mutableLongStateOf(startPositionMs) }
     var playbackIsPlaying by remember(playbackSessionKey) { mutableStateOf(false) }
     var confirmedPlaybackIdentity by remember(playbackSessionKey) { mutableStateOf<PlaybackIdentity?>(null) }
+    var confirmedNativePlaybackIdentity by remember(playbackSessionKey) {
+        mutableStateOf<NativePlaybackIdentity?>(null)
+    }
     var tracksRevision by remember(playbackSessionKey) { mutableIntStateOf(0) }
     // One same-stream retry at a capped resolution before giving the provider up: weak TV
     // decoders (Fire TV's OMX.MS.AVC) can die on 1080p with a codec error even though the
@@ -449,8 +452,12 @@ fun PlayerSurface(
                         val item = activeController.currentMediaItem
                         val identity = item?.nativePlaybackIdentity()
                         val navigationIdentity = item?.playbackNavigationIdentityOrNull()
-                        if (identity == null || navigationIdentity == null) {
-                            DiagnosticsLog.event("PlayerSurface ignored end without playback identity")
+                        if (
+                            identity == null ||
+                            navigationIdentity == null ||
+                            !isConfirmedNativeTerminalEvent(identity, confirmedNativePlaybackIdentity)
+                        ) {
+                            DiagnosticsLog.event("PlayerSurface ignored unconfirmed/stale terminal event")
                         } else {
                             currentOnEnded(
                                 NativePlaybackCompletion(
@@ -467,16 +474,26 @@ fun PlayerSurface(
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     playbackIsPlaying = isPlaying
                     if (isPlaying) {
-                        activeController.currentMediaItem?.playbackIdentityOrNull()?.let {
-                            confirmedPlaybackIdentity = it
-                        }
+                        val item = activeController.currentMediaItem
+                        item?.playbackIdentityOrNull()?.let { confirmedPlaybackIdentity = it }
+                        item?.nativePlaybackIdentity()?.let { confirmedNativePlaybackIdentity = it }
                     }
                     DiagnosticsLog.event("PlayerSurface isPlaying=$isPlaying")
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
                     DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
-                    val failedMediaId = activeController.currentMediaItem?.mediaId
+                    val failedItem = activeController.currentMediaItem
+                    val failedIdentity = failedItem?.playbackIdentityOrNull()
+                    val failedMediaId = failedItem?.mediaId
+                    if (
+                        failedIdentity == null ||
+                        failedMediaId == null ||
+                        !isSamePlaybackSession(failedIdentity, playbackIdentity)
+                    ) {
+                        DiagnosticsLog.event("PlayerSurface ignored error without current playback identity")
+                        return
+                    }
                     if (
                         error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED &&
                         decoderRetryPolicy.tryConsumeRetry(failedMediaId)
@@ -496,8 +513,9 @@ fun PlayerSurface(
                         return
                     }
                     currentOnError(
+                        failedIdentity,
                         error.localizedMessage ?: "Playback failed",
-                        activeController.currentMediaItem?.mediaId.orEmpty(),
+                        failedMediaId,
                         activeController.currentPosition.coerceAtLeast(0L),
                     )
                 }
@@ -629,10 +647,12 @@ fun PlayerSurface(
             positionMs = activeController.currentPosition.coerceAtLeast(0)
             durationMs = activeController.duration.coerceAtLeast(0)
             if (activeController.isPlaying) {
-                activeController.currentMediaItem?.playbackIdentityOrNull()?.let { identity ->
+                val item = activeController.currentMediaItem
+                item?.playbackIdentityOrNull()?.let { identity ->
                     confirmedPlaybackIdentity = identity
                     currentOnProgress?.invoke(identity, positionMs, durationMs, true)
                 }
+                item?.nativePlaybackIdentity()?.let { confirmedNativePlaybackIdentity = it }
             }
             delay(500)
         }

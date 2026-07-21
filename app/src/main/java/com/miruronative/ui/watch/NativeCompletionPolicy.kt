@@ -13,6 +13,12 @@ data class NativePlaybackCompletion(
     val durationMs: Long,
 )
 
+/** A queued terminal event is trusted only after that exact MediaItem was observed playing. */
+internal fun isConfirmedNativeTerminalEvent(
+    reported: NativePlaybackIdentity,
+    confirmed: NativePlaybackIdentity?,
+): Boolean = reported == confirmed
+
 internal data class NativeCompletionCommit(
     val identity: NativePlaybackIdentity,
     val positionMs: Long,
