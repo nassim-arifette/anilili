@@ -48,6 +48,7 @@ streams play with ExoPlayer; embed providers and fallback playback use WebView.
 | `app/src/main/java/com/miruronative/ui` | Compose screens and player UI |
 | `docs/PIPE_PROTOCOL.md` | Notes about the Miruro pipe format |
 | `docs/KNOWN_ISSUES.md` | Checklist of fixed and remaining issues from code review |
+| `docs/FEATURE_IDEAS.md` | Prioritized product and playback feature backlog |
 | `showcase/mobile` | Six optimized 540×1170 WebP screenshots |
 
 ## Build
@@ -55,7 +56,7 @@ streams play with ExoPlayer; embed providers and fallback playback use WebView.
 Requirements:
 
 - JDK 17
-- Android Studio or Android SDK API 35
+- Android Studio or Android SDK API 36
 - Gradle 8.13 if building from the command line without a generated wrapper
 
 Android Studio:
@@ -77,7 +78,7 @@ On Windows, use:
 gradlew.bat assembleDebug
 ```
 
-The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
+The debug APK is generated at `app/build/outputs/apk/debug/anilili.apk`.
 
 ## Notes
 
