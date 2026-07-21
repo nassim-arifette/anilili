@@ -253,20 +253,30 @@ class ReleaseSyncWorker(
             val localSaved = fetchCompleteSnapshot(LibraryStore.watchlist.value) { saved ->
                 repo.animeInfo(saved.anilistId)
             }
-            if (AuthManager.isLoggedIn) {
+            // Capture one account generation. Network results from this worker may only affect
+            // notifications and alarms while that exact account still owns the session.
+            val accountGeneration = AuthManager.current()?.let { AuthManager.sessionGeneration() }
+            if (accountGeneration != null) {
                 runCatching {
                     val (items, unread) = repo.notifications(markAllRead = false)
-                    NotificationCenter.setUnread(unread)
-                    AniListNotificationPushManager.notifyUnread(applicationContext, items)
+                    AuthManager.commitIfSessionCurrent(accountGeneration) {
+                        NotificationCenter.setUnread(unread)
+                        AniListNotificationPushManager.notifyUnread(applicationContext, items)
+                    }
                 }
 
                 val aniListTracked = anilistTrackedMedia(repo)
                 val aniListIds = aniListTracked.mapTo(hashSetOf()) { it.id }
                 // AniList notifications are now the canonical push source for logged-in users.
                 // Keep local alarms only for device-only saves that AniList cannot notify about.
-                AutomaticReleaseManager.sync(localSaved.filterNot { it.id in aniListIds })
+                AuthManager.commitIfSessionCurrent(accountGeneration) {
+                    AutomaticReleaseManager.sync(localSaved.filterNot { it.id in aniListIds })
+                }
             } else {
-                AutomaticReleaseManager.sync(localSaved.distinctBy { it.id })
+                AuthManager.commitIfLoggedOut {
+                    NotificationCenter.setUnread(0)
+                    AutomaticReleaseManager.sync(localSaved.distinctBy { it.id })
+                }
             }
             Result.success()
         } catch (error: Exception) {

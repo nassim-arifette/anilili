@@ -7,12 +7,15 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.miruronative.MainActivity
 import com.miruronative.R
 import com.miruronative.data.model.AppNotification
+import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.nav.Routes
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
@@ -29,8 +32,10 @@ object AniListNotificationPushManager {
     private const val KEY_DELIVERED_IDS = "delivered_ids"
     private const val MAX_DELIVERED_IDS = 400
     private const val MAX_PUSHES_PER_SYNC = 8
+    private const val NOTIFICATION_TAG = "anilist-account"
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    private val deliveryLock = Any()
     private lateinit var appContext: Context
 
     fun init(context: Context) {
@@ -41,38 +46,60 @@ object AniListNotificationPushManager {
     fun notifyUnread(context: Context, items: List<AppNotification>) {
         val app = if (::appContext.isInitialized) appContext else context.applicationContext.also {
             appContext = it
-            createChannel(it)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            return
+        createChannel(app)
+        val manager = app.getSystemService(NotificationManager::class.java) ?: return
+        if (!canPostNotifications(app, manager)) return
+
+        synchronized(deliveryLock) {
+            // Re-check while holding the same lock as the ledger. Permission or channel state can
+            // change while a worker is waiting behind another delivery.
+            if (!canPostNotifications(app, manager)) return
+            val delivered = readDelivered(app)
+            val selected = selectNotificationsForDelivery(items, delivered, MAX_PUSHES_PER_SYNC)
+            if (selected.isEmpty()) return
+
+            val successfullyPosted = selected.asReversed()
+                .filter { item -> notify(app, manager, item) }
+                .mapTo(hashSetOf(), AppNotification::id)
+            if (successfullyPosted.isEmpty()) return
+
+            val successfulIdsInFeedOrder = selected
+                .map(AppNotification::id)
+                .filter(successfullyPosted::contains)
+            val nextLedger = updateDeliveredLedger(
+                deliveredIds = delivered,
+                successfullyPostedIds = successfulIdsInFeedOrder,
+                limit = MAX_DELIVERED_IDS,
+            )
+            if (!writeDelivered(app, nextLedger)) {
+                DiagnosticsLog.event("AniList notification ledger commit failed")
+                successfullyPosted.forEach { manager.cancel(NOTIFICATION_TAG, it) }
+                return
+            }
+            postGroupSummary(app, manager)
         }
-
-        val delivered = readDelivered(app)
-        val deliveredSet = delivered.toHashSet()
-        val freshUnread = items.filter { it.unread && it.id !in deliveredSet }
-        if (freshUnread.isEmpty()) return
-
-        freshUnread
-            .take(MAX_PUSHES_PER_SYNC)
-            .asReversed()
-            .forEach { item -> notify(app, item) }
-        postGroupSummary(app)
-
-        writeDelivered(
-            app,
-            (freshUnread.map { it.id } + delivered)
-                .distinct()
-                .take(MAX_DELIVERED_IDS),
-        )
     }
 
     fun clearDelivered(context: Context) {
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .remove(KEY_DELIVERED_IDS)
-            .apply()
+        val app = context.applicationContext
+        synchronized(deliveryLock) {
+            app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_DELIVERED_IDS)
+                .commit()
+        }
+    }
+
+    /** Clears every account-owned surface when logging out or replacing the AniList account. */
+    fun resetAccountState(context: Context) {
+        val app = context.applicationContext
+        synchronized(deliveryLock) {
+            val deliveredIds = readDelivered(app)
+            clearDelivered(app)
+            dismissAll(app, deliveredIds)
+            NotificationCenter.setUnread(0)
+        }
     }
 
     /**
@@ -81,20 +108,29 @@ object AniListNotificationPushManager {
      * so the shade never shows entries the app already considers handled.
      */
     fun dismissAll(context: Context) {
-        val manager = context.applicationContext.getSystemService(NotificationManager::class.java) ?: return
-        runCatching {
-            manager.activeNotifications
-                .filter { it.notification.channelId == CHANNEL_ID }
-                .forEach { manager.cancel(it.id) }
+        synchronized(deliveryLock) {
+            dismissAll(context.applicationContext, emptyList())
         }
     }
 
-    private fun notify(context: Context, item: AppNotification) {
+    private fun dismissAll(context: Context, knownIds: List<Int>) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        knownIds.forEach { manager.cancel(NOTIFICATION_TAG, it) }
+        manager.cancel(NOTIFICATION_TAG, SUMMARY_ID)
+        runCatching {
+            manager.activeNotifications
+                .filter { it.tag == NOTIFICATION_TAG || it.notification.channelId == CHANNEL_ID }
+                .forEach { manager.cancel(it.tag, it.id) }
+        }
+    }
+
+    private fun notify(context: Context, manager: NotificationManager, item: AppNotification): Boolean {
         val route = item.mediaId?.let(Routes::detail) ?: Routes.NOTIFICATIONS
         val open = PendingIntent.getActivity(
             context,
             item.id,
             Intent(context, MainActivity::class.java).apply {
+                data = Uri.parse("anililiplus://notification/anilist/${item.id}")
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra(Routes.EXTRA_ROUTE, route)
             },
@@ -119,16 +155,22 @@ object AniListNotificationPushManager {
             .setCategory(NotificationCompat.CATEGORY_EVENT)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
-        context.getSystemService(NotificationManager::class.java)
-            .notify(item.id, notification)
+        return runCatching {
+            manager.notify(NOTIFICATION_TAG, item.id, notification)
+            true
+        }.getOrElse { error ->
+            DiagnosticsLog.throwable("AniList notification ${item.id} was not posted", error)
+            false
+        }
     }
 
     /** Without a summary, Android never collapses the group — each push stays a separate row. */
-    private fun postGroupSummary(context: Context) {
+    private fun postGroupSummary(context: Context, manager: NotificationManager) {
         val open = PendingIntent.getActivity(
             context,
             SUMMARY_ID,
             Intent(context, MainActivity::class.java).apply {
+                data = Uri.parse("anililiplus://notification/anilist/summary")
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra(Routes.EXTRA_ROUTE, Routes.NOTIFICATIONS)
             },
@@ -143,7 +185,8 @@ object AniListNotificationPushManager {
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_EVENT)
             .build()
-        context.getSystemService(NotificationManager::class.java).notify(SUMMARY_ID, summary)
+        runCatching { manager.notify(NOTIFICATION_TAG, SUMMARY_ID, summary) }
+            .onFailure { DiagnosticsLog.throwable("AniList notification summary was not posted", it) }
     }
 
     private const val SUMMARY_ID = -1001
@@ -162,6 +205,20 @@ object AniListNotificationPushManager {
         )
     }
 
+    private fun canPostNotifications(context: Context, manager: NotificationManager): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return false
+        }
+        if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return false
+        val channel = manager.getNotificationChannel(CHANNEL_ID) ?: return false
+        return channel.importance != NotificationManager.IMPORTANCE_NONE
+    }
+
     private fun readDelivered(context: Context): List<Int> {
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_DELIVERED_IDS, null)
@@ -171,11 +228,11 @@ object AniListNotificationPushManager {
         }.getOrDefault(emptyList())
     }
 
-    private fun writeDelivered(context: Context, ids: List<Int>) {
+    private fun writeDelivered(context: Context, ids: List<Int>): Boolean {
         val raw = json.encodeToString(ListSerializer(Int.serializer()), ids)
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_DELIVERED_IDS, raw)
-            .apply()
+            .commit()
     }
 }
