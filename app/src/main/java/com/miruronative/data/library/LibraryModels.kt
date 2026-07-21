@@ -2,7 +2,13 @@ package com.miruronative.data.library
 
 import kotlinx.serialization.Serializable
 
-/** One history record per anime: the last episode watched plus an optional continuation target. */
+/**
+ * One history record per anime: the last episode watched plus an optional continuation target.
+ *
+ * [episodeWatchProgress] is deliberately sparse. Remote list services expose a single aggregate
+ * episode number, but the device must not infer that opening episode 90 means episodes 1-89 were
+ * actually played. Older saved JSON has no map and remains valid through the empty default.
+ */
 @Serializable
 data class HistoryEntry(
     val anilistId: Int,
@@ -21,6 +27,8 @@ data class HistoryEntry(
     val continuationEpisodeNumber: Double? = null,
     /** Completed final episodes stay in viewing history but are hidden from Continue Watching. */
     val completed: Boolean = false,
+    /** Actual locally observed progress, keyed by the canonical string form of an episode number. */
+    val episodeWatchProgress: Map<String, Float> = emptyMap(),
     val updatedAt: Long = 0,
 ) {
     private val activeContinuationEpisodeNumber: Double?
@@ -30,6 +38,37 @@ data class HistoryEntry(
 
     val progressFraction: Float
         get() = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+
+    private val currentEpisodeWatchFraction: Float
+        get() = if (completed || activeContinuationEpisodeNumber != null) 1f else progressFraction
+
+    /** Locally observed progress for exactly [episodeNumber], without sequential inference. */
+    fun watchFractionFor(episodeNumber: Double): Float {
+        if (!episodeNumber.isFinite()) return 0f
+        val recorded = episodeWatchProgress[episodeNumber.episodeProgressKey()]
+            ?.normalizedWatchFraction()
+            ?: 0f
+        val current = if (this.episodeNumber == episodeNumber) currentEpisodeWatchFraction else 0f
+        return maxOf(recorded, current)
+    }
+
+    /** Fraction of the whole series that this device has actually observed. */
+    fun seriesWatchFraction(totalEpisodes: Int): Float {
+        if (totalEpisodes <= 0) return 0f
+        val observed = linkedMapOf<Double, Float>()
+        episodeWatchProgress.forEach { (key, fraction) ->
+            val episode = key.toDoubleOrNull()?.takeIf(Double::isFinite) ?: return@forEach
+            if (episode <= 0.0 || episode > totalEpisodes.toDouble()) return@forEach
+            observed[episode] = maxOf(observed[episode] ?: 0f, fraction.normalizedWatchFraction())
+        }
+        if (episodeNumber > 0.0 && episodeNumber <= totalEpisodes.toDouble()) {
+            observed[episodeNumber] = maxOf(
+                observed[episodeNumber] ?: 0f,
+                currentEpisodeWatchFraction,
+            )
+        }
+        return (observed.values.sum() / totalEpisodes).coerceIn(0f, 1f)
+    }
 
     val episodeLabel: String
         get() = episodeNumber.toEpisodeLabel()
@@ -63,6 +102,39 @@ data class HistoryEntry(
         else -> null
     }
 }
+
+/**
+ * Carries forward only progress that was actually observed on this device. The current resume
+ * fields remain owned by [incoming]; the sparse map survives episode changes and records a
+ * naturally completed episode as complete even when its final timestamp is slightly short.
+ */
+internal fun mergeHistoryEntry(existing: HistoryEntry?, incoming: HistoryEntry): HistoryEntry {
+    val progress = linkedMapOf<String, Float>()
+
+    fun record(episodeNumber: Double, fraction: Float) {
+        if (!episodeNumber.isFinite()) return
+        val normalized = fraction.normalizedWatchFraction()
+        if (normalized <= 0f) return
+        val key = episodeNumber.episodeProgressKey()
+        progress[key] = maxOf(progress[key] ?: 0f, normalized)
+    }
+
+    fun recordSaved(entry: HistoryEntry) {
+        entry.episodeWatchProgress.forEach { (key, fraction) ->
+            key.toDoubleOrNull()?.let { record(it, fraction) }
+        }
+        record(entry.episodeNumber, entry.watchFractionFor(entry.episodeNumber))
+    }
+
+    existing?.takeIf { it.anilistId == incoming.anilistId }?.let(::recordSaved)
+    recordSaved(incoming)
+    return incoming.copy(episodeWatchProgress = progress)
+}
+
+private fun Double.episodeProgressKey(): String = toString()
+
+private fun Float.normalizedWatchFraction(): Float =
+    if (isFinite()) coerceIn(0f, 1f) else 0f
 
 private fun Double.toEpisodeLabel(): String =
     if (this % 1.0 == 0.0) toInt().toString() else toString()

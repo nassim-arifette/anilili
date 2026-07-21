@@ -1,6 +1,7 @@
 package com.miruronative.data.library
 
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -33,6 +34,11 @@ class HistoryEntryTest {
         assertEquals(45_000L, entry.continuePositionMs)
         assertEquals(.5f, entry.continueProgressFraction)
         assertEquals(45_000L, entry.resumePositionFor(3.0))
+        assertTrue(entry.episodeWatchProgress.isEmpty())
+        assertEquals(0f, entry.watchFractionFor(1.0))
+        assertEquals(0f, entry.watchFractionFor(2.0))
+        assertEquals(.5f, entry.watchFractionFor(3.0))
+        assertEquals(0f, entry.watchFractionFor(4.0))
     }
 
     @Test
@@ -72,6 +78,77 @@ class HistoryEntryTest {
         assertEquals(12.0, entry.continueEpisodeNumber, 0.0)
         assertNull(entry.resumePositionFor(12.0))
         assertNull(entry.resumePositionFor(13.0))
+    }
+
+    @Test
+    fun `jumping to episode ninety does not invent progress for earlier episodes`() {
+        val episodeOne = historyEntry(
+            episodeNumber = 1.0,
+            positionMs = 45_000L,
+            durationMs = 90_000L,
+        )
+        val episodeNinety = mergeHistoryEntry(
+            existing = episodeOne,
+            incoming = historyEntry(
+                episodeNumber = 90.0,
+                positionMs = 30_000L,
+                durationMs = 120_000L,
+            ),
+        )
+
+        assertEquals(.5f, episodeNinety.watchFractionFor(1.0))
+        assertEquals(0f, episodeNinety.watchFractionFor(2.0))
+        assertEquals(0f, episodeNinety.watchFractionFor(89.0))
+        assertEquals(.25f, episodeNinety.watchFractionFor(90.0))
+        assertEquals(.0075f, episodeNinety.seriesWatchFraction(totalEpisodes = 100), .00001f)
+    }
+
+    @Test
+    fun `completed episode remains explicit when continuation starts`() {
+        val completedNinety = mergeHistoryEntry(
+            existing = null,
+            incoming = historyEntry(
+                episodeNumber = 90.0,
+                positionMs = 110_000L,
+                durationMs = 120_000L,
+                continuationEpisodeNumber = 91.0,
+            ),
+        )
+        val startedNinetyOne = mergeHistoryEntry(
+            existing = completedNinety,
+            incoming = historyEntry(
+                episodeNumber = 91.0,
+                positionMs = 0L,
+                durationMs = 0L,
+            ),
+        )
+
+        assertEquals(1f, startedNinetyOne.watchFractionFor(90.0))
+        assertEquals(0f, startedNinetyOne.watchFractionFor(91.0))
+        assertEquals(0f, startedNinetyOne.watchFractionFor(89.0))
+    }
+
+    @Test
+    fun `sparse episode progress survives JSON round trip`() {
+        val saved = mergeHistoryEntry(
+            existing = historyEntry(
+                episodeNumber = 2.0,
+                positionMs = 60_000L,
+                durationMs = 120_000L,
+            ),
+            incoming = historyEntry(
+                episodeNumber = 90.0,
+                positionMs = 30_000L,
+                durationMs = 120_000L,
+            ),
+        )
+
+        val restored = Json.decodeFromString<HistoryEntry>(Json.encodeToString(saved))
+
+        assertEquals(saved.episodeWatchProgress, restored.episodeWatchProgress)
+        assertEquals(.5f, restored.watchFractionFor(2.0))
+        assertEquals(0f, restored.watchFractionFor(89.0))
+        assertEquals(.25f, restored.watchFractionFor(90.0))
     }
 
     private fun historyEntry(
