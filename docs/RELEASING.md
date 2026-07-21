@@ -65,7 +65,10 @@ base64 -w 0 release-signing.jks
    ```
 
    Verify the same endpoint returns `"enabled": true`. This setting protects future releases;
-   it does not retroactively make `v0.2.0` immutable.
+   it does not retroactively make `v0.2.0` immutable. This is an operator preflight: GitHub's
+   workflow token has `contents: write` for releases but cannot read the repository-level
+   `Administration` permission required by this endpoint. The workflow independently requires the
+   published release response to report `"immutable": true`.
 4. Run **Actions > Publish signed APK > Run workflow** from `main`. The workflow creates the
    matching version tag after all verification succeeds.
 5. Confirm that the workflow tests the app and publishes exactly one release APK plus its SHA-256

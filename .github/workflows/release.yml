@@ -271,17 +271,6 @@ jobs:
           set -euo pipefail
           api_version="2026-03-10"
 
-          immutable_enabled="$(
-            gh api \
-              -H "X-GitHub-Api-Version: $api_version" \
-              "repos/$GITHUB_REPOSITORY/immutable-releases" \
-              --jq '.enabled' 2>/dev/null || true
-          )"
-          if [ "$immutable_enabled" != "true" ]; then
-            echo "Repository release immutability must be enabled before publishing" >&2
-            exit 1
-          fi
-
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG already exists and will not be replaced" >&2
             exit 1
@@ -293,17 +282,28 @@ jobs:
 
           release_id=""
           published=false
-          cleanup_draft() {
+          cleanup_unpublished_release() {
             status=$?
             trap - EXIT
             if [ "$status" -ne 0 ] && [ "$published" != "true" ] && [ -n "$release_id" ]; then
               gh api --method DELETE \
                 -H "X-GitHub-Api-Version: $api_version" \
                 "repos/$GITHUB_REPOSITORY/releases/$release_id" >/dev/null || true
+              created_tag_target="$(
+                gh api \
+                  -H "X-GitHub-Api-Version: $api_version" \
+                  "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+                  --jq '.object.sha' 2>/dev/null || true
+              )"
+              if [ "$created_tag_target" = "$GITHUB_SHA" ]; then
+                gh api --method DELETE \
+                  -H "X-GitHub-Api-Version: $api_version" \
+                  "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" >/dev/null || true
+              fi
             fi
             exit "$status"
           }
-          trap cleanup_draft EXIT
+          trap cleanup_unpublished_release EXIT
 
           release_json="$(
             gh api --method POST \
@@ -375,7 +375,12 @@ jobs:
               -F draft=false \
               -f make_latest=true
           )"
-          published=true
+          if jq -e '.draft == false and .immutable == true' <<< "$published_json" >/dev/null; then
+            # An immutable publication cannot be rolled back safely: GitHub permanently reserves
+            # its tag name even if the release is later deleted. Disable cleanup before the
+            # remaining assertions so a diagnostic failure cannot destroy a valid release.
+            published=true
+          fi
           jq -e \
             --arg tag "$TAG" \
             --arg target "$GITHUB_SHA" \
