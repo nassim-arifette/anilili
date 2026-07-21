@@ -445,7 +445,7 @@ private fun WatchContent(
     onEmbedProgress: (EmbedPlaybackKey, Long, Long) -> Unit,
     onEmbedPlaybackEnded: (EmbedPlaybackCompletion) -> Boolean,
     onNativeProgress: (PlaybackIdentity, Long, Long, Boolean) -> Unit,
-    onPlaybackError: (PlaybackIdentity, String, String, Long) -> Unit,
+    onPlaybackError: (PlaybackIdentity, String, String, Long, Set<String>) -> Unit,
     onEmbedPlaybackError: (EmbedPlaybackKey, String, String, Long) -> Unit,
     onEmbedPrevious: (EmbedPlaybackKey) -> Unit,
     onEmbedNext: (EmbedPlaybackKey) -> Unit,

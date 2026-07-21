@@ -305,7 +305,7 @@ internal fun PlayerSurface(
     onEnded: (NativePlaybackCompletion, PlaybackNavigationIdentity) -> Unit,
     onNextEpisode: () -> Unit,
     onPlaybackIdentityChanged: (NativePlaybackIdentity) -> Unit,
-    onError: (PlaybackIdentity, String, String, Long) -> Unit,
+    onError: (PlaybackIdentity, String, String, Long, Set<String>) -> Unit,
     modifier: Modifier = Modifier,
     onToggleFullscreen: (() -> Unit)? = null,
     startPositionMs: Long = 0,
@@ -382,19 +382,21 @@ internal fun PlayerSurface(
         mutableStateOf<NativePlaybackIdentity?>(null)
     }
     var tracksRevision by remember(playbackSessionKey) { mutableIntStateOf(0) }
-    // One same-stream retry at a capped resolution before giving the provider up: weak TV
-    // decoders (Fire TV's OMX.MS.AVC) can die on 1080p with a codec error even though the
-    // format is nominally supported, and a provider failover for a device-side decode hiccup
-    // needlessly restarts the episode on another server.
-    // The listener below lives for the MediaController, not for a particular episode. Keep the
-    // retry allowance tied to each MediaItem installation so a new logical playback can retry
-    // even when its provider reuses the same URL as the previous episode.
-    val decoderRetryPolicy = remember { PlayerDecoderRetryPolicy() }
+    var pinnedVideoHeight by remember(controller, playbackSessionKey) { mutableStateOf<Int?>(null) }
+    var defaultQualityApplied by remember(playbackSessionKey) { mutableStateOf(false) }
+    // Weak TV decoders can reject a nominally supported high-resolution source. Keep recovery
+    // scoped to this logical playback so lower per-quality URLs are exhausted without looping,
+    // then grant the last URL one same-manifest retry capped at 720p.
+    val decoderRetryPolicy = remember(playbackSessionKey) {
+        PlayerDecoderRetryPolicy().apply { startSession(playbackSessionKey) }
+    }
     val nativeQualityStreams = remember(playbackSessionKey, stream, qualityStreams) {
         (listOf(stream) + qualityStreams)
             .filterNot(StreamItem::isEmbed)
             .distinctBy(StreamItem::url)
     }
+    val currentActiveStream by rememberUpdatedState(activeStream)
+    val currentNativeQualityStreams by rememberUpdatedState(nativeQualityStreams)
 
     DisposableEffect(controllerFuture) {
         controllerFuture.addListener(
@@ -503,34 +505,89 @@ internal fun PlayerSurface(
                         val failedItem = activeController.currentMediaItem
                         val failedIdentity = failedItem?.playbackIdentityOrNull()
                         val failedMediaId = failedItem?.mediaId
+                        val failedStream = currentActiveStream
                         if (
                             failedIdentity == null ||
                             failedMediaId == null ||
-                            !isSamePlaybackSession(failedIdentity, playbackIdentity)
+                            !isSamePlaybackSession(failedIdentity, playbackIdentity) ||
+                            failedIdentity.mediaId != failedMediaId ||
+                            failedMediaId != failedStream.url
                         ) {
                             DiagnosticsLog.event("PlayerSurface ignored error without current playback identity")
-                        } else if (
-                            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED &&
-                            decoderRetryPolicy.tryConsumeRetry(failedMediaId)
-                        ) {
-                            val resumeAt = activeController.currentPosition.coerceAtLeast(0L)
-                            activeController.trackSelectionParameters = activeController.trackSelectionParameters
-                                .buildUpon()
-                                .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
-                                .setMaxVideoSize(1280, 720)
-                                .build()
-                            activeController.prepare()
-                            activeController.seekTo(resumeAt)
-                            activeController.play()
-                            DiagnosticsLog.event(
-                                "PlayerSurface decoder failed; retrying same stream capped at 720p resumeMs=$resumeAt",
+                        } else if (error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED) {
+                            val fallback = decoderRetryPolicy.onDecoderFailure(
+                                session = playbackSessionKey,
+                                failedMediaId = failedMediaId,
+                                failedHeight = failedStream.declaredVideoHeight()
+                                    ?: activeController.currentVideoHeight(),
+                                candidates = currentNativeQualityStreams.map { candidate ->
+                                    DecoderStreamCandidate(
+                                        mediaId = candidate.url,
+                                        height = candidate.declaredVideoHeight(),
+                                    )
+                                },
+                                positionMs = activeController.currentPosition,
                             )
+                            when (fallback) {
+                                is DecoderFallbackAction.SwitchStream -> {
+                                    val replacement = currentNativeQualityStreams.firstOrNull {
+                                        it.url == fallback.mediaId
+                                    }
+                                    if (replacement == null) {
+                                        currentOnError(
+                                            failedIdentity,
+                                            error.localizedMessage ?: "Playback failed",
+                                            failedMediaId,
+                                            fallback.resumePositionMs,
+                                            setOf(failedMediaId),
+                                        )
+                                    } else {
+                                        clearVideoSelection(activeController)
+                                        nextStartPositionMs = fallback.resumePositionMs
+                                        pinnedVideoHeight = fallback.height
+                                        defaultQualityApplied = true
+                                        activeStream = replacement
+                                        DiagnosticsLog.event(
+                                            "PlayerSurface decoder failed; switching to " +
+                                                "${fallback.height}p stream resumeMs=${fallback.resumePositionMs}",
+                                        )
+                                    }
+                                }
+                                is DecoderFallbackAction.RetryCurrentStreamCapped -> {
+                                    defaultQualityApplied = true
+                                    pinnedVideoHeight = fallback.maxHeight
+                                    activeController.trackSelectionParameters =
+                                        activeController.trackSelectionParameters
+                                            .buildUpon()
+                                            .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                                            .setMaxVideoSize(1280, fallback.maxHeight)
+                                            .build()
+                                    activeController.prepare()
+                                    activeController.seekTo(fallback.resumePositionMs)
+                                    activeController.play()
+                                    DiagnosticsLog.event(
+                                        "PlayerSurface decoder failed; retrying same stream capped at " +
+                                            "${fallback.maxHeight}p resumeMs=${fallback.resumePositionMs}",
+                                    )
+                                }
+                                is DecoderFallbackAction.Exhausted -> currentOnError(
+                                    failedIdentity,
+                                    error.localizedMessage ?: "Playback failed",
+                                    failedMediaId,
+                                    fallback.resumePositionMs,
+                                    fallback.attemptedMediaIds.ifEmpty { setOf(failedMediaId) },
+                                )
+                                is DecoderFallbackAction.IgnoreStaleSession -> DiagnosticsLog.event(
+                                    "PlayerSurface ignored decoder error for stale playback session",
+                                )
+                            }
                         } else {
                             currentOnError(
                                 failedIdentity,
                                 error.localizedMessage ?: "Playback failed",
                                 failedMediaId,
                                 activeController.currentPosition.coerceAtLeast(0L),
+                                setOf(failedMediaId),
                             )
                         }
                     }
@@ -667,7 +724,6 @@ internal fun PlayerSurface(
                 PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
                 currentOnPlaybackIdentityChanged(nativePlaybackIdentity)
                 activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
-                decoderRetryPolicy.onMediaItemSet()
                 activeController.prepare()
                 activeController.playWhenReady = true
                 DiagnosticsLog.event("PlayerSurface prepare called playWhenReady=true")
@@ -807,7 +863,6 @@ internal fun PlayerSurface(
         phoneControlsVisible = false
     }
     val captionStyle by SettingsStore.captionStyle.collectAsState()
-    var pinnedVideoHeight by remember(controller, playbackSessionKey) { mutableStateOf<Int?>(null) }
     fun changeVideoHeight(activeController: MediaController, height: Int?): Boolean {
         var applied = false
         val accepted = runIfPlaybackOwnerActive {
@@ -844,7 +899,6 @@ internal fun PlayerSurface(
         return accepted && applied
     }
     val defaultQuality by SettingsStore.defaultQuality.collectAsState()
-    var defaultQualityApplied by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(controller, playbackSessionKey, tracksRevision, defaultQuality) {
         val activeController = controller ?: return@LaunchedEffect
         if (defaultQualityApplied || pinnedVideoHeight != null) return@LaunchedEffect
@@ -1528,6 +1582,18 @@ private fun MediaController.videoSelectionBuilder(): TrackSelectionParameters.Bu
         .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
         .clearVideoSizeConstraints()
         .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, false)
+
+/** Best known height of the concrete video input that just failed to decode. */
+private fun MediaController.currentVideoHeight(): Int? =
+    videoSize.height.takeIf { it > 0 }
+        ?: currentTracks.groups.asSequence()
+            .filter { it.type == C.TRACK_TYPE_VIDEO }
+            .flatMap { group ->
+                (0 until group.length).asSequence()
+                    .filter(group::isTrackSelected)
+                    .map { index -> group.getTrackFormat(index).height }
+            }
+            .firstOrNull { it > 0 }
 
 private fun MediaController.hasVideoHeight(height: Int): Boolean = currentTracks.groups.any { group ->
     group.type == C.TRACK_TYPE_VIDEO && group.isSupported &&
