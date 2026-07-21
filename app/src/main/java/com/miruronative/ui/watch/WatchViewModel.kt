@@ -1,6 +1,5 @@
 package com.miruronative.ui.watch
 
-import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -21,6 +20,7 @@ import com.miruronative.data.model.SourcesResult
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.remote.KonohaEpisode
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import com.miruronative.playback.PlaybackService
 import com.miruronative.ui.UiState
 import com.miruronative.ui.detail.mergeEpisodeMetadata
@@ -1775,6 +1775,7 @@ class WatchViewModel : ViewModel() {
         positionMs: Long,
         attemptedStreamUrls: Set<String> = setOf(streamUrl),
     ) {
+        // `message` is presentation-only and may originate in Media3 or a provider WebView.
         val data = (_state.value as? UiState.Success)?.data ?: return
         if (data.isResolving) return
         captureNativeFailureProgress(data, streamUrl, positionMs)
@@ -1783,14 +1784,17 @@ class WatchViewModel : ViewModel() {
         }
         DiagnosticsLog.event(
             "Watch playback error provider=${data.provider} episode=${data.current.displayNumber} " +
-                "streamHost=${runCatching { Uri.parse(streamUrl).host }.getOrNull() ?: "unknown"} " +
-                "positionMs=$positionMs message=${message.take(160)}",
+                "category=source-playback ${privacySafeUrlDiagnosticLabel(streamUrl)} " +
+                "positionMs=$positionMs",
         )
 
         if (data.provider == "allanime" && streamUrl.isNotBlank()) {
             val attemptedUrls = (attemptedStreamUrls + streamUrl).filterTo(linkedSetOf(), String::isNotBlank)
             if (!failedStreamUrls.addAll(attemptedUrls)) {
-                DiagnosticsLog.event("Watch ignored duplicate AllAnime stream failure host=${Uri.parse(streamUrl).host}")
+                DiagnosticsLog.event(
+                    "Watch ignored duplicate AllAnime stream failure " +
+                        privacySafeUrlDiagnosticLabel(streamUrl),
+                )
                 return
             }
             val next = nextProviderStream(
@@ -1969,8 +1973,7 @@ class WatchViewModel : ViewModel() {
             isHls -> "hls"
             else -> "direct"
         }
-        return "$type label=${label.take(48)} audio=${audio ?: "unknown"} " +
-            "height=${height ?: "auto"} host=${runCatching { Uri.parse(url).host }.getOrNull() ?: "unknown"}"
+        return "$type height=${height ?: "auto"} ${privacySafeUrlDiagnosticLabel(url)}"
     }
 }
 

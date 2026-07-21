@@ -159,9 +159,9 @@ object PipeBridge {
                 val failedUrl = request.url.toString()
                 if (failedUrl != origin && !failedUrl.startsWith("$origin/")) return
                 DiagnosticsLog.event(
-                    "PipeBridge main-frame error code=${error?.errorCode} " +
-                        "description=${error?.description} " +
-                        privacySafeUrlDiagnosticLabel(origin),
+                    "PipeBridge main-frame error category=web-resource " +
+                        "code=${error?.errorCode ?: "unknown"} mainFrame=true " +
+                        privacySafeUrlDiagnosticLabel(failedUrl),
                 )
                 // This mirror is unreachable (ISP block, DNS, site down): roll to the next one.
                 // Only once all mirrors fail do waiters unblock into the cache/error path.
@@ -303,7 +303,8 @@ object PipeBridge {
                         attached.view.evaluateJavascript(js, null)
                         scheduleIdle()
                     } catch (error: Throwable) {
-                        Log.w(TAG, "evaluateJavascript failed", error)
+                        val errorType = error.javaClass.simpleName.ifBlank { "unknown" }
+                        Log.w(TAG, "evaluateJavascript failed type=$errorType")
                         failRequest(request, "webview request failed")
                     }
                 }

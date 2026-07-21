@@ -642,8 +642,17 @@ internal fun PlayerSurface(
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
+                    val diagnosticCategory = playerErrorDiagnosticCategory(error.errorCode)
+                    // Media3 may include a signed media URI in localizedMessage. It remains an
+                    // on-screen recovery message; only the controlled category/code are logged.
+                    val userFacingMessage = error.localizedMessage
+                        ?.takeIf(String::isNotBlank)
+                        ?: "Playback failed"
                     val accepted = runIfPlaybackOwnerActive {
-                        DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
+                        DiagnosticsLog.event(
+                            "PlayerSurface player error category=$diagnosticCategory " +
+                                "code=${error.errorCode}",
+                        )
                         val failedItem = activeController.currentMediaItem
                         val failedIdentity = failedItem?.playbackIdentityOrNull()
                         val failedMediaId = failedIdentity?.mediaId
@@ -678,7 +687,7 @@ internal fun PlayerSurface(
                                     if (replacement == null) {
                                         currentOnError(
                                             failedIdentity,
-                                            error.localizedMessage ?: "Playback failed",
+                                            userFacingMessage,
                                             failedMediaId,
                                             fallback.resumePositionMs,
                                             setOf(failedMediaId),
@@ -714,7 +723,7 @@ internal fun PlayerSurface(
                                 }
                                 is DecoderFallbackAction.Exhausted -> currentOnError(
                                     failedIdentity,
-                                    error.localizedMessage ?: "Playback failed",
+                                    userFacingMessage,
                                     failedMediaId,
                                     fallback.resumePositionMs,
                                     fallback.attemptedMediaIds.ifEmpty { setOf(failedMediaId) },
@@ -726,7 +735,7 @@ internal fun PlayerSurface(
                         } else {
                             currentOnError(
                                 failedIdentity,
-                                error.localizedMessage ?: "Playback failed",
+                                userFacingMessage,
                                 failedMediaId,
                                 activeController.currentPosition.coerceAtLeast(0L),
                                 setOf(failedMediaId),
