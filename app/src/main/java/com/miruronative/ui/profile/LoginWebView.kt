@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.view.inputmethod.InputMethodManager
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -18,11 +19,17 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
 import com.miruronative.diagnostics.CrashReporter
+import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.adaptive.LocalAppDeviceProfile
 import com.miruronative.ui.adaptive.focusHighlight
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -113,9 +120,11 @@ fun <T> LoginWebView(
     onCancel: () -> Unit,
 ) {
     val device = LocalAppDeviceProfile.current
+    var rendererGeneration by remember(authorizeUrl) { mutableIntStateOf(0) }
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Box(Modifier.fillMaxSize()) {
-            AndroidView(
+            key(rendererGeneration) {
+                AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
                     try {
@@ -156,6 +165,18 @@ fun <T> LoginWebView(
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     if (device.isTv) view?.evaluateJavascript(TV_IME_JS, null)
                                 }
+
+                                override fun onRenderProcessGone(
+                                    view: WebView?,
+                                    detail: RenderProcessGoneDetail?,
+                                ): Boolean {
+                                    DiagnosticsLog.event(
+                                        "LoginWebView render process gone didCrash=${detail?.didCrash()} " +
+                                            "priority=${detail?.rendererPriorityAtExit()}",
+                                    )
+                                    rendererGeneration++
+                                    return true
+                                }
                             }
                             if (device.isTv) addJavascriptInterface(TvImeBridge(this), "MiruroTvIme")
                             loadUrl(authorizeUrl)
@@ -168,13 +189,14 @@ fun <T> LoginWebView(
                 },
                 onRelease = { view ->
                     val web = view as? WebView ?: return@AndroidView
-                    web.stopLoading()
-                    web.loadUrl("about:blank")
-                    web.clearHistory()
-                    web.removeAllViews()
-                    web.destroy()
+                    runCatching { web.stopLoading() }
+                    runCatching { web.loadUrl("about:blank") }
+                    runCatching { web.clearHistory() }
+                    runCatching { web.removeAllViews() }
+                    runCatching { web.destroy() }
                 },
-            )
+                )
+            }
             IconButton(
                 onClick = onCancel,
                 modifier = Modifier
