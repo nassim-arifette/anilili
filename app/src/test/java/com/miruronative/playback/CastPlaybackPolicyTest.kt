@@ -64,4 +64,16 @@ class CastPlaybackPolicyTest {
         assertFalse(owners.release(token))
         assertFalse(owners.hasOwner())
     }
+
+    @Test
+    fun `only newest overlapping native surface may publish PiP geometry`() {
+        val owners = LocalPlaybackOwnerRegistry()
+        val outgoing = owners.acquire()
+        val incoming = owners.acquire()
+
+        assertFalse(owners.isLatest(outgoing))
+        assertTrue(owners.isLatest(incoming))
+        assertTrue(owners.release(incoming))
+        assertTrue(owners.isLatest(outgoing))
+    }
 }

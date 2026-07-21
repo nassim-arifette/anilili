@@ -14,6 +14,7 @@ import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlayerTransferState
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.cast.CastPlayer
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -32,14 +33,54 @@ import com.miruronative.MainActivity
 import com.miruronative.ui.nav.Routes
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 /** Process-wide playback state used by the activity to decide when PiP is appropriate. */
 object PlaybackStatus {
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying = _isPlaying.asStateFlow()
+    private val _pictureInPictureSnapshot = MutableStateFlow(PictureInPicturePlaybackSnapshot())
+    internal val pictureInPictureSnapshot = _pictureInPictureSnapshot.asStateFlow()
 
     internal fun update(playing: Boolean) {
         _isPlaying.value = playing
+        _pictureInPictureSnapshot.update { it.copy(isPlaying = playing) }
+    }
+
+    internal fun updatePlaybackRoute(route: PlaybackRoute) {
+        _pictureInPictureSnapshot.update { it.copy(playbackRoute = route) }
+    }
+
+    internal fun updateNativeSurface(active: Boolean) {
+        _pictureInPictureSnapshot.update {
+            it.copy(
+                hasNativeSurface = active,
+                sourceRect = it.sourceRect.takeIf { active },
+            )
+        }
+    }
+
+    internal fun updateVideoSize(width: Int, height: Int, pixelWidthHeightRatio: Float) {
+        _pictureInPictureSnapshot.update {
+            it.copy(aspectRatio = pictureInPictureAspectRatio(width, height, pixelWidthHeightRatio))
+        }
+    }
+
+    internal fun updateSourceRect(sourceRect: PictureInPictureSourceRect?) {
+        _pictureInPictureSnapshot.update { current ->
+            current.copy(sourceRect = sourceRect?.takeIf(PictureInPictureSourceRect::isUsable))
+        }
+    }
+
+    internal fun resetPlayerState() {
+        _isPlaying.value = false
+        _pictureInPictureSnapshot.update {
+            it.copy(
+                isPlaying = false,
+                playbackRoute = PlaybackRoute.LOCAL,
+                aspectRatio = PictureInPictureAspectRatio.DEFAULT,
+            )
+        }
     }
 }
 
@@ -160,13 +201,26 @@ class PlaybackService : MediaSessionService() {
 
                     override fun onDeviceInfoChanged(deviceInfo: DeviceInfo) {
                         val route = if (deviceInfo.playbackType == DeviceInfo.PLAYBACK_TYPE_REMOTE) {
-                            "remote"
+                            PlaybackRoute.REMOTE
                         } else {
-                            "local"
+                            PlaybackRoute.LOCAL
                         }
+                        PlaybackStatus.updatePlaybackRoute(route)
                         DiagnosticsLog.event(
-                            "PlaybackService route=$route " +
+                            "PlaybackService route=${route.name.lowercase()} " +
                                 "routingController=${deviceInfo.routingControllerId ?: "none"}",
+                        )
+                    }
+
+                    override fun onVideoSizeChanged(videoSize: VideoSize) {
+                        PlaybackStatus.updateVideoSize(
+                            width = videoSize.width,
+                            height = videoSize.height,
+                            pixelWidthHeightRatio = videoSize.pixelWidthHeightRatio,
+                        )
+                        DiagnosticsLog.event(
+                            "PlaybackService video size=${videoSize.width}x${videoSize.height} " +
+                                "pixelRatio=${videoSize.pixelWidthHeightRatio}",
                         )
                     }
 
@@ -186,6 +240,7 @@ class PlaybackService : MediaSessionService() {
                 })
             }
         activePlayer = castPlayer
+        PlaybackStatus.updatePlaybackRoute(castPlayer.playbackRoute())
 
         // The playlist holds one media item at a time (episodes resolve lazily, per provider),
         // but the session still advertises next/previous by forwarding them to the app's
@@ -304,7 +359,7 @@ class PlaybackService : MediaSessionService() {
         activePlayer = null
         episodeNavigator = null
         watchPlaybackOwners.clear()
-        PlaybackStatus.update(false)
+        PlaybackStatus.resetPlayerState()
         if (::session.isInitialized) session.release()
         if (::castPlayer.isInitialized) {
             castPlayer.release()
@@ -349,14 +404,33 @@ class PlaybackService : MediaSessionService() {
 
         internal fun acquireLocalPlaybackOwner(): LocalPlaybackOwnerToken {
             val token = localPlaybackOwners.acquire()
+            PlaybackStatus.updateNativeSurface(true)
             DiagnosticsLog.event("PlaybackService local playback owner acquired id=${token.id}")
             return token
         }
 
         internal fun releaseLocalPlaybackOwner(token: LocalPlaybackOwnerToken) {
+            val wasLatest = localPlaybackOwners.isLatest(token)
             if (localPlaybackOwners.release(token)) {
+                PlaybackStatus.updateNativeSurface(localPlaybackOwners.hasOwner())
+                if (wasLatest) PlaybackStatus.updateSourceRect(null)
                 DiagnosticsLog.event("PlaybackService local playback owner released id=${token.id}")
             }
+        }
+
+        internal fun updatePictureInPictureSourceRect(
+            token: LocalPlaybackOwnerToken,
+            sourceRect: PictureInPictureSourceRect,
+        ): Boolean {
+            if (!localPlaybackOwners.isLatest(token)) return false
+            PlaybackStatus.updateSourceRect(sourceRect)
+            return true
+        }
+
+        internal fun clearPictureInPictureSourceRect(token: LocalPlaybackOwnerToken): Boolean {
+            if (!localPlaybackOwners.isLatest(token)) return false
+            PlaybackStatus.updateSourceRect(null)
+            return true
         }
 
         internal fun activateWatchPlaybackOwner(): WatchPlaybackOwnerToken {

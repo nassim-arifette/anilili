@@ -2,6 +2,7 @@ package com.miruronative.ui.watch
 
 import android.content.ComponentName
 import android.content.ContextWrapper
+import android.graphics.Rect
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
@@ -102,6 +103,7 @@ import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.LocalPlaybackOwnerToken
 import com.miruronative.playback.CastSourceDecision
 import com.miruronative.playback.chooseCastSource
+import com.miruronative.playback.PictureInPictureSourceRect
 import com.miruronative.playback.PlaybackService
 import com.miruronative.playback.SubtitleDelay
 import com.miruronative.playback.WatchPlaybackOwnerToken
@@ -353,9 +355,8 @@ internal fun PlayerSurface(
     val playbackSessionKey = playbackIdentity.nativePlaybackSessionKey()
     DisposableEffect(Unit) { onDispose { resetPlayerBrightness(context) } }
     val lifecycleOwner = remember(context) { context.findPlayerLifecycleOwner() }
+    var localPlaybackOwner by remember { mutableStateOf<LocalPlaybackOwnerToken?>(null) }
     DisposableEffect(lifecycleOwner) {
-        var localPlaybackOwner: LocalPlaybackOwnerToken? = null
-
         fun acquirePlaybackOwner() {
             if (localPlaybackOwner == null) {
                 localPlaybackOwner = PlaybackService.acquireLocalPlaybackOwner()
@@ -904,6 +905,45 @@ internal fun PlayerSurface(
     }
 
     var playerView by remember { mutableStateOf<PlayerView?>(null) }
+    DisposableEffect(playerView, localPlaybackOwner) {
+        val view = playerView
+        val owner = localPlaybackOwner
+        if (view == null || owner == null) {
+            onDispose { }
+        } else {
+            fun publishSourceRect() {
+                val visibleRect = Rect()
+                if (
+                    view.isShown &&
+                    view.getGlobalVisibleRect(visibleRect) &&
+                    visibleRect.width() > 0 &&
+                    visibleRect.height() > 0
+                ) {
+                    PlaybackService.updatePictureInPictureSourceRect(
+                        token = owner,
+                        sourceRect = PictureInPictureSourceRect(
+                            left = visibleRect.left,
+                            top = visibleRect.top,
+                            right = visibleRect.right,
+                            bottom = visibleRect.bottom,
+                        ),
+                    )
+                } else {
+                    PlaybackService.clearPictureInPictureSourceRect(owner)
+                }
+            }
+
+            val layoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                publishSourceRect()
+            }
+            view.addOnLayoutChangeListener(layoutListener)
+            view.post { publishSourceRect() }
+            onDispose {
+                view.removeOnLayoutChangeListener(layoutListener)
+                PlaybackService.clearPictureInPictureSourceRect(owner)
+            }
+        }
+    }
     var controllerVisible by remember { mutableStateOf(false) }
     var tvControlsVisible by remember { mutableStateOf(false) }
     var tvControlsInteraction by remember { mutableIntStateOf(0) }
