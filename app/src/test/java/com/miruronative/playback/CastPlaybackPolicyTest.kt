@@ -64,4 +64,72 @@ class CastPlaybackPolicyTest {
         assertFalse(owners.release(token))
         assertFalse(owners.hasOwner())
     }
+
+    @Test
+    fun `paused remote item keeps service alive after task removal`() {
+        assertFalse(
+            shouldStopPlaybackServiceAfterTaskRemoved(
+                playerInitialized = true,
+                route = PlaybackRoute.REMOTE,
+                mediaItemCount = 1,
+                playWhenReady = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `paused local item may stop after task removal`() {
+        assertTrue(
+            shouldStopPlaybackServiceAfterTaskRemoved(
+                playerInitialized = true,
+                route = PlaybackRoute.LOCAL,
+                mediaItemCount = 1,
+                playWhenReady = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `Cast completion advances only the exact Watch episode and playback UUID`() {
+        val active = EpisodeNavigatorPlaybackIdentity(
+            animeId = 42,
+            episodeNumber = 3.0,
+            playbackGeneration = 7,
+            playbackId = "active-playback",
+        )
+        val expected = RemotePlaybackHistoryIdentity(
+            playbackId = "active-playback",
+            animeId = 42,
+            mediaId = "https://cdn/video.m3u8",
+            episodeNumber = 3.0,
+            generation = 7,
+            watchOwnerGeneration = 12L,
+        )
+
+        assertTrue(acceptsEpisodeNavigatorPlayback(12L, active, expected))
+        assertFalse(acceptsEpisodeNavigatorPlayback(11L, active, expected))
+        assertFalse(
+            acceptsEpisodeNavigatorPlayback(
+                12L,
+                active.copy(episodeNumber = 4.0),
+                expected,
+            ),
+        )
+        assertFalse(
+            acceptsEpisodeNavigatorPlayback(
+                12L,
+                active.copy(playbackId = "stale-playback"),
+                expected,
+            ),
+        )
+    }
+
+    @Test
+    fun `navigator cleanup ignores the UUID bound after logical registration`() {
+        val logical = EpisodeNavigatorPlaybackIdentity(42, 3.0, 7)
+        val bound = logical.copy(playbackId = "cast-playback")
+
+        assertTrue(bound.matchesLogicalPlayback(logical))
+        assertFalse(bound.matchesLogicalPlayback(logical.copy(episodeNumber = 4.0)))
+    }
 }

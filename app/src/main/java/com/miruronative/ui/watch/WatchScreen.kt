@@ -102,6 +102,7 @@ import com.miruronative.data.model.EpisodeItem
 import com.miruronative.data.model.StreamItem
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.PlaybackService
+import com.miruronative.playback.EpisodeNavigatorPlaybackIdentity
 import com.miruronative.playback.WatchPlaybackOwnerToken
 import com.miruronative.ui.UiState
 import com.miruronative.ui.components.ErrorBox
@@ -612,6 +613,11 @@ private fun WatchContent(
                         Box(Modifier.fillMaxSize()) {
                             EmbedEpisodeNavigationEffect(
                                 playbackOwner = playbackOwner,
+                                playback = EpisodeNavigatorPlaybackIdentity(
+                                    animeId = embedPlaybackKey.animeId,
+                                    episodeNumber = embedPlaybackKey.episodeNumber,
+                                    playbackGeneration = embedPlaybackKey.sourceGeneration,
+                                ),
                                 hasPrevious = data.hasPrev,
                                 hasNext = data.hasNext,
                                 onPrevious = { onEmbedPrevious(embedPlaybackKey) },
@@ -669,6 +675,7 @@ private fun WatchContent(
                         seriesTitle = data.seriesTitle,
                         episodeTitle = "Episode ${data.current.displayNumber}" +
                             (data.current.title?.let { ": $it" } ?: ""),
+                        historyEpisodeTitle = data.current.title,
                         artworkUrl = data.artworkUrl,
                         animeId = data.anilistId,
                         provider = data.provider,
@@ -700,6 +707,8 @@ private fun WatchContent(
                         onProgress = onNativeProgress,
                         onPreviousEpisode = { onPlayerPrev(playbackNavigation) },
                         hasNextEpisode = data.hasNext,
+                        nextEpisodeNumber = data.episodes.getOrNull(data.currentIndex + 1)?.number,
+                        totalEpisodes = data.totalEpisodes,
                         hasPreviousEpisode = data.hasPrev,
                         focusPlayerOnStart = fullscreen,
                         isFullscreen = fullscreen,
@@ -1791,6 +1800,7 @@ private fun NoSource(onWebFallback: () -> Unit) {
 @Composable
 private fun EmbedEpisodeNavigationEffect(
     playbackOwner: WatchPlaybackOwnerToken,
+    playback: EpisodeNavigatorPlaybackIdentity,
     hasPrevious: Boolean,
     hasNext: Boolean,
     onPrevious: () -> Unit,
@@ -1801,7 +1811,7 @@ private fun EmbedEpisodeNavigationEffect(
     val currentOnPrevious by rememberUpdatedState(onPrevious)
     val currentOnNext by rememberUpdatedState(onNext)
 
-    DisposableEffect(Unit) {
+    DisposableEffect(playbackOwner, playback) {
         val navigator: (Int) -> Unit = { direction ->
             DiagnosticsLog.event("Embed player episode navigator direction=$direction")
             when {
@@ -1809,13 +1819,17 @@ private fun EmbedEpisodeNavigationEffect(
                 direction < 0 && currentHasPrevious -> currentOnPrevious()
             }
         }
-        val registered = PlaybackService.registerEpisodeNavigator(playbackOwner, navigator)
+        val registered = PlaybackService.registerEpisodeNavigator(
+            owner = playbackOwner,
+            playback = playback,
+            navigator = navigator,
+        )
         DiagnosticsLog.event(
             "Embed player episode navigator registered=$registered " +
                 "hasPrev=$hasPrevious hasNext=$hasNext",
         )
         onDispose {
-            PlaybackService.clearEpisodeNavigator(playbackOwner)
+            PlaybackService.clearEpisodeNavigator(playbackOwner, playback)
             DiagnosticsLog.event("Embed player episode navigator cleared")
         }
     }
