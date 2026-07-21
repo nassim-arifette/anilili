@@ -225,8 +225,20 @@ fun EmbedWebView(
     var introAutoSkipped by remember(navigationSession.generation, introStartMs, introEndMs) {
         mutableStateOf(false)
     }
+    var introAutoSkipPending by remember(navigationSession.generation, introStartMs, introEndMs) {
+        mutableStateOf(false)
+    }
+    var introAutoSkipAttempt by remember(navigationSession.generation, introStartMs, introEndMs) {
+        mutableIntStateOf(0)
+    }
     var outroAutoHandled by remember(navigationSession.generation, outroStartMs, outroEndMs) {
         mutableStateOf(false)
+    }
+    var outroAutoSkipPending by remember(navigationSession.generation, outroStartMs, outroEndMs) {
+        mutableStateOf(false)
+    }
+    var outroAutoSkipAttempt by remember(navigationSession.generation, outroStartMs, outroEndMs) {
+        mutableIntStateOf(0)
     }
     val autoAdvanceGate = remember { EmbedAutoAdvanceGate() }
     // The concrete WebView and Java bridge live across URL changes. Updated handlers make their
@@ -493,12 +505,50 @@ fun EmbedWebView(
         outroEndMs,
         navigationSession.generation,
         hasNextEpisode,
+        introAutoSkipAttempt,
+        outroAutoSkipAttempt,
     ) {
         if (!autoSkipIntroOutro || !webIsPlaying || positionMs <= 0L) return@LaunchedEffect
 
         if (!introAutoSkipped && isInSkipWindow(positionMs, introStartMs, introEndMs)) {
-            if (seekWebVideo(webView, introEndMs, navigationSession, navigationGuard)) {
-                introAutoSkipped = true
+            if (!introAutoSkipPending) {
+                introAutoSkipPending = true
+                val queued = seekWebVideo(
+                    webView = webView,
+                    targetMs = introEndMs,
+                    session = navigationSession,
+                    guard = navigationGuard,
+                    onResult = seekResult@{ succeeded ->
+                        if (!navigationGuard.isCurrent(navigationSession)) return@seekResult
+                        introAutoSkipPending = false
+                        if (succeeded) {
+                            introAutoSkipped = true
+                        } else {
+                            mainHandler.postDelayed(
+                                {
+                                    if (
+                                        navigationGuard.isCurrent(navigationSession) &&
+                                        !introAutoSkipped
+                                    ) {
+                                        introAutoSkipAttempt++
+                                    }
+                                },
+                                AUTO_SKIP_RETRY_MS,
+                            )
+                        }
+                    },
+                )
+                if (!queued) {
+                    introAutoSkipPending = false
+                    mainHandler.postDelayed(
+                        {
+                            if (navigationGuard.isCurrent(navigationSession) && !introAutoSkipped) {
+                                introAutoSkipAttempt++
+                            }
+                        },
+                        AUTO_SKIP_RETRY_MS,
+                    )
+                }
             }
             return@LaunchedEffect
         }
@@ -517,8 +567,44 @@ fun EmbedWebView(
         ) {
             OutroSkipAction.NONE -> Unit
             OutroSkipAction.SEEK_TO_END -> {
-                if (seekWebVideo(webView, outroEndMs, navigationSession, navigationGuard)) {
-                    outroAutoHandled = true
+                if (!outroAutoSkipPending) {
+                    outroAutoSkipPending = true
+                    val queued = seekWebVideo(
+                        webView = webView,
+                        targetMs = outroEndMs,
+                        session = navigationSession,
+                        guard = navigationGuard,
+                        onResult = seekResult@{ succeeded ->
+                            if (!navigationGuard.isCurrent(navigationSession)) return@seekResult
+                            outroAutoSkipPending = false
+                            if (succeeded) {
+                                outroAutoHandled = true
+                            } else {
+                                mainHandler.postDelayed(
+                                    {
+                                        if (
+                                            navigationGuard.isCurrent(navigationSession) &&
+                                            !outroAutoHandled
+                                        ) {
+                                            outroAutoSkipAttempt++
+                                        }
+                                    },
+                                    AUTO_SKIP_RETRY_MS,
+                                )
+                            }
+                        },
+                    )
+                    if (!queued) {
+                        outroAutoSkipPending = false
+                        mainHandler.postDelayed(
+                            {
+                                if (navigationGuard.isCurrent(navigationSession) && !outroAutoHandled) {
+                                    outroAutoSkipAttempt++
+                                }
+                            },
+                            AUTO_SKIP_RETRY_MS,
+                        )
+                    }
                 }
             }
             OutroSkipAction.NEXT_EPISODE -> {
@@ -1424,15 +1510,23 @@ private fun seekWebVideo(
     targetMs: Long?,
     session: EmbedNavigationSession,
     guard: EmbedNavigationGuard,
+    onResult: ((Boolean) -> Unit)? = null,
 ): Boolean {
     val web = webView ?: return false
     val targetSec = targetMs?.div(1000.0) ?: return false
     if (!guard.isCurrent(session)) return false
     return runCatching {
-        web.evaluateJavascript(SEEK_VIDEO_JS(targetSec, session.generation), null)
+        web.evaluateJavascript(SEEK_VIDEO_JS(targetSec, session.generation)) { result ->
+            onResult?.invoke(
+                guard.isCurrent(session) && javascriptBooleanResult(result),
+            )
+        }
         true
     }.getOrDefault(false)
 }
+
+/** WebView serializes a JavaScript Boolean as the unquoted strings `true` or `false`. */
+internal fun javascriptBooleanResult(result: String?): Boolean = result?.trim() == "true"
 
 private fun adjustWebVolume(
     webView: WebView?,
@@ -1545,6 +1639,8 @@ private fun SEEK_VIDEO_JS(targetSec: Double, navigationGeneration: Long): String
       }
     })();
 """.trimIndent()
+
+private const val AUTO_SKIP_RETRY_MS = 500L
 
 private fun readDeviceVolume(audioManager: android.media.AudioManager?): Float {
     audioManager ?: return 1f
