@@ -1175,8 +1175,14 @@ class WatchViewModel : ViewModel() {
         positionMs: Long,
         durationMs: Long,
     ) {
-        lastKnownProgress = PlaybackProgressSnapshot(identity, positionMs, durationMs)
-        scheduleAniSkipLookup(data, identity, durationMs)
+        val progress = progressSnapshotRetainingValidDuration(
+            previous = lastKnownProgress,
+            identity = identity,
+            positionMs = positionMs,
+            durationMs = durationMs,
+        )
+        lastKnownProgress = progress
+        scheduleAniSkipLookup(data, identity, progress.durationMs)
         maybeSyncAniListProgress(identity, positionMs, durationMs, totalEpisodes)
         val lastIdentity = lastProgressSaveIdentity
         if (lastIdentity == null || !isSamePlaybackSession(lastIdentity, identity)) {

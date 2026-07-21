@@ -56,6 +56,7 @@ class AniSkipPlaybackPolicyTest {
         val plan = buildPlaybackSkipPlan(
             providerSkip = provider,
             aniSkipSegments = listOf(segment(AniSkipType.MIXED_OP, 12.0, 84.0)),
+            aniSkipLookupStatus = AniSkipLookupStatus.COMPLETE,
         )
 
         assertEquals(PlaybackSkipKind.MIXED_OPENING, plan.opening?.kind)
@@ -106,12 +107,26 @@ class AniSkipPlaybackPolicyTest {
         val plan = buildPlaybackSkipPlan(
             providerSkip = SkipTimes(5.0, 95.0, 1_300.0, 1_390.0),
             aniSkipSegments = listOf(segment(AniSkipType.RECAP, 0.0, 45.0)),
+            aniSkipLookupStatus = AniSkipLookupStatus.COMPLETE,
         )
 
         assertEquals(PlaybackSkipOrigin.PROVIDER, plan.opening?.origin)
         assertEquals(PlaybackSkipOrigin.PROVIDER, plan.ending?.origin)
         assertEquals(PlaybackSkipKind.RECAP, plan.recap?.kind)
         assertEquals("Skip Recap", plan.actionAt(20_000L, hasNextEpisode = true)?.label)
+    }
+
+    @Test
+    fun `omitted lookup status fails safe instead of enabling provider auto skip`() {
+        val plan = buildPlaybackSkipPlan(
+            providerSkip = SkipTimes(0.0, 90.0, 1_320.0, 1_410.0),
+            aniSkipSegments = emptyList(),
+        )
+
+        assertEquals(PlaybackSkipOrigin.PROVIDER, plan.opening?.origin)
+        assertEquals(PlaybackSkipOrigin.PROVIDER, plan.ending?.origin)
+        assertNull(plan.automaticOpening)
+        assertNull(plan.automaticEnding)
     }
 
     @Test
