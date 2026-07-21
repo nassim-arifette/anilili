@@ -149,6 +149,29 @@ fun WatchScreen(
     var fullscreen by remember(animeId, showEpisodeListInitially, device.isTv) {
         mutableStateOf(device.isTv && !showEpisodeListInitially)
     }
+    val successData = (state as? UiState.Success)?.data
+    val requestedPlayerMode = when {
+        webFallback -> WatchPlayerMode.EMBED
+        successData == null -> WatchPlayerMode.INACTIVE
+        successData.anilistId != animeId -> WatchPlayerMode.INACTIVE
+        device.isTv && !fullscreen -> WatchPlayerMode.INACTIVE
+        successData.chosenStream == null -> WatchPlayerMode.INACTIVE
+        successData.chosenStream.isEmbed || ProviderCatalog.isEmbed(successData.provider) -> WatchPlayerMode.EMBED
+        else -> WatchPlayerMode.NATIVE
+    }
+    // Do not compose a WebView (or expose a terminal state) in the same frame that removes the
+    // native surface. The service owns its player beyond PlayerSurface's lifetime, so disposal
+    // alone cannot silence it. This explicit barrier stops/clears Media3 first, then permits the
+    // requested owner to render on the following frame.
+    var renderedPlayerMode by remember(animeId) { mutableStateOf<WatchPlayerMode?>(null) }
+    val playerModeHandoff = playerModeHandoffAction(renderedPlayerMode, requestedPlayerMode)
+    LaunchedEffect(animeId, requestedPlayerMode) {
+        if (playerModeHandoff == PlayerModeHandoffAction.STOP_NATIVE_THEN_RENDER) {
+            PlaybackService.stopActivePlayback()
+        }
+        renderedPlayerMode = requestedPlayerMode
+    }
+    val playerModeReady = renderedPlayerMode == requestedPlayerMode
     val activity = remember(context) { context.findActivity() }
     val currentOnBack by rememberUpdatedState(onBack)
     var embeddedPlaybackStopper by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -253,6 +276,14 @@ fun WatchScreen(
         )
     }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
+        if (!playerModeReady) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                com.miruronative.ui.components.NoFaceLoadingIndicator(size = 72.dp)
+            }
+            BackButton(pauseAndBack, Modifier.align(Alignment.TopStart))
+            return@Box
+        }
+
         if (webFallback) {
             EmbedWebView(
                 url = "https://www.miruro.to/info/$animeId",
@@ -530,9 +561,6 @@ private fun WatchContent(
                     stream == null -> NoSource(onWebFallback)
                     stream.isEmbed || ProviderCatalog.isEmbed(data.provider) ->
                         Box(Modifier.fillMaxSize()) {
-                            LaunchedEffect(embedPlaybackKey, stream.url) {
-                                PlaybackService.stopActivePlayback()
-                            }
                             EmbedEpisodeNavigationEffect(
                                 hasPrevious = data.hasPrev,
                                 hasNext = data.hasNext,
