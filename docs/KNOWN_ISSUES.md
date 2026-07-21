@@ -70,6 +70,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 
 | ID | Status | Fix | Topic branch |
 | --- | --- | --- | --- |
+| DIAG-001 | [x] | Redact signed playback and WebView URLs from user-shareable diagnostics and debug logs. URL-bearing lifecycle, resolver, navigation, native-player, and process-wide playback-service entries retain only a bounded normalized host and stable SHA-256 fingerprint. Remote page titles, WebView error text, HTTP reason phrases, pipe response bodies, and player exception messages are excluded from logs while user-facing errors remain available in the UI. | `fix/embed-diagnostic-url-redaction` |
 | PIPE-001 | [x] | Bind Pipe requests/readiness to a WebView and document generation; cancel displaced requests and reject stale callbacks. | `fix/pipe-request-lifecycle` |
 | PIPE-002 | [x] | Let requests wait for delayed WebView attachment and restart readiness safely after navigation or renderer replacement. | `fix/pipe-request-lifecycle-reviewed` |
 | AUTH-001 | [x] | Bind MAL authorization codes and verifier snapshots to the correct login attempt. | `fix/mal-auth-session-race`, `fix/mal-auth-code-snapshot` |

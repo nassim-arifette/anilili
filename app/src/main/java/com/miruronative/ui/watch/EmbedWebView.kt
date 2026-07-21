@@ -69,6 +69,7 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.CrashReporter
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
@@ -764,12 +765,16 @@ fun EmbedWebView(
 
     LaunchedEffect(navigationSession.generation) {
         DiagnosticsLog.event(
-            "EmbedWebView composed urlHost=${allowedHost ?: "unknown"} " +
-                "generation=${navigationSession.generation} refererHost=${activeReferer.hostOrNone()}",
+            "EmbedWebView composed document=${privacySafeUrlDiagnosticLabel(activeUrl)} " +
+                "generation=${navigationSession.generation} " +
+                "referer=${privacySafeUrlDiagnosticLabel(activeReferer)}",
         )
         delay(10_000)
         if (finishedUrl == null && loadError == null) {
-            DiagnosticsLog.event("EmbedWebView still loading after 10000ms urlHost=${allowedHost ?: "unknown"}")
+            DiagnosticsLog.event(
+                "EmbedWebView still loading after 10000ms " +
+                    privacySafeUrlDiagnosticLabel(activeUrl),
+            )
         }
     }
     // The navigation session locks its main frame after the accepted finish callback: later
@@ -1287,14 +1292,14 @@ fun EmbedWebView(
                                 finishedUrl = null
                                 DiagnosticsLog.event(
                                     "EmbedWebView page started generation=${navigationSession.generation} " +
-                                        "host=${startedUrl.hostOrNone()}",
+                                        privacySafeUrlDiagnosticLabel(startedUrl),
                                 )
                             },
-                            onPageFinishedAccepted = { finishedView, loadedUrl ->
+                            onPageFinishedAccepted = { _, loadedUrl ->
                                 finishedUrl = loadedUrl
                                 DiagnosticsLog.event(
                                     "EmbedWebView page finished generation=${navigationSession.generation} " +
-                                        "host=${loadedUrl.hostOrNone()} title=${finishedView.title ?: "none"}",
+                                        privacySafeUrlDiagnosticLabel(loadedUrl),
                                 )
                                 if (playbackMode.exposesNativeBridge) {
                                     val navigationSetupJs = buildString {
@@ -1337,7 +1342,7 @@ fun EmbedWebView(
                             },
                         )
                         DiagnosticsLog.event(
-                            "EmbedWebView loadUrl after blank host=${activeUrl.hostOrNone()} " +
+                            "EmbedWebView loadUrl after blank ${privacySafeUrlDiagnosticLabel(activeUrl)} " +
                                 "generation=${navigationSession.generation} " +
                                 "headers=${headers.keys.joinToString()}",
                         )
@@ -1393,7 +1398,8 @@ fun EmbedWebView(
                 if (webView === web) webView = null
                 val releasedUrl = runCatching { web.url }.getOrNull()
                 DiagnosticsLog.event(
-                    "EmbedWebView release url=${releasedUrl ?: "none"} size=${web.width}x${web.height}",
+                    "EmbedWebView release ${privacySafeUrlDiagnosticLabel(releasedUrl)} " +
+                        "size=${web.width}x${web.height}",
                 )
                 stopWebPlayback(web)
                 runCatching { web.removeJavascriptInterface("AniliProgress") }
@@ -2214,7 +2220,9 @@ private fun beginEmbedDocumentTeardown(
 }
 
 private fun stopWebPlayback(webView: WebView) {
-    DiagnosticsLog.event("EmbedWebView stop playback url=${webView.url ?: "none"}")
+    DiagnosticsLog.event(
+        "EmbedWebView stop playback ${privacySafeUrlDiagnosticLabel(webView.url)}",
+    )
     // pauseTimers() is process-wide and can freeze OAuth and hidden resolver WebViews.
     runCatching { webView.onPause() }
     var blankRequested = false
@@ -2300,9 +2308,6 @@ private fun isInSkipWindow(positionMs: Long, startMs: Long?, endMs: Long?): Bool
     return end > start && positionMs in start until end
 }
 
-private fun String?.hostOrNone(): String =
-    this?.let { runCatching { Uri.parse(it).host }.getOrNull() } ?: "none"
-
 /** Client used only while the outgoing episode is being replaced by `about:blank`. */
 private class EmbedTeardownWebViewClient(
     private val session: EmbedNavigationSession,
@@ -2330,7 +2335,8 @@ private class EmbedTeardownWebViewClient(
         } else {
             DiagnosticsLog.event(
                 "EmbedWebView ignored stale/non-blank teardown finish " +
-                    "generation=${session.generation} callback=${url.hostOrNone()}",
+                    "generation=${session.generation} " +
+                    "callback=${privacySafeUrlDiagnosticLabel(url)}",
             )
         }
     }
@@ -2403,7 +2409,7 @@ private class EmbedNavigationWebViewClient(
         if (!allowed) {
             DiagnosticsLog.event(
                 "EmbedWebView blocked main-frame nav generation=${session.generation} " +
-                    "targetHost=${target.host.orEmpty()}",
+                    "target=${privacySafeUrlDiagnosticLabel(target.toString())}",
             )
         }
         return !allowed
@@ -2415,7 +2421,8 @@ private class EmbedNavigationWebViewClient(
         } else {
             DiagnosticsLog.event(
                 "EmbedWebView ignored page started generation=${session.generation} " +
-                    "callback=${url.hostOrNone()} current=${view?.url.hostOrNone()}",
+                    "callback=${privacySafeUrlDiagnosticLabel(url)} " +
+                    "current=${privacySafeUrlDiagnosticLabel(view?.url)}",
             )
         }
     }
@@ -2426,7 +2433,8 @@ private class EmbedNavigationWebViewClient(
         } else {
             DiagnosticsLog.event(
                 "EmbedWebView ignored page finished generation=${session.generation} " +
-                    "callback=${url.hostOrNone()} current=${view?.url.hostOrNone()}",
+                    "callback=${privacySafeUrlDiagnosticLabel(url)} " +
+                    "current=${privacySafeUrlDiagnosticLabel(view?.url)}",
             )
         }
     }
@@ -2436,15 +2444,17 @@ private class EmbedNavigationWebViewClient(
         if (!guard.acceptMainFrameError(session, request.url?.toString(), view?.url)) {
             DiagnosticsLog.event(
                 "EmbedWebView ignored main-frame error generation=${session.generation} " +
-                    "host=${request.url?.host ?: "unknown"}",
+                    privacySafeUrlDiagnosticLabel(request.url?.toString()),
             )
             return
         }
+        // Preserve the provider's text for the on-screen error only. Diagnostics below use
+        // controlled fields because a page can place its URL or credentials in this description.
         val message = error?.description?.toString() ?: "The server did not respond"
         DiagnosticsLog.event(
             "EmbedWebView main-frame error generation=${session.generation} " +
-                "code=${error?.errorCode} description=${error?.description} " +
-                "host=${request.url?.host ?: "unknown"}",
+                "category=web-resource code=${error?.errorCode ?: "unknown"} mainFrame=true " +
+                privacySafeUrlDiagnosticLabel(request.url?.toString()),
         )
         onMainFrameErrorAccepted(message)
     }
@@ -2458,15 +2468,15 @@ private class EmbedNavigationWebViewClient(
         if (!guard.acceptMainFrameError(session, request.url?.toString(), view?.url)) {
             DiagnosticsLog.event(
                 "EmbedWebView ignored main-frame HTTP error generation=${session.generation} " +
-                    "host=${request.url?.host ?: "unknown"}",
+                    privacySafeUrlDiagnosticLabel(request.url?.toString()),
             )
             return
         }
         val message = "HTTP ${errorResponse?.statusCode ?: "error"} from the video server"
         DiagnosticsLog.event(
             "EmbedWebView main-frame HTTP error generation=${session.generation} " +
-                "status=${errorResponse?.statusCode} reason=${errorResponse?.reasonPhrase} " +
-                "host=${request.url?.host ?: "unknown"}",
+                "category=http status=${errorResponse?.statusCode ?: "unknown"} mainFrame=true " +
+                privacySafeUrlDiagnosticLabel(request.url?.toString()),
         )
         onMainFrameErrorAccepted(message)
     }

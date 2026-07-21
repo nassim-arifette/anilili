@@ -7,6 +7,7 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import java.io.ByteArrayOutputStream
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
@@ -64,7 +65,8 @@ internal class FlixcloudPlaylistDataSource(
             if (isPlaylist || segmentLogCount.getAndIncrement() < 3) {
                 DiagnosticsLog.event(
                     "Flixcloud ${if (isPlaylist) "playlist decoded" else "segment unwrapped"} " +
-                        "host=${dataSpec.uri.host ?: "unknown"} bytes=${decoded.size}",
+                        "${privacySafeUrlDiagnosticLabel(dataSpec.uri.toString())} " +
+                        "bytes=${decoded.size}",
                 )
             }
         }

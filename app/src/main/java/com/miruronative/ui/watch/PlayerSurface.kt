@@ -95,6 +95,8 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.DefaultQuality
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.playerErrorDiagnosticCategory
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import com.miruronative.playback.LocalPlaybackOwnerToken
 import com.miruronative.playback.CastSourceDecision
 import com.miruronative.playback.chooseCastSource
@@ -598,7 +600,7 @@ internal fun PlayerSurface(
                     val accepted = runIfPlaybackOwnerActive {
                         DiagnosticsLog.event(
                             "PlayerSurface playbackState=${playbackState.stateName()} " +
-                                "mediaId=${activeController.currentMediaItem?.mediaId?.take(120) ?: "none"}",
+                                "media=${privacySafeUrlDiagnosticLabel(activeController.currentMediaItem?.mediaId)}",
                         )
                         // The default-quality effect waits for READY; re-trigger it when we get there.
                         if (playbackState == Player.STATE_READY) tracksRevision++
@@ -641,8 +643,17 @@ internal fun PlayerSurface(
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
+                    val diagnosticCategory = playerErrorDiagnosticCategory(error.errorCode)
+                    // Media3 may include a signed media URI in localizedMessage. It remains an
+                    // on-screen recovery message; only the controlled category/code are logged.
+                    val userFacingMessage = error.localizedMessage
+                        ?.takeIf(String::isNotBlank)
+                        ?: "Playback failed"
                     val accepted = runIfPlaybackOwnerActive {
-                        DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
+                        DiagnosticsLog.event(
+                            "PlayerSurface player error category=$diagnosticCategory " +
+                                "code=${error.errorCode}",
+                        )
                         val failedItem = activeController.currentMediaItem
                         val failedIdentity = failedItem?.playbackIdentityOrNull()
                         val failedMediaId = failedIdentity?.mediaId
@@ -677,7 +688,7 @@ internal fun PlayerSurface(
                                     if (replacement == null) {
                                         currentOnError(
                                             failedIdentity,
-                                            error.localizedMessage ?: "Playback failed",
+                                            userFacingMessage,
                                             failedMediaId,
                                             fallback.resumePositionMs,
                                             setOf(failedMediaId),
@@ -713,7 +724,7 @@ internal fun PlayerSurface(
                                 }
                                 is DecoderFallbackAction.Exhausted -> currentOnError(
                                     failedIdentity,
-                                    error.localizedMessage ?: "Playback failed",
+                                    userFacingMessage,
                                     failedMediaId,
                                     fallback.resumePositionMs,
                                     fallback.attemptedMediaIds.ifEmpty { setOf(failedMediaId) },
@@ -725,7 +736,7 @@ internal fun PlayerSurface(
                         } else {
                             currentOnError(
                                 failedIdentity,
-                                error.localizedMessage ?: "Playback failed",
+                                userFacingMessage,
                                 failedMediaId,
                                 activeController.currentPosition.coerceAtLeast(0L),
                                 setOf(failedMediaId),

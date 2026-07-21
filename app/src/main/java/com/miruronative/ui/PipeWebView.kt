@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import com.miruronative.data.remote.PipeBridge
 import com.miruronative.diagnostics.CrashReporter
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 
 /**
  * Hidden 1dp WebView that hosts the Cloudflare-cleared miruro.to session. It stays attached to the
@@ -52,7 +53,10 @@ fun PipeWebView() {
         onRelease = { view ->
             val web = view as? WebView ?: return@AndroidView
             val releasedUrl = runCatching { web.url }.getOrNull()
-            DiagnosticsLog.event("PipeWebView release url=${releasedUrl ?: "none"} size=${web.width}x${web.height}")
+            DiagnosticsLog.event(
+                "PipeWebView release ${privacySafeUrlDiagnosticLabel(releasedUrl)} " +
+                    "size=${web.width}x${web.height}",
+            )
             PipeBridge.detach(web)
             runCatching { web.stopLoading() }
             runCatching { web.webChromeClient = null }

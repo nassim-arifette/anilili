@@ -313,7 +313,7 @@ fun WatchScreen(
                     DiagnosticsLog.event("WatchScreen still loading after 10000ms id=$animeId provider=$provider")
                 }
             }
-            is UiState.Error -> DiagnosticsLog.event("WatchScreen error visible message=${s.message.take(160)}")
+            is UiState.Error -> DiagnosticsLog.event("WatchScreen error visible category=watch-load")
             is UiState.Success -> {
                 val stream = s.data.chosenStream
                 DiagnosticsLog.event(

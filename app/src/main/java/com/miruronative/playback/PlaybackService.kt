@@ -33,6 +33,8 @@ import androidx.media3.session.CommandButton
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.playerErrorDiagnosticCategory
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import com.miruronative.MainActivity
 import com.miruronative.data.AppGraph
 import com.miruronative.data.auth.AccountService
@@ -302,13 +304,17 @@ class PlaybackService : MediaSessionService() {
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
-                        DiagnosticsLog.throwable("PlaybackService player error code=${error.errorCodeName}", error)
+                        DiagnosticsLog.event(
+                            "PlaybackService player error " +
+                                "category=${playerErrorDiagnosticCategory(error.errorCode)} " +
+                                "code=${error.errorCode}",
+                        )
                     }
 
                     override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
                         DiagnosticsLog.event(
                             "PlaybackService media transition reason=$reason " +
-                                "mediaId=${mediaItem?.mediaId?.take(120) ?: "none"}",
+                                "media=${privacySafeUrlDiagnosticLabel(mediaItem?.mediaId)}",
                         )
                         if (!::session.isInitialized) return
                         val retained = remoteHistoryMetadataFor(mediaItem)
@@ -1142,7 +1148,7 @@ class PlaybackService : MediaSessionService() {
             )
             DiagnosticsLog.event(
                 "PlaybackService.configureRequestHeaders " +
-                    "refererHost=${android.net.Uri.parse(safeReferer).host ?: "unknown"} " +
+                    "referer=${privacySafeUrlDiagnosticLabel(safeReferer)} " +
                     "playlistKey=${playlistKey != null}",
             )
         }
