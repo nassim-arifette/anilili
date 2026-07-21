@@ -695,7 +695,7 @@ fun EmbedWebView(
                                 )
                                 if (navigationSession.request.resumePositionMs > 0L) {
                                     append(
-                                        RESUME_WHEN_READY_JS(
+                                        embedResumeWhenReadyJs(
                                             navigationSession.request.resumePositionMs / 1000.0,
                                             navigationSession.generation,
                                         ),
@@ -1367,38 +1367,6 @@ private fun REMOTE_TOGGLE_PLAYBACK_JS(navigationGeneration: Long): String = """
         }
       } catch (e) { /* ignored */ }
       return false;
-    })();
-""".trimIndent()
-
-private fun RESUME_WHEN_READY_JS(targetSec: Double, navigationGeneration: Long): String = """
-    (function() {
-      ${embedNavigationJsGuard(navigationGeneration)}
-      var attempts = 0;
-      var timer = setInterval(function() {
-        if (
-          window.__aniliNavigationToken !== '$navigationGeneration' ||
-          window.__aniliNavigationRevoked === true
-        ) {
-          clearInterval(timer);
-          return;
-        }
-        attempts++;
-        try {
-          var video = document.querySelector('video');
-          if (video && video.readyState >= 1) {
-            var target = $targetSec;
-            video.currentTime = isFinite(video.duration) && video.duration > 0
-              ? Math.min(target, video.duration)
-              : target;
-            video.play();
-            clearInterval(timer);
-          } else if (attempts >= 30) {
-            clearInterval(timer);
-          }
-        } catch (e) {
-          if (attempts >= 30) clearInterval(timer);
-        }
-      }, 250);
     })();
 """.trimIndent()
 
