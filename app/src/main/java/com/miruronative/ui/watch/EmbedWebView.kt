@@ -573,14 +573,19 @@ fun EmbedWebView(
         onDispose { currentOnPlaybackStopperChanged?.invoke(null) }
     }
 
-    val canControlPlayback = playbackMode.controlsPlayback && webPlaybackAvailable
+    val canControlPlayback = canUseManagedEmbedControls(
+        managedControlsDeclared = playbackMode.controlsPlayback,
+        bridgePlaybackAvailable = webPlaybackAvailable,
+        activeMediaIdentity = activeConcreteMediaIdentity,
+        reportedMediaIdentity = webMediaIdentity,
+    )
     val canAutomatePlayback = canControlPlayback && playbackMode.automatesEpisode
     // Full touch controls — seek bar and all — whenever the injected JS can reach the <video>.
     val touchControlsActive = canControlPlayback && !device.isTv && loadError == null
     // Everything else: the page is out of reach, so this bar carries only what the app itself can
     // answer — episode moves, device-volume settings, fullscreen, and an honest provider hand-off.
     val fallbackControlsActive =
-        playbackMode.controlsPlayback && !device.isTv && !webPlaybackAvailable && loadError == null
+        playbackMode.controlsPlayback && !device.isTv && !canControlPlayback && loadError == null
     val tvControlPolicy = embedTvControlPolicy(
         playerOwnsRemote = device.isTv && focusPlayerOnStart,
         managedControlsDeclared = playbackMode.controlsPlayback,

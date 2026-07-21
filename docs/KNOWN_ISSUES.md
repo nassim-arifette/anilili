@@ -63,6 +63,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | EMBED-001 | [x] | Authenticate bridge callbacks and isolate every embed navigation so an old page cannot update the new episode. | `fix/webview-bridge-capabilities`, `fix/embed-navigation-generation` |
 | EMBED-002 | [x] | Retry resume until a same-origin video is ready, including accessible iframes, and preserve pause state during seeks. | `fix/embed-resume-readiness`, `fix/embed-seek-preserves-pause` |
 | EMBED-003 | [x] | Accept natural embed completion only after content-like playback samples, commit it before autoplay, and advance at most once. | `fix/embed-safe-natural-end-autoplay`, `fix/embed-terminal-progress-commit` |
+| EMBED-004 | [x] | Keep managed embed controls unavailable until the authenticated bridge and the active concrete video report the exact same media identity. The pre-tick readiness window now retains the honest provider handoff instead of dispatching commands whose acknowledgement cannot be matched. | `fix/embed-concrete-control-readiness` |
 
 ### Pipe, account, synchronization, and update safety
 
