@@ -404,12 +404,11 @@ private fun DetailActions(
     }
 }
 
-/** Series-level progress like list apps show: how far through the whole anime the user is. */
+/** Series-level progress from episodes actually observed on this device. */
 @Composable
 private fun SeriesWatchProgress(resume: HistoryEntry, totalEpisodes: Int) {
     if (totalEpisodes <= 0) return
-    val watched = ((resume.episodeNumber - 1).coerceAtLeast(0.0) + resume.progressFraction).toFloat()
-    val fraction = (watched / totalEpisodes).coerceIn(0f, 1f)
+    val fraction = resume.seriesWatchFraction(totalEpisodes)
     val pad = LocalAppDeviceProfile.current.pagePadding
     Column(Modifier.fillMaxWidth().padding(start = pad, end = pad, bottom = 12.dp)) {
         Row(

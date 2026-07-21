@@ -94,17 +94,9 @@ fun WatchProgressBar(fraction: Float, modifier: Modifier = Modifier) {
     }
 }
 
-/**
- * How much of [episodeNumber] counts as watched, judged from the anime's single history entry:
- * everything before the episode being tracked is complete, the tracked episode carries its
- * playback fraction, and later episodes are untouched.
- */
-fun episodeWatchFraction(entry: com.miruronative.data.library.HistoryEntry?, episodeNumber: Double): Float = when {
-    entry == null -> 0f
-    episodeNumber < entry.episodeNumber -> 1f
-    episodeNumber == entry.episodeNumber -> entry.progressFraction
-    else -> 0f
-}
+/** How much of [episodeNumber] was actually observed locally, with no sequential inference. */
+fun episodeWatchFraction(entry: com.miruronative.data.library.HistoryEntry?, episodeNumber: Double): Float =
+    entry?.watchFractionFor(episodeNumber) ?: 0f
 
 @Composable
 fun SectionHeader(

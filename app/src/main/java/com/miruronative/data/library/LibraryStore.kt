@@ -79,7 +79,8 @@ object LibraryStore {
         upsertHistoryInternal(entry, commitToDisk = true)
 
     private fun upsertHistoryInternal(entry: HistoryEntry, commitToDisk: Boolean): Boolean {
-        val stamped = entry.copy(updatedAt = System.currentTimeMillis())
+        val existing = _history.value.firstOrNull { it.anilistId == entry.anilistId }
+        val stamped = mergeHistoryEntry(existing, entry).copy(updatedAt = System.currentTimeMillis())
         val updated = buildList {
             add(stamped)
             addAll(_history.value.filter { it.anilistId != entry.anilistId })

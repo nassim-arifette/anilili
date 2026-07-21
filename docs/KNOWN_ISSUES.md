@@ -42,6 +42,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | HISTORY-005 | [x] | Hide a completed final episode from Continue Watching and Watch Next while retaining it in history. | `fix/completed-final-episode-history` |
 | HISTORY-006 | [x] | Require a known series episode total and an exact final-episode match before marking a title completed. The latest released episode of an airing series remains resumable. | `fix/final-episode-completion-evidence` |
 | HISTORY-007 | [x] | Key Watch Next throttling by episode/source context, use a monotonic clock, and remove completed titles. | `fix/watch-next-content-aware-throttle` |
+| HISTORY-008 | [x] | Persist sparse per-episode device progress and render only episodes actually played. Opening episode 90 no longer marks episodes 1-89 complete or fills their thumbnail bars. | `fix/per-episode-watch-progress` |
 
 ### Intro, outro, embed, and autoplay
 
@@ -174,6 +175,12 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   enabled. The workflow uploads and verifies both assets on a draft before publishing, requires the
   release response to be immutable, and `v0.2.1` has a valid GitHub release attestation. Historical
   `v0.2.0` remains mutable because the setting only applies to future releases.
+
+- [ ] **OPEN-024 - Sparse remote-list progress.** AniList and MyAnimeList expose an aggregate
+  integer episode count rather than a sparse per-episode ledger. Local thumbnails now remain honest,
+  but syncing out-of-order playback such as episode 90 still uses the remote service's sequential
+  `progress = 90` semantics. Avoiding that inference requires a product policy for non-contiguous
+  playback (for example, syncing only the highest contiguous locally completed episode).
 
 ## Superseded candidates retired without tree changes
 
