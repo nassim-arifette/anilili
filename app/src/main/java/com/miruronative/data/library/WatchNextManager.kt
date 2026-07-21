@@ -62,12 +62,13 @@ object WatchNextManager {
     private fun publishProgram(context: Context, entry: HistoryEntry, engagementAtMs: Long): Boolean =
         runCatching {
             val app = context.applicationContext
+            val target = entry.watchNextProgramData()
             val watchIntent = Intent(app, com.miruronative.MainActivity::class.java).apply {
                 action = Intent.ACTION_VIEW
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra(
                     Routes.EXTRA_ROUTE,
-                    Routes.watch(entry.anilistId, entry.provider, entry.category, entry.episodeLabel),
+                    Routes.watch(entry.anilistId, entry.provider, entry.category, target.episodeLabel),
                 )
             }
             val program = WatchNextProgram.Builder()
@@ -75,15 +76,15 @@ object WatchNextManager {
                 .setWatchNextType(TvContractCompat.WatchNextPrograms.WATCH_NEXT_TYPE_CONTINUE)
                 .setLastEngagementTimeUtcMillis(engagementAtMs)
                 .setTitle(entry.title)
-                .setEpisodeTitle(entry.episodeTitle ?: "Episode ${entry.episodeLabel}")
-                .setEpisodeNumber(entry.episodeNumber.toInt())
+                .setEpisodeTitle(target.episodeTitle)
+                .setEpisodeNumber(target.episodeNumber.toInt())
                 .setInternalProviderId(entry.anilistId.toString())
                 .setIntentUri(Uri.parse(watchIntent.toUri(Intent.URI_INTENT_SCHEME)))
                 .apply {
                     entry.cover?.let { setPosterArtUri(Uri.parse(it)) }
-                    if (entry.durationMs > 0) {
-                        setDurationMillis(entry.durationMs.toInt())
-                        setLastPlaybackPositionMillis(entry.positionMs.coerceAtLeast(0).toInt())
+                    if (target.durationMs > 0) {
+                        setDurationMillis(target.durationMs.toInt())
+                        setLastPlaybackPositionMillis(target.positionMs.coerceAtLeast(0).toInt())
                     }
                 }
                 .build()
@@ -193,6 +194,15 @@ internal data class WatchNextContent(
     val episodeNumber: Double,
     val provider: String,
     val category: String,
+    val isContinuationTarget: Boolean = false,
+)
+
+internal data class WatchNextProgramData(
+    val episodeNumber: Double,
+    val episodeLabel: String,
+    val episodeTitle: String,
+    val positionMs: Long,
+    val durationMs: Long,
 )
 
 internal data class WatchNextPublishState(
@@ -201,9 +211,19 @@ internal data class WatchNextPublishState(
 )
 
 internal fun HistoryEntry.watchNextContent(): WatchNextContent = WatchNextContent(
-    episodeNumber = episodeNumber,
+    episodeNumber = continueEpisodeNumber,
     provider = provider,
     category = category,
+    isContinuationTarget = hasContinuationTarget,
+)
+
+internal fun HistoryEntry.watchNextProgramData(): WatchNextProgramData = WatchNextProgramData(
+    episodeNumber = continueEpisodeNumber,
+    episodeLabel = continueEpisodeLabel,
+    episodeTitle = episodeTitle.takeUnless { hasContinuationTarget } ?: "Episode $continueEpisodeLabel",
+    positionMs = continuePositionMs,
+    // The completed episode's duration does not describe the fresh continuation target.
+    durationMs = continueDurationMs,
 )
 
 internal fun shouldPublishWatchNext(

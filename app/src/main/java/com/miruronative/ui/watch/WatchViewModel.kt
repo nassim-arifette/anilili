@@ -826,12 +826,18 @@ class WatchViewModel : ViewModel() {
             totalEpisodes = totalEpisodes,
             hasNextEpisode = data.hasNext,
         )
+        val continuationEpisodeNumber = continuationEpisodeAfterNaturalEnd(
+            currentEpisodeNumber = commit.identity.episodeNumber,
+            nextEpisodeNumber = data.episodes.getOrNull(data.currentIndex + 1)?.number,
+            completedFinalEpisode = completedFinalEpisode,
+        )
         if (
             !LibraryStore.updateProgressDurably(
                 anilistId = progressIdentity.animeId,
                 episodeNumber = commit.identity.episodeNumber,
                 positionMs = commit.positionMs,
                 durationMs = commit.durationMs,
+                continuationEpisodeNumber = continuationEpisodeNumber,
                 completed = completedFinalEpisode,
             )
         ) {
@@ -846,6 +852,7 @@ class WatchViewModel : ViewModel() {
             persisted.episodeNumber != commit.identity.episodeNumber ||
             persisted.positionMs != commit.positionMs ||
             persisted.durationMs != commit.durationMs ||
+            persisted.continuationEpisodeNumber != continuationEpisodeNumber ||
             persisted.completed != completedFinalEpisode
         ) {
             DiagnosticsLog.event(
@@ -916,6 +923,11 @@ class WatchViewModel : ViewModel() {
             totalEpisodes = totalEpisodes,
             hasNextEpisode = data.hasNext,
         )
+        val continuationEpisodeNumber = continuationEpisodeAfterNaturalEnd(
+            currentEpisodeNumber = commit.playbackKey.episodeNumber,
+            nextEpisodeNumber = data.episodes.getOrNull(data.currentIndex + 1)?.number,
+            completedFinalEpisode = completedFinalEpisode,
+        )
         val entry = HistoryEntry(
             anilistId = commit.playbackKey.animeId,
             title = data.seriesTitle,
@@ -926,6 +938,7 @@ class WatchViewModel : ViewModel() {
             category = commit.playbackKey.category,
             positionMs = commit.positionMs,
             durationMs = commit.durationMs,
+            continuationEpisodeNumber = continuationEpisodeNumber,
             completed = completedFinalEpisode,
         )
         if (!LibraryStore.upsertHistoryDurably(entry)) {
@@ -940,6 +953,7 @@ class WatchViewModel : ViewModel() {
             persisted.episodeNumber != commit.playbackKey.episodeNumber ||
             persisted.positionMs != commit.positionMs ||
             persisted.durationMs != commit.durationMs ||
+            persisted.continuationEpisodeNumber != continuationEpisodeNumber ||
             persisted.completed != completedFinalEpisode
         ) {
             DiagnosticsLog.event(
