@@ -627,8 +627,11 @@ class WatchViewModel : ViewModel() {
         // first episode merely because that server/audio pair lacks the episode being watched.
         if (selectedProviderEpisodes.none { it.number == currentNumber }) return
 
+        // Keep resolution on the provider that is actually playing for the rest of this watch
+        // session. A SUB/DUB switch is not a request to change the user's global preference, but
+        // it must not fall back to the stale provider that failed earlier in the session either.
+        preferred = providerName
         if (rememberProvider) {
-            preferred = providerName
             globalPreferredProvider = providerName
             SettingsStore.setPreferredProvider(providerName)
         }
