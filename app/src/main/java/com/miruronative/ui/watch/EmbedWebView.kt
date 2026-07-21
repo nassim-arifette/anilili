@@ -104,7 +104,7 @@ fun EmbedWebView(
     startPositionMs: Long = 0L,
     skip: SkipTimes? = null,
     aniSkipSegments: List<AniSkipPlaybackSegment> = emptyList(),
-    aniSkipLookupStatus: AniSkipLookupStatus = AniSkipLookupStatus.COMPLETE,
+    aniSkipLookupStatus: AniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
     seriesTitle: String? = null,
     episodeTitle: String? = null,
     onPreviousEpisode: ((EmbedPlaybackKey) -> Unit)? = null,

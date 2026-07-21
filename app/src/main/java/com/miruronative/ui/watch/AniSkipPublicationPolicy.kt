@@ -24,6 +24,33 @@ internal fun aniSkipDurationBucketMs(durationMs: Long): Long? {
     return (((durationMs + 500L) / 1_000L) * 1_000L).takeIf { it > 0L }
 }
 
+/**
+ * Some player backends briefly report an unknown duration after already publishing a measured
+ * one. Keep the last usable duration only for the exact same concrete media identity so an
+ * in-flight AniSkip response can still prove that it belongs to the current encode. A source,
+ * episode, or generation change must never inherit the previous media item's duration.
+ */
+internal fun progressSnapshotRetainingValidDuration(
+    previous: PlaybackProgressSnapshot?,
+    identity: PlaybackIdentity,
+    positionMs: Long,
+    durationMs: Long,
+): PlaybackProgressSnapshot {
+    val retainedDurationMs = if (aniSkipDurationBucketMs(durationMs) != null) {
+        durationMs
+    } else {
+        previous
+            ?.takeIf { it.identity == identity && aniSkipDurationBucketMs(it.durationMs) != null }
+            ?.durationMs
+            ?: durationMs
+    }
+    return PlaybackProgressSnapshot(
+        identity = identity,
+        positionMs = positionMs,
+        durationMs = retainedDurationMs,
+    )
+}
+
 internal fun canPublishAniSkipSegments(
     expected: AniSkipLookupIdentity,
     current: AniSkipLookupIdentity,

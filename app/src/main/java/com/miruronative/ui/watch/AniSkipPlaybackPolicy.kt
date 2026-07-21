@@ -60,7 +60,7 @@ internal data class PlaybackSkipAction(
 internal fun buildPlaybackSkipPlan(
     providerSkip: SkipTimes?,
     aniSkipSegments: List<AniSkipPlaybackSegment>,
-    aniSkipLookupStatus: AniSkipLookupStatus = AniSkipLookupStatus.COMPLETE,
+    aniSkipLookupStatus: AniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
 ): PlaybackSkipPlan {
     fun typedMarker(vararg priorities: AniSkipType): PlaybackSkipMarker? = priorities
         .asSequence()
