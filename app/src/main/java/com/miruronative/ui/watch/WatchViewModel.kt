@@ -140,6 +140,7 @@ class WatchViewModel : ViewModel() {
     private var sourceValidationJob: Job? = null
     private var mergedIncludesAnivexa = false
     private var mergedEpisodes = EpisodesResult(emptyList())
+    private var catalogGeneration = 0L
     private val requestGate = PlaybackRequestGate()
     private var pendingResolution: PendingResolution? = null
     private var playbackGenerationCounter = 0
@@ -170,6 +171,7 @@ class WatchViewModel : ViewModel() {
         unavailableSources.clear()
         confirmedSources.clear()
         mergedIncludesAnivexa = false
+        catalogGeneration = 0L
         episodeMeta = emptyList()
         resetProgressSession()
 
@@ -260,6 +262,7 @@ class WatchViewModel : ViewModel() {
                         },
                 )
                 mergedEpisodes = merged
+                catalogGeneration++
                 // Prefer dub: launches carrying category=sub (typically history saved before the
                 // setting was enabled) upgrade to dub when the catalog actually has the start
                 // episode dubbed. In-player category switches are unaffected — this only runs on
@@ -329,30 +332,12 @@ class WatchViewModel : ViewModel() {
             val late = lateResult?.getOrNull() ?: return@launch
             if (late.isEmpty) return@launch
             mergedEpisodes = repo.mergeProviders(late, mergedEpisodes)
+            catalogGeneration++
             val rebuiltSpine = pickSpine(mergedEpisodes)
             DiagnosticsLog.event(
                 "Watch miruro late merge applied id=$id providers=" + late.providerNames.joinToString(),
             )
-            if (requestGate.hasPendingRequest()) return@launch
-            val activeRequest = requestGate.currentRequest()
-            val data = (_state.value as? UiState.Success)?.data ?: return@launch
-            val number = data.current.number
-            val index = navigationEpisodeIndex(rebuiltSpine, number)
-            if (index == null) {
-                DiagnosticsLog.event(
-                    "Watch miruro late merge ignored: active episode=${fmt(number)} missing from rebuilt spine",
-                )
-                return@launch
-            }
-            spine = rebuiltSpine
-            _state.value = UiState.Success(
-                data.copy(
-                    episodes = spine,
-                    currentIndex = index,
-                    sourceOptions = sourceOptions(number),
-                ),
-            )
-            launchSourceValidation(number, activeRequest)
+            publishMergedSpine(rebuiltSpine, mergeLabel = "miruro")
         }
     }
 
@@ -373,6 +358,7 @@ class WatchViewModel : ViewModel() {
             ensureCurrentSession(session)
             val rebuiltSpine = if (anivexa != null && !anivexa.isEmpty) {
                 mergedEpisodes = repo.mergeProviders(mergedEpisodes, anivexa)
+                catalogGeneration++
                 DiagnosticsLog.event(
                     "Watch anivexa merge applied id=$id providers=" + mergedEpisodes.providerNames.joinToString(),
                 )
@@ -383,27 +369,51 @@ class WatchViewModel : ViewModel() {
             mergedIncludesAnivexa = true
             // Reflect completion whether or not Anivexa added anything: the extra servers become
             // selectable and the "loading more servers" hint clears.
-            if (requestGate.hasPendingRequest()) return@launch
-            val activeRequest = requestGate.currentRequest()
-            val data = (_state.value as? UiState.Success)?.data ?: return@launch
+            publishMergedSpine(
+                rebuiltSpine = rebuiltSpine,
+                mergeLabel = "anivexa",
+                isLoadingMoreSources = false,
+            )
+        }
+    }
+
+    /**
+     * Publish a late catalog even while a source request is pending. [spine] must not move on its
+     * own while [WatchData] still points at the old list: next/previous navigation reads both.
+     * The snapshot policy therefore either preserves the visible episode at its rebuilt index or
+     * rejects the whole publication. Loading states have no visible episode and can publish the
+     * rebuilt spine immediately, which is what lets a direct link resolve from a slow catalog.
+     */
+    private fun publishMergedSpine(
+        rebuiltSpine: List<EpisodeItem>,
+        mergeLabel: String,
+        isLoadingMoreSources: Boolean? = null,
+    ) {
+        val data = (_state.value as? UiState.Success)?.data
+        val visibleNumber = data?.current?.number
+        val publication = catalogSpinePublication(rebuiltSpine, visibleNumber)
+        if (publication == null) {
+            DiagnosticsLog.event(
+                "Watch $mergeLabel merge ignored: active episode=${visibleNumber?.let(::fmt) ?: "none"} " +
+                    "missing from rebuilt spine",
+            )
+            return
+        }
+
+        spine = publication.episodes
+        if (data != null) {
             val number = data.current.number
-            val index = navigationEpisodeIndex(rebuiltSpine, number)
-            if (index == null) {
-                DiagnosticsLog.event(
-                    "Watch anivexa merge ignored: active episode=${fmt(number)} missing from rebuilt spine",
-                )
-                return@launch
-            }
-            spine = rebuiltSpine
             _state.value = UiState.Success(
                 data.copy(
-                    episodes = spine,
-                    currentIndex = index,
+                    episodes = publication.episodes,
+                    currentIndex = checkNotNull(publication.currentIndex),
                     sourceOptions = sourceOptions(number),
-                    isLoadingMoreSources = false,
+                    isLoadingMoreSources = isLoadingMoreSources ?: data.isLoadingMoreSources,
                 ),
             )
-            launchSourceValidation(number, activeRequest)
+            if (!requestGate.hasPendingRequest()) {
+                launchSourceValidation(number, requestGate.currentRequest())
+            }
         }
     }
 
@@ -470,6 +480,7 @@ class WatchViewModel : ViewModel() {
         val previous = (_state.value as? UiState.Success)?.data
         _state.value = previous?.let { UiState.Success(it.copy(isResolving = true, notice = null)) }
             ?: UiState.Loading
+        var resolvedAgainstCatalogGeneration = catalogGeneration
         var resolution = repo.resolveSources(
             anilistId = requestAnimeId,
             number = number,
@@ -481,17 +492,26 @@ class WatchViewModel : ViewModel() {
         ensureCurrentRequest(request)
         val unavailableThisResolve = resolution.unavailableProviders.toMutableSet()
         var resolved = resolution.resolved
-        if (resolved == null && !mergedIncludesAnivexa) {
-            // The quick partial catalog missed; the slower servers may still carry this episode,
-            // so wait for the full merge before declaring no source.
-            DiagnosticsLog.event(
-                "Watch resolve retry pending full catalog id=$requestAnimeId episode=${fmt(number)}",
-            )
-            _loadingStatus.value = "Still looking — checking the remaining servers…"
-            anivexaMergeJob?.join()
+        suspend fun retryAfterCatalogMerge(label: String, mergeJob: Job?) {
+            if (resolved != null || mergeJob == null) return
+            if (mergeJob.isActive) {
+                DiagnosticsLog.event(
+                    "Watch resolve waiting for $label catalog id=$requestAnimeId episode=${fmt(number)}",
+                )
+                _loadingStatus.value = "Still looking — checking the remaining servers…"
+            }
+            mergeJob.join()
             ensureCurrentRequest(request)
-            // Last chance before "no source": the attempt cap only exists to bound mid-playback
-            // fallback latency, so here every remaining server gets a try.
+            if (!shouldRetryAfterCatalogMerge(resolved != null, resolvedAgainstCatalogGeneration, catalogGeneration)) {
+                return
+            }
+            DiagnosticsLog.event(
+                "Watch resolve retry after $label catalog id=$requestAnimeId episode=${fmt(number)} " +
+                    "generation=$catalogGeneration",
+            )
+            // Once a late catalog adds providers, try all of them. The normal attempt cap bounds
+            // mid-playback fallback latency, but it must not hide a directly requested episode.
+            resolvedAgainstCatalogGeneration = catalogGeneration
             resolution = repo.resolveSources(
                 anilistId = requestAnimeId,
                 number = number,
@@ -505,6 +525,9 @@ class WatchViewModel : ViewModel() {
             unavailableThisResolve += resolution.unavailableProviders
             resolved = resolution.resolved
         }
+
+        retryAfterCatalogMerge("anivexa", anivexaMergeJob)
+        retryAfterCatalogMerge("miruro", miruroLateMergeJob)
         if (resolved == null) {
             aniSkipFallback.cancel()
             ensureCurrentRequest(request)
@@ -526,19 +549,20 @@ class WatchViewModel : ViewModel() {
             } ?: UiState.Error(message)
             return@coroutineScope
         }
-        val fallbackNotice = if (resolved.provider != requestedProvider) {
+        val playable = checkNotNull(resolved)
+        val fallbackNotice = if (playable.provider != requestedProvider) {
             "${ProviderCatalog.label(requestedProvider)} is unavailable for this episode. " +
-                "Playing ${ProviderCatalog.label(resolved.provider)} instead."
+                "Playing ${ProviderCatalog.label(playable.provider)} instead."
         } else {
             null
         }
         if (fallbackNotice != null) {
             DiagnosticsLog.event(
-                "Watch provider fallback requested=$requestedProvider actual=${resolved.provider} " +
+                "Watch provider fallback requested=$requestedProvider actual=${playable.provider} " +
                     "episode=${fmt(number)}",
             )
         }
-        val providerSkip = normalizedSkipTimes(resolved.sources.skip)
+        val providerSkip = normalizedSkipTimes(playable.sources.skip)
         val fallbackSkip = if (hasCompleteSkipTimes(providerSkip)) {
             null
         } else {
@@ -551,27 +575,27 @@ class WatchViewModel : ViewModel() {
             unavailableSources += EpisodeSourceKey(number, provider, requestedCategory)
         }
         // A later successful retry makes this option valid again for the current session.
-        unavailableSources -= EpisodeSourceKey(number, resolved.provider, requestedCategory)
-        confirmedSources += EpisodeSourceKey(number, resolved.provider, requestedCategory)
+        unavailableSources -= EpisodeSourceKey(number, playable.provider, requestedCategory)
+        confirmedSources += EpisodeSourceKey(number, playable.provider, requestedCategory)
         // A late catalog merge must not re-advertise the requested provider after this request
         // already proved it unusable for the episode.
-        if (resolved.provider != requestedProvider && requestedProvider != DEFAULT_PREFERRED_PROVIDER) {
+        if (playable.provider != requestedProvider && requestedProvider != DEFAULT_PREFERRED_PROVIDER) {
             unavailableSources += EpisodeSourceKey(number, requestedProvider, requestedCategory)
         }
-        val sources = resolved.sources.copy(skip = mergeSkipTimes(providerSkip, fallbackSkip))
+        val sources = playable.sources.copy(skip = mergeSkipTimes(providerSkip, fallbackSkip))
         val index = navigationEpisodeIndex(spine, number)
             ?: error("Resolved episode ${fmt(number)} is missing from the navigation catalog")
         val resume = LibraryStore.historyFor(requestAnimeId)?.takeIf { it.episodeNumber == number }?.positionMs ?: 0L
-        val chosen = pickProviderStream(resolved.provider, sources)
+        val chosen = pickProviderStream(playable.provider, sources)
         DiagnosticsLog.event(
-            "Watch resolve success provider=${resolved.provider} episode=${fmt(number)} index=$index " +
-                "hls=${resolved.sources.hlsStreams.size} total=${resolved.sources.streams.size} " +
-                "embed=${resolved.sources.embedStreams.size} subtitles=${resolved.sources.subtitles.size} " +
+            "Watch resolve success provider=${playable.provider} episode=${fmt(number)} index=$index " +
+                "hls=${playable.sources.hlsStreams.size} total=${playable.sources.streams.size} " +
+                "embed=${playable.sources.embedStreams.size} subtitles=${playable.sources.subtitles.size} " +
                 "chosen=${chosen?.diagnosticLabel() ?: "none"} resumeMs=$resume",
         )
         DiagnosticsLog.event(
-            "Watch source inventory provider=${resolved.provider} " +
-                resolved.sources.streams.joinToString(separator = ",", limit = 16, truncated = "...") {
+            "Watch source inventory provider=${playable.provider} " +
+                playable.sources.streams.joinToString(separator = ",", limit = 16, truncated = "...") {
                     "${it.diagnosticLabel()}${if (it.isActive) "*" else ""}"
                 },
         )
@@ -581,7 +605,7 @@ class WatchViewModel : ViewModel() {
             WatchData(
                 episodes = spine,
                 currentIndex = index,
-                provider = resolved.provider,
+                provider = playable.provider,
                 category = requestedCategory,
                 sourceOptions = sourceOptions(number),
                 anilistId = requestAnimeId,
@@ -1454,3 +1478,26 @@ internal fun pickNavigationSpine(
 /** Never silently turn a missing requested episode into the first row. */
 internal fun navigationEpisodeIndex(episodes: List<EpisodeItem>, number: Double): Int? =
     episodes.indexOfFirst { it.number == number }.takeIf { it >= 0 }
+
+internal data class CatalogSpinePublication(
+    val episodes: List<EpisodeItem>,
+    val currentIndex: Int?,
+)
+
+/** Build one consistent catalog snapshot, or reject it if it would orphan the visible episode. */
+internal fun catalogSpinePublication(
+    rebuiltSpine: List<EpisodeItem>,
+    visibleEpisodeNumber: Double?,
+): CatalogSpinePublication? {
+    if (rebuiltSpine.isEmpty()) return null
+    val currentIndex = visibleEpisodeNumber?.let { number ->
+        navigationEpisodeIndex(rebuiltSpine, number) ?: return null
+    }
+    return CatalogSpinePublication(rebuiltSpine, currentIndex)
+}
+
+internal fun shouldRetryAfterCatalogMerge(
+    hasResolvedSource: Boolean,
+    resolvedAgainstCatalogGeneration: Long,
+    currentCatalogGeneration: Long,
+): Boolean = !hasResolvedSource && resolvedAgainstCatalogGeneration != currentCatalogGeneration
