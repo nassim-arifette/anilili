@@ -72,7 +72,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | UPDATE-005 | [x] | Distinguish the workflow's no-replacement policy from GitHub's separate repository-enforced immutable-release feature. | `fix/release-immutability-claim` |
 | BRAND-001 | [x] | Replace the inherited anime-head launcher artwork, monochrome icon, and TV banner mark with a fork-specific AniLili+ orbit-and-plus identity. | `fix/distinct-rebrand-artwork` |
 
-## Remaining issues
+## Follow-up issue checklist
 
 ### High priority: playback limitations
 
@@ -81,61 +81,69 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   natural end, speed, and caption control remain unavailable there. A reliable solution needs a
   provider `postMessage` contract, a native stream, or an app-controlled player page.
 
-- [ ] **OPEN-002 - Generic web fallback identity.** The fallback site can select a different
-  episode inside its page, so the app cannot safely attribute progress to the route that opened it.
-  It needs an episode-aware bridge or must remain explicitly unmanaged playback.
+- [x] **OPEN-002 - Generic web fallback identity.** Generic fallback pages are now explicitly
+  unmanaged: they cannot write route-owned progress/history, and cross-origin controls expose only
+  a neutral `Play or pause` action instead of inventing a playback state.
 
-- [ ] **OPEN-003 - Cast durability outside Watch.** Progress persistence, completion, and episode
-  navigation still live in the Watch UI. They stop when that UI is disposed even if remote Cast
-  playback continues. This needs a service-owned playback/history coordinator.
+- [ ] **OPEN-003 - Cast auto-next after Watch disposal.** The playback service now owns Cast
+  progress, durable completion, account sync, identity restoration after service recreation, and
+  single-writer handoff. It can also navigate while the exact Watch catalogue is alive. If Watch is
+  fully destroyed, it cannot safely resolve the next provider URL, so remote natural completion is
+  saved but does not auto-load the next episode.
 
-- [ ] **OPEN-004 - Protected Cast sources and subtitles.** Sender-only `Referer`, `Origin`,
-  playlist decryption, and subtitle headers are not reproduced by a stock Cast receiver. Some
-  protected media therefore cannot play remotely without a custom receiver or authenticated proxy.
+- [x] **OPEN-004 - Protected Cast sources and subtitles.** Cast now rejects embeds, local playlist
+  keys, sender-only headers, non-HTTP media, and side-loaded subtitles whose request metadata cannot
+  survive receiver transfer. It selects the closest public alternate when one exists; otherwise it
+  disables direct Cast and offers protected screen mirroring instead of sending a broken item.
 
-- [ ] **OPEN-005 - Embed video selection heuristic.** Generic scripts use the first accessible
-  `<video>`, which can be a preroll or advertisement. Terminal filtering reduces false autoplay,
-  but progress and resume can still bind to the wrong media. Provider-specific selectors or a
-  stable-content heuristic are required.
+- [x] **OPEN-005 - Embed video selection heuristic.** Accessible videos are scored by duration,
+  dimensions, visibility, readiness, and source stability. Ads, prerolls, and sub-two-minute media
+  are rejected, and the selected content identity is locked for telemetry, resume, and controls.
 
-- [ ] **OPEN-006 - Optimistic manual embed controls.** Auto-skip now waits for JavaScript success,
-  but several manual seek/play controls still update their local UI after the command was queued,
-  not after the page confirmed it. A shared asynchronous command/acknowledgement layer is needed.
+- [x] **OPEN-006 - Optimistic manual embed controls.** Seek, play/pause, speed, volume, resume, and
+  skip commands now carry a generation, command ID, and media identity. UI state changes only after
+  a matching acknowledgement; superseded, rejected, stale, and timed-out commands cannot commit.
 
-- [ ] **OPEN-007 - Ended non-final episode policy.** With autoplay disabled, a naturally ended
-  episode that has a Next episode remains in history at its full duration. Reopening it can start at
-  the end. Moving Continue Watching to an unplayed Next episode would conflict with the rule that
-  history is created only after confirmed playback, so this needs an explicit product decision.
+- [x] **OPEN-007 - Ended non-final episode policy.** A naturally completed non-final episode keeps
+  its honest history record but stores an explicit continuation target. Continue Watching opens the
+  next episode at zero without pretending that the next episode has already been played.
 
-- [ ] **OPEN-008 - Decoder fallback choice.** The retry caps the same stream at 720p; it does not
-  switch to a distinct lower-resolution URL when the manifest/decoder itself is defective.
+- [x] **OPEN-008 - Decoder fallback choice.** Decoder recovery now exhausts distinct lower-quality
+  URLs in order, preserves the confirmed position, avoids retry loops, and only then performs the
+  final same-manifest 720p cap.
 
 ### Medium priority: application state and platform behavior
 
-- [ ] **OPEN-009 - Reminder cold-start delivery race.** App initialization can reschedule a
-  persisted alarm before the receiver removes the record, producing a duplicate notification.
+- [x] **OPEN-009 - Reminder cold-start delivery race.** Receivers durably claim and remove the exact
+  record before posting. Startup restoration cannot re-arm a claimed delivery, and stale broadcasts
+  become harmless no-ops.
 
-- [ ] **OPEN-010 - Reminder request-code collisions.** `31 * mediaId + episode` is not unique and
-  a changed airing timestamp can leave an older alarm armed.
+- [x] **OPEN-010 - Reminder request-code collisions.** Alarms use stable full record identities,
+  cancel legacy identities, and reconcile replacements so timestamp changes cannot leave an older
+  alarm armed.
 
-- [ ] **OPEN-011 - Notification delivery accounting.** Only eight new AniList notifications are
-  displayed, but all fresh IDs are currently recorded as delivered.
+- [x] **OPEN-011 - Notification delivery accounting.** Only IDs successfully posted in the current
+  eight-item batch are recorded. Remaining unread items stay eligible for the next synchronization,
+  and account-generation checks reject results from a replaced session.
 
-- [ ] **OPEN-012 - Batch cache coherence.** `AppCache.putBatch()` updates Room without replacing
-  matching in-memory entries, so the process can continue reading stale data.
+- [x] **OPEN-012 - Batch cache coherence.** Batch writes now update the in-memory and Room cache as
+  one coherent operation, so later reads cannot return entries predating the batch.
 
-- [ ] **OPEN-013 - Write ordering.** Independent DataStore settings writes and rapid remote
-  watchlist toggles can complete in an order different from the last UI action.
+- [x] **OPEN-013 - Write ordering.** Settings use an ordered pending overlay over DataStore, and
+  watchlist mutations are serialized with account/session checks. The last accepted UI action is
+  now the state that survives asynchronous persistence.
 
-- [ ] **OPEN-014 - Release-worker settings barrier.** The worker can read default notification
-  settings before DataStore has finished loading.
+- [x] **OPEN-014 - Release-worker settings barrier.** Workers and reschedule receivers await the
+  loaded settings snapshot. Disabled release notifications also durably cancel existing work and
+  alarms before returning.
 
-- [ ] **OPEN-015 - Picture-in-Picture entry.** PiP is declared and observed, but the app does not
-  call `enterPictureInPictureMode` or configure Android 12 auto-enter behavior.
+- [x] **OPEN-015 - Picture-in-Picture entry.** Native playback now publishes its exact surface
+  bounds and aspect ratio, uses legacy user-leave entry where required, and configures Android 12+
+  auto-enter while excluding remote Cast and non-native playback.
 
-- [ ] **OPEN-016 - Release metadata ambiguity.** A successful release response with missing
-  metadata can still be treated as definitive absence; the sync needs an explicit completeness
-  signal from every source.
+- [x] **OPEN-016 - Release metadata ambiguity.** Release and AniList-list fetches now distinguish
+  present data, definitive absence, and incomplete/malformed responses. Destructive alarm
+  reconciliation runs only after every source produced a complete snapshot.
 
 - [ ] **OPEN-017 - Physical-device update validation.** The updater and signed release pipeline
   have automated coverage, but a complete older-APK to newer-APK install should still be verified
@@ -158,10 +166,8 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   installed application id. Test both identities against real streams before changing it, because
   an unverified rename could break playback.
 
-- [ ] **OPEN-022 - GitHub Actions Node runtime migration.** The pinned checkout, Java, Gradle,
-  Android SDK, and artifact actions currently declare Node 20. GitHub's hosted runner successfully
-  forces them onto Node 24 but emits deprecation warnings. Upgrade each pin to a reviewed Node 24
-  release as those actions publish compatible versions.
+- [x] **OPEN-022 - GitHub Actions Node runtime migration.** Checkout, Java, Gradle, Android SDK,
+  upload, and download actions are pinned to reviewed exact releases whose manifests use Node 24.
 
 - [ ] **OPEN-023 - GitHub-enforced release immutability.** The workflow refuses to replace an
   existing release or move its tag, and Android still rejects APKs without the pinned signing key,
@@ -169,10 +175,11 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   fully populated draft after repository release immutability is enabled; making `v0.2.0`
   immutable would require deliberately republishing it.
 
-## Superseded branches intentionally not merged
+## Superseded candidates retired without tree changes
 
-These early candidates remain as local branches for audit history, but merging them would restore
-bugs that their replacements fixed:
+These early candidate heads are recorded as parents of an `ours` merge for complete branch history,
+but none of their obsolete tree content was imported because it would restore bugs fixed by their
+replacements:
 
 - `fix/history-on-playback-start` (`3caa052`) was replaced by
   `fix/history-on-confirmed-playback`.
@@ -186,17 +193,18 @@ bugs that their replacements fixed:
 ## Validation checklist
 
 - [x] Focused unit tests for each topic branch passed before integration.
-- [x] Run the complete `testDebugUnitTest` suite on the final merged tree (`BUILD SUCCESSFUL`,
-  July 21, 2026).
-- [x] Build the final debug APK with SDK 36 (`assembleDebug`, `BUILD SUCCESSFUL`) and verify
+- [ ] Run the complete `testDebugUnitTest` suite on the final merged `v0.2.1` tree.
+- [ ] Build the final debug APK with SDK 36 and verify
   `app/build/outputs/apk/debug/anilili-plus-debug.apk` with Android's APK signer.
-- [x] Run `testDebugUnitTest`, `lintRelease`, and an unsigned `assembleRelease` using the same
-  release tasks as GitHub Actions (`BUILD SUCCESSFUL`, July 21, 2026).
-- [x] Build the locally signed AniLili+ release APK and verify application id, version `0.2.0`
-  (`versionCode 29`), 16 KiB ZIP alignment, one signer, and the pinned release certificate.
+- [ ] Run `testDebugUnitTest`, `lintRelease`, and an unsigned `assembleRelease` using the same
+  release tasks as GitHub Actions.
+- [ ] Build the locally signed AniLili+ release APK and verify application id, version `0.2.1`
+  (`versionCode 30`), 16 KiB ZIP alignment, one signer, and the pinned release certificate.
 - [x] Publish and download GitHub Release `v0.2.0`, then independently verify its sidecar and API
   SHA-256 (`3c0897f11fb5763cf5eb71d51043321fb56b11835d8a5a719ed7e9fd9b45f6ad`),
   package metadata, 16 KiB alignment, and pinned signer (July 21, 2026).
+- [ ] Publish immutable GitHub Release `v0.2.1`, download both assets, and independently verify
+  their API digests, sidecar, package metadata, 16 KiB alignment, and pinned signer.
 - [ ] Validate rapid Watch A -> B transitions, embed/native handoff, pause/seek/exit resume,
   intro/outro, an airing show's latest episode, the actual series finale, Cast, renderer loss,
   account replacement, and provider exhaustion on a real device or emulator.
