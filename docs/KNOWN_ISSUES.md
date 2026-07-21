@@ -225,6 +225,13 @@ replacements:
 - [x] Build the locally signed AniLili+ release APK and verify application id, version `0.2.1`
   (`versionCode 30`), 16 KiB ZIP alignment, one signer, and the pinned release certificate. Local
   SHA-256: `bff9225fe4c822c0d9808112089d3eac033f8edaf70db5c175edf8fba87ac6d1`.
+- [x] Run a clean non-incremental `testDebugUnitTest`, `lintRelease`, `assembleDebug`, and
+  `assembleRelease` on the merged `v0.2.2` tree: 419 tests, zero failures/errors, two skipped tests,
+  zero fatal/error lint findings, and `BUILD SUCCESSFUL` (July 21, 2026).
+- [x] Verify the locally signed AniLili+ `v0.2.2` APK: application id
+  `com.nassimarifette.anililiplus`, `versionCode 31`, 16 KiB ZIP alignment, one signer, and the
+  pinned release certificate. Local SHA-256:
+  `a131a746387f21bc722930d807fd0063e919e79abef9511ce908675abaf24f44`.
 - [x] Publish and download GitHub Release `v0.2.0`, then independently verify its sidecar and API
   SHA-256 (`3c0897f11fb5763cf5eb71d51043321fb56b11835d8a5a719ed7e9fd9b45f6ad`),
   package metadata, 16 KiB alignment, and pinned signer (July 21, 2026).
