@@ -33,13 +33,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Fullscreen
-import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -59,7 +53,6 @@ import androidx.compose.runtime.key as compositionKey
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -109,6 +102,8 @@ fun EmbedWebView(
     qualityStreams: List<StreamItem> = emptyList(),
     startPositionMs: Long = 0L,
     skip: SkipTimes? = null,
+    seriesTitle: String? = null,
+    episodeTitle: String? = null,
     onPreviousEpisode: ((EmbedPlaybackKey) -> Unit)? = null,
     onNextEpisode: ((EmbedPlaybackKey) -> Unit)? = null,
     hasPreviousEpisode: Boolean = false,
@@ -1174,6 +1169,8 @@ fun EmbedWebView(
                     touchControlsInteraction++
                 },
                 onSettings = { settingsSheetVisible = true },
+                seriesTitle = seriesTitle,
+                episodeTitle = episodeTitle,
                 isFullscreen = isFullscreen,
                 onFullscreen = onToggleFullscreen,
                 onInteract = { touchControlsInteraction++ },
@@ -1213,66 +1210,38 @@ fun EmbedWebView(
             )
         }
 
-        // One bar for the servers our JS cannot reach, sitting where a player's controls belong:
-        // episode moves and play/pause on the left, settings and fullscreen on the right. There is
-        // no position or duration to build a scrubber from, so seeking stays the provider's.
-        if (fallbackControlsActive && fallbackControlsVisible) Row(
+        // Cross-origin providers keep their own seek/play surface. Present only the controls this
+        // app can honour and an explicit hand-off to the provider; never imply that an inaccessible
+        // media element can be paused or scrubbed by AniLili+.
+        if (fallbackControlsActive && fallbackControlsVisible) EmbedFallbackControls(
+            seriesTitle = seriesTitle,
+            episodeTitle = episodeTitle,
+            hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
+            hasNext = hasNextEpisode && currentOnNextEpisode != null,
+            onPrevious = { currentOnPreviousEpisode?.invoke(playbackKey) },
+            onUseProviderControls = {
+                DiagnosticsLog.event("EmbedWebView exposing cross-origin provider controls")
+                fallbackControlsVisible = false
+                providerControlsMode = true
+                webView?.requestFocus()
+                fallbackInteraction++
+            },
+            onNext = { currentOnNextEpisode?.invoke(playbackKey) },
+            onSettings = {
+                settingsSheetVisible = true
+                fallbackInteraction++
+            },
+            isFullscreen = isFullscreen,
+            onFullscreen = onToggleFullscreen?.let { toggle ->
+                {
+                    toggle()
+                    fallbackInteraction++
+                }
+            },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))),
-                )
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                PlayerControlIconButton(
-                    "Previous episode",
-                    Icons.Default.SkipPrevious,
-                    enabled = hasPreviousEpisode && currentOnPreviousEpisode != null,
-                    onClick = { currentOnPreviousEpisode?.invoke(playbackKey) },
-                )
-                PlayerControlIconButton(
-                    "Use provider controls",
-                    Icons.Default.TouchApp,
-                    onClick = {
-                        DiagnosticsLog.event("EmbedWebView exposing cross-origin provider controls")
-                        fallbackControlsVisible = false
-                        providerControlsMode = true
-                        webView?.requestFocus()
-                        fallbackInteraction++
-                    },
-                )
-                PlayerControlIconButton(
-                    "Next episode",
-                    Icons.Default.SkipNext,
-                    enabled = hasNextEpisode && currentOnNextEpisode != null,
-                    onClick = { currentOnNextEpisode?.invoke(playbackKey) },
-                )
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                PlayerControlIconButton(
-                    "Settings",
-                    Icons.Default.Settings,
-                    onClick = {
-                        settingsSheetVisible = true
-                        fallbackInteraction++
-                    },
-                )
-                onToggleFullscreen?.let { toggle ->
-                    PlayerControlIconButton(
-                        if (isFullscreen) "Exit fullscreen" else "Fullscreen",
-                        if (isFullscreen) Icons.Default.FullscreenExit else Icons.Default.Fullscreen,
-                        onClick = {
-                            toggle()
-                            fallbackInteraction++
-                        },
-                    )
-                }
-            }
-        }
+                .fillMaxWidth(),
+        )
 
         if (playbackMode.controlsPlayback && device.isTv && focusPlayerOnStart && tvControlsVisible) {
             TvPlayerControls(
