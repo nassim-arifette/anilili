@@ -1,14 +1,24 @@
 package com.miruronative.ui.watch
 
-/** Identifies the exact logical playback item that emitted a native-player progress callback. */
+/** Identifies the exact logical and concrete playback item that emitted a progress callback. */
 data class PlaybackIdentity(
     val animeId: Int,
     val episodeNumber: Double,
     val generation: Int,
+    /** Canonical in-memory source/document id used to prove this callback belongs to WatchData. */
     val mediaId: String,
     /** Optional opaque instance scope when one media id can be replaced inside the same player. */
     val mediaInstanceId: String? = null,
-)
+    /** Optional privacy-safe source id used only for AniSkip lookup and persistent cache scoping. */
+    val aniSkipSourceIdentity: String? = null,
+) {
+    // Native manifests and embed documents may be signed URLs. Data-class diagnostics must never
+    // serialize either the persistence identity or its AniSkip/cache counterpart.
+    override fun toString(): String =
+        "PlaybackIdentity(animeId=$animeId, episodeNumber=$episodeNumber, generation=$generation, " +
+            "mediaId=<redacted>, mediaInstanceId=${mediaInstanceId?.let { "<redacted>" }}, " +
+            "aniSkipSourceIdentity=${aniSkipSourceIdentity?.let { "<redacted>" }})"
+}
 
 /** Last position reported by a concrete, identity-bearing playback item. */
 internal data class PlaybackProgressSnapshot(
@@ -31,12 +41,18 @@ internal data class NativePlaybackSessionKey(
 internal fun PlaybackIdentity.nativePlaybackSessionKey(): NativePlaybackSessionKey =
     NativePlaybackSessionKey(animeId, episodeNumber, generation)
 
-/** The native media identities that the currently published watch state is allowed to report. */
+/** Managed embeds provide an opaque cache id; native sources fall back to their concrete URL. */
+internal fun PlaybackIdentity.sourceIdentityForAniSkipLookup(): String =
+    aniSkipSourceIdentity?.takeIf(String::isNotBlank) ?: mediaId
+
+/** The media identities that the currently published watch state is allowed to report. */
 internal data class ActivePlaybackTarget(
     val animeId: Int,
     val episodeNumber: Double,
     val generation: Int,
     val mediaIds: Set<String>,
+    /** `null` for native playback; an exact (possibly empty) allow-list for managed embeds. */
+    val allowedMediaInstanceIds: Set<String>? = null,
 )
 
 /**
@@ -51,7 +67,11 @@ internal fun acceptsPlaybackProgress(
     callback.episodeNumber == active.episodeNumber &&
     callback.generation == active.generation &&
     callback.mediaId.isNotBlank() &&
-    callback.mediaId in active.mediaIds
+    callback.mediaId in active.mediaIds &&
+    (
+        active.allowedMediaInstanceIds == null ||
+            callback.mediaInstanceId?.let(active.allowedMediaInstanceIds::contains) == true
+        )
 
 /** A native failure can affect source selection only for the exact current MediaItem. */
 internal fun acceptsNativePlaybackError(
@@ -74,6 +94,25 @@ internal fun isNewConfirmedPlayback(
     callback: PlaybackIdentity,
 ): Boolean = previouslyConfirmed == null || !isSamePlaybackSession(previouslyConfirmed, callback)
 
+/** Selects the one identity-validated progress sample that a transition is allowed to bank. */
+internal fun confirmedProgressForFlush(
+    candidate: PlaybackProgressSnapshot?,
+    confirmedIdentity: PlaybackIdentity?,
+    activeTarget: ActivePlaybackTarget?,
+): PlaybackProgressSnapshot? = candidate?.takeIf { progress ->
+    progress.positionMs > 0L &&
+        activeTarget != null &&
+        acceptsPlaybackProgress(progress.identity, activeTarget) &&
+        confirmedIdentity != null &&
+        isSamePlaybackSession(confirmedIdentity, progress.identity)
+}
+
+/** Keeps player recreation aligned with the exact outgoing progress that was accepted for flush. */
+internal fun resumePositionAfterValidatedFlush(
+    currentPositionMs: Long,
+    flushedProgress: PlaybackProgressSnapshot?,
+): Long = flushedProgress?.positionMs ?: currentPositionMs
+
 /**
  * Banks the last confirmed, still-current native position before a caller invalidates that
  * playback session. Keeping the write and transition in one helper makes their ordering explicit:
@@ -91,13 +130,7 @@ internal fun <T> flushProgressBeforeTransition(
     persist: (PlaybackProgressSnapshot) -> Unit,
     transition: () -> T,
 ): T {
-    val current = candidate?.takeIf { progress ->
-        progress.positionMs > 0L &&
-            activeTarget != null &&
-            acceptsPlaybackProgress(progress.identity, activeTarget) &&
-            confirmedIdentity != null &&
-            isSamePlaybackSession(confirmedIdentity, progress.identity)
-    }
+    val current = confirmedProgressForFlush(candidate, confirmedIdentity, activeTarget)
     current?.let(persist)
     return transition()
 }

@@ -89,6 +89,26 @@ data class EmbedMediaIdentity(
             "documentMediaId=<redacted>, videoIdentity=$videoIdentity)"
 }
 
+/**
+ * Separates the two identities needed by managed embed progress. The raw selected document stays
+ * in memory as [PlaybackIdentity.mediaId] so WatchData can validate and persist a final tick, while
+ * AniSkip receives only an opaque concrete-video fingerprint. The instance id remains independent
+ * so a later video selected inside the same document invalidates the former video's progress.
+ */
+internal fun EmbedMediaIdentity.playbackProgressIdentity(): PlaybackIdentity? {
+    val instanceId = mediaInstanceId ?: return null
+    val aniSkipIdentity = aniSkipSourceIdentity() ?: return null
+    if (!isConcrete) return null
+    return PlaybackIdentity(
+        animeId = playbackKey.animeId,
+        episodeNumber = playbackKey.episodeNumber,
+        generation = playbackKey.sourceGeneration,
+        mediaId = documentMediaId,
+        mediaInstanceId = instanceId,
+        aniSkipSourceIdentity = aniSkipIdentity,
+    )
+}
+
 /** A callback must belong to both the current route and its latest concrete embed navigation. */
 internal fun acceptsEmbedMediaCallback(
     reported: EmbedMediaIdentity,
@@ -97,6 +117,22 @@ internal fun acceptsEmbedMediaCallback(
 ): Boolean = reported.isConcrete &&
     reported.playbackKey == currentPlaybackKey &&
     reported == active
+
+/** Require final-save paths to accept only the concrete video currently active in this document. */
+internal fun ActivePlaybackTarget.scopedToActiveEmbedMedia(
+    active: EmbedMediaIdentity?,
+    currentPlaybackKey: EmbedPlaybackKey,
+): ActivePlaybackTarget {
+    val instanceId = active
+        ?.takeIf { candidate ->
+            acceptsEmbedMediaCallback(candidate, candidate, currentPlaybackKey) &&
+                candidate.documentMediaId in mediaIds
+        }
+        ?.mediaInstanceId
+    // An empty set is deliberate: a managed embed without a concrete active video must reject a
+    // queued sample. `null` is reserved for native playback, where no in-document instance exists.
+    return copy(allowedMediaInstanceIds = setOfNotNull(instanceId))
+}
 
 internal enum class EmbedMediaHandoffDecision {
     REJECT,

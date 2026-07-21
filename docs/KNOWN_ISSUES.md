@@ -45,6 +45,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | HISTORY-006 | [x] | Require a known series episode total and an exact final-episode match before marking a title completed. The latest released episode of an airing series remains resumable. | `fix/final-episode-completion-evidence` |
 | HISTORY-007 | [x] | Key Watch Next throttling by episode/source context, use a monotonic clock, and remove completed titles. | `fix/watch-next-content-aware-throttle` |
 | HISTORY-008 | [x] | Persist sparse per-episode device progress and render only episodes actually played. Opening episode 90 no longer marks episodes 1-89 complete or fills their thumbnail bars. | `fix/per-episode-watch-progress` |
+| HISTORY-009 | [x] | Keep the selected embed document URL as the in-memory persistence identity while using a separate opaque AniSkip cache identity. Manual Next, source changes, fullscreen/TV exit, and player close now flush the latest concrete embed position. A quality/document handoff also carries that verified position into the live resume state before invalidating the outgoing instance, so closing before the replacement's first tick cannot reopen behind it. Signed document and video URLs remain redacted from diagnostics. | `fix/embed-progress-save-identity` |
 
 ### Intro, outro, embed, and autoplay
 
