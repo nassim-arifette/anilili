@@ -84,7 +84,7 @@ private data class EpisodeSourceKey(
 )
 
 private data class PendingResolution(
-    val id: Long,
+    val token: PlaybackRequestToken,
     val key: EpisodeResolutionKey,
 )
 
@@ -126,13 +126,9 @@ class WatchViewModel : ViewModel() {
     private var sourceValidationJob: Job? = null
     private var mergedIncludesAnivexa = false
     private var mergedEpisodes = EpisodesResult(emptyList())
-<<<<<<< HEAD
     private val requestGate = PlaybackRequestGate()
-=======
     private var pendingResolution: PendingResolution? = null
-    private var resolutionRequestId = 0L
     private var playbackGenerationCounter = 0
->>>>>>> fix/episode-transition-idempotence
 
     fun start(id: Int, providerName: String, categoryApi: String, episodeNumber: String) {
         val key = "$id/$providerName/$categoryApi/$episodeNumber"
@@ -781,11 +777,6 @@ class WatchViewModel : ViewModel() {
     }
 
     /** All episode resolution goes through here so a failure becomes an error state, not a crash. */
-<<<<<<< HEAD
-    private fun launchResolve(number: Double, before: (() -> Unit)? = null) {
-        DiagnosticsLog.event("Watch launchResolve episode=${fmt(number)}")
-        val request = requestGate.nextRequest()
-=======
     private fun launchResolve(number: Double, before: (suspend () -> Unit)? = null) {
         val key = EpisodeResolutionKey(
             animeId = anilistId,
@@ -798,10 +789,13 @@ class WatchViewModel : ViewModel() {
             DiagnosticsLog.event("Watch ignored duplicate resolve episode=${fmt(number)}")
             return
         }
-        val request = PendingResolution(++resolutionRequestId, key)
-        pendingResolution = request
-        DiagnosticsLog.event("Watch launchResolve episode=${fmt(number)} request=${request.id}")
->>>>>>> fix/episode-transition-idempotence
+        val request = requestGate.nextRequest()
+        val pending = PendingResolution(request, key)
+        pendingResolution = pending
+        DiagnosticsLog.event(
+            "Watch launchResolve episode=${fmt(number)} " +
+                "request=${request.sessionGeneration}/${request.requestGeneration}",
+        )
         resolveJob?.cancel()
         sourceValidationJob?.cancel()
         resolveJob = viewModelScope.launch {
@@ -817,13 +811,12 @@ class WatchViewModel : ViewModel() {
                 _loadingStatus.value = null
                 _state.value = UiState.Error(e.message ?: "Failed to load episode")
             } finally {
-                if (pendingResolution?.id == request.id) pendingResolution = null
+                if (pendingResolution?.token == request) pendingResolution = null
             }
         }
     }
 
     private fun invalidatePendingResolution() {
-        resolutionRequestId++
         pendingResolution = null
     }
 
