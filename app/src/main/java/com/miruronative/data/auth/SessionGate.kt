@@ -17,6 +17,8 @@ internal class SessionGate {
     fun <T> snapshot(read: () -> T): Snapshot<T> =
         synchronized(lock) { Snapshot(generation, read()) }
 
+    fun generationSnapshot(): Long = synchronized(lock) { generation }
+
     fun invalidate(change: () -> Unit) {
         synchronized(lock) {
             generation++
@@ -27,6 +29,16 @@ internal class SessionGate {
     fun commitIfCurrent(snapshot: Snapshot<*>, change: () -> Unit): Boolean =
         synchronized(lock) {
             if (generation != snapshot.generation) {
+                false
+            } else {
+                change()
+                true
+            }
+        }
+
+    fun commitIfGenerationCurrent(expected: Long, change: () -> Unit): Boolean =
+        synchronized(lock) {
+            if (generation != expected) {
                 false
             } else {
                 change()
