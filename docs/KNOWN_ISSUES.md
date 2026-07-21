@@ -69,6 +69,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | UPDATE-002 | [x] | Give the fork its own Android identity and add a stable-key GitHub Release workflow so future AniLili+ APKs can update existing installations. | `feature/anilili-plus-auto-updates` |
 | UPDATE-003 | [x] | Restore the Gradle wrapper executable bit so the Linux GitHub Actions runner can build releases. | `fix/gradlew-executable` |
 | UPDATE-004 | [x] | Recompute deterministic asset names in the publish job instead of passing outputs that GitHub redacts after a secret-bearing signing job. | `fix/release-output-taint` |
+| UPDATE-005 | [x] | Distinguish the workflow's no-replacement policy from GitHub's separate repository-enforced immutable-release feature. | `fix/release-immutability-claim` |
 
 ## Remaining issues
 
@@ -156,6 +157,17 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   installed application id. Test both identities against real streams before changing it, because
   an unverified rename could break playback.
 
+- [ ] **OPEN-022 - GitHub Actions Node runtime migration.** The pinned checkout, Java, Gradle,
+  Android SDK, and artifact actions currently declare Node 20. GitHub's hosted runner successfully
+  forces them onto Node 24 but emits deprecation warnings. Upgrade each pin to a reviewed Node 24
+  release as those actions publish compatible versions.
+
+- [ ] **OPEN-023 - GitHub-enforced release immutability.** The workflow refuses to replace an
+  existing release or move its tag, and Android still rejects APKs without the pinned signing key,
+  but GitHub reports the first `v0.2.0` release as mutable. A future release workflow can publish a
+  fully populated draft after repository release immutability is enabled; making `v0.2.0`
+  immutable would require deliberately republishing it.
+
 ## Superseded branches intentionally not merged
 
 These early candidates remain as local branches for audit history, but merging them would restore
@@ -181,8 +193,9 @@ bugs that their replacements fixed:
   release tasks as GitHub Actions (`BUILD SUCCESSFUL`, July 21, 2026).
 - [x] Build the locally signed AniLili+ release APK and verify application id, version `0.2.0`
   (`versionCode 29`), 16 KiB ZIP alignment, one signer, and the pinned release certificate.
-- [ ] Publish and download the first GitHub Release, then verify its checksum, package metadata,
-  alignment, and signer independently from the workflow artifact.
+- [x] Publish and download GitHub Release `v0.2.0`, then independently verify its sidecar and API
+  SHA-256 (`3c0897f11fb5763cf5eb71d51043321fb56b11835d8a5a719ed7e9fd9b45f6ad`),
+  package metadata, 16 KiB alignment, and pinned signer (July 21, 2026).
 - [ ] Validate rapid Watch A -> B transitions, embed/native handoff, pause/seek/exit resume,
   intro/outro, an airing show's latest episode, the actual series finale, Cast, renderer loss,
   account replacement, and provider exhaustion on a real device or emulator.
