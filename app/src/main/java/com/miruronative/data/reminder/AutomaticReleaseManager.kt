@@ -34,6 +34,10 @@ import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.nav.Routes
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -83,8 +87,10 @@ object AutomaticReleaseManager {
     }
 
     fun sync(media: Collection<Media>) {
+        // Future callers must not turn the in-memory default into scheduled alarms during startup.
+        if (!SettingsStore.isLoaded.value) return
         if (!SettingsStore.releaseNotifications.value) {
-            cancelAll()
+            cancelAllIfDisabled()
             return
         }
         val now = System.currentTimeMillis() / 1000L
@@ -103,6 +109,12 @@ object AutomaticReleaseManager {
         }.distinctBy { it.id }
 
         synchronized(lock) {
+            // Serialize the final setting check with scheduling/cancellation. A UI toggle can
+            // otherwise cancel first and let this older reconciliation recreate alarms after it.
+            if (!SettingsStore.releaseNotifications.value) {
+                cancelAllLocked()
+                return
+            }
             val plan = planReleaseAlarmReconciliation(alarms, desired)
             val previousIds = alarms.mapTo(hashSetOf(), ReleaseAlarm::id)
             // Install every desired alarm before removing obsolete identities. If scheduling
@@ -122,9 +134,7 @@ object AutomaticReleaseManager {
     fun cancelAll() {
         if (!::appContext.isInitialized) return
         synchronized(lock) {
-            alarms.forEach(::cancel)
-            alarms.forEach(::cancelLegacy)
-            replaceAlarms(emptyList())
+            cancelAllLocked()
         }
     }
 
@@ -146,8 +156,11 @@ object AutomaticReleaseManager {
 
     /** Recreates alarms only for an explicit boot/package-replacement event, never process start. */
     internal fun restoreAlarms() {
-        if (!::appContext.isInitialized) return
-        synchronized(lock) { restoreAlarmsLocked(AlarmRestorationCause.BOOT_OR_PACKAGE_REPLACEMENT) }
+        if (!::appContext.isInitialized || !SettingsStore.isLoaded.value) return
+        synchronized(lock) {
+            if (!SettingsStore.releaseNotifications.value) return@synchronized
+            restoreAlarmsLocked(AlarmRestorationCause.BOOT_OR_PACKAGE_REPLACEMENT)
+        }
     }
 
     private fun restoreAlarmsLocked(cause: AlarmRestorationCause) {
@@ -155,6 +168,24 @@ object AutomaticReleaseManager {
             runCatching { schedule(alarm) }
                 .onFailure { DiagnosticsLog.throwable("Automatic release restore failed id=${alarm.id}", it) }
         }
+    }
+
+    /** Cancels a stale background action only if the setting is still disabled under the lock. */
+    internal fun cancelAllIfDisabled() {
+        if (!::appContext.isInitialized || !SettingsStore.isLoaded.value) return
+        synchronized(lock) {
+            if (!SettingsStore.releaseNotifications.value) cancelAllLocked()
+        }
+    }
+
+    private fun cancelAllLocked() {
+        val previous = alarms
+        if (!replaceAlarms(emptyList(), durable = true)) {
+            DiagnosticsLog.event("Automatic release durable cancellation failed")
+            return
+        }
+        previous.forEach(::cancel)
+        previous.forEach(::cancelLegacy)
     }
 
     private fun schedule(alarm: ReleaseAlarm) {
@@ -232,9 +263,31 @@ object AutomaticReleaseManager {
 
 class AutomaticReleaseReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val alarm = AutomaticReleaseManager.claimDelivery(intent.getStringExtra("releaseId")) ?: return
-        runCatching { ReleaseSyncScheduler.runNow(context) }
-            .onFailure { DiagnosticsLog.throwable("Release sync enqueue after delivery failed", it) }
+        val pendingResult = goAsync()
+        val appContext = context.applicationContext
+        val releaseId = intent.getStringExtra("releaseId")
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                SettingsStore.awaitLoaded()
+                if (!SettingsStore.releaseNotifications.value) {
+                    AutomaticReleaseManager.cancelAllIfDisabled()
+                    return@launch
+                }
+                val alarm = AutomaticReleaseManager.claimDelivery(releaseId) ?: return@launch
+                runCatching { ReleaseSyncScheduler.runNow(appContext) }
+                    .onFailure { DiagnosticsLog.throwable("Release sync enqueue after delivery failed", it) }
+                deliver(appContext, alarm)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                DiagnosticsLog.throwable("Automatic release receiver failed", error)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    private fun deliver(context: Context, alarm: ReleaseAlarm) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) return
@@ -315,11 +368,12 @@ class ReleaseSyncWorker(
     params: WorkerParameters,
 ) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
-        if (!SettingsStore.releaseNotifications.value) {
-            AutomaticReleaseManager.cancelAll()
-            return Result.success()
-        }
         return try {
+            SettingsStore.awaitLoaded()
+            if (!SettingsStore.releaseNotifications.value) {
+                AutomaticReleaseManager.cancelAllIfDisabled()
+                return Result.success()
+            }
             val repo = AppGraph.repository
             // Reconciliation removes alarms that are absent from this list, so never feed it a
             // partial snapshot after a transient metadata failure.

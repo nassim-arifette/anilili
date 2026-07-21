@@ -17,14 +17,16 @@ import androidx.core.content.ContextCompat
 import com.miruronative.MainActivity
 import com.miruronative.R
 import com.miruronative.data.model.AiringSchedule
+import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.nav.Routes
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -302,14 +304,28 @@ class ReminderRescheduleReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED && intent.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
         val pendingResult = goAsync()
+        val appContext = context.applicationContext
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
+                SettingsStore.awaitLoaded()
+                runCatching { ReminderManager.init(appContext) }
+                    .onFailure { DiagnosticsLog.throwable("Manual reminder initialization failed", it) }
+                runCatching { AutomaticReleaseManager.init(appContext) }
+                    .onFailure { DiagnosticsLog.throwable("Automatic release initialization failed", it) }
                 runCatching { ReminderManager.restoreAlarms() }
                     .onFailure { DiagnosticsLog.throwable("Manual reminder restore failed", it) }
-                runCatching { AutomaticReleaseManager.restoreAlarms() }
-                    .onFailure { DiagnosticsLog.throwable("Automatic release restore failed", it) }
-                runCatching { ReleaseSyncScheduler.runNow(context.applicationContext) }
-                    .onFailure { DiagnosticsLog.throwable("Release sync enqueue after restore failed", it) }
+                if (SettingsStore.releaseNotifications.value) {
+                    runCatching { AutomaticReleaseManager.restoreAlarms() }
+                        .onFailure { DiagnosticsLog.throwable("Automatic release restore failed", it) }
+                    runCatching { ReleaseSyncScheduler.runNow(appContext) }
+                        .onFailure { DiagnosticsLog.throwable("Release sync enqueue after restore failed", it) }
+                } else {
+                    AutomaticReleaseManager.cancelAllIfDisabled()
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                DiagnosticsLog.throwable("Alarm restoration failed", error)
             } finally {
                 pendingResult.finish()
             }

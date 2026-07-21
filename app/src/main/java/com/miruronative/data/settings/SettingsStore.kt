@@ -117,7 +117,8 @@ object SettingsStore {
 
     private val _preferredProvider = MutableStateFlow(DEFAULT_PREFERRED_PROVIDER)
     val preferredProvider = _preferredProvider.asStateFlow()
-    private val loaded = MutableStateFlow(false)
+    private val _isLoaded = MutableStateFlow(false)
+    val isLoaded = _isLoaded.asStateFlow()
 
     fun init(context: Context) {
         val app = context.applicationContext
@@ -126,10 +127,16 @@ object SettingsStore {
             produceFile = { app.preferencesDataStoreFile("anilili_settings") },
         )
         scope.launch {
-            runCatching { migrateLegacyPreferences(app) }
-                .onFailure { CrashReporter.logNonFatal("Settings migration failed", it) }
+            try {
+                migrateLegacyPreferences(app)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                CrashReporter.logNonFatal("Settings migration failed", error)
+            }
             store.data
                 .catch { error ->
+                    if (error is CancellationException) throw error
                     // A settings read must never take the process down; fall back to defaults.
                     if (error !is IOException) CrashReporter.logNonFatal("Settings read failed", error)
                     emit(emptyPreferences())
@@ -232,7 +239,7 @@ object SettingsStore {
 
     /** Guarantees cold-start consumers see the persisted preference instead of the in-memory default. */
     suspend fun awaitLoaded() {
-        loaded.first { it }
+        awaitSettingsReady(isLoaded)
     }
 
     private fun editCaptionStyle(transform: (CaptionStyle) -> CaptionStyle) {
@@ -272,7 +279,7 @@ object SettingsStore {
                 .also { desiredSnapshot = it }
                 .also(::publishSnapshot)
         }
-        loaded.value = true
+        _isLoaded.value = true
     }
 
     private fun mutate(
