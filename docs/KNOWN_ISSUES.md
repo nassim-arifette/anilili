@@ -50,7 +50,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 
 | ID | Status | Fix | Topic branch |
 | --- | --- | --- | --- |
-| SKIP-001 | [x] | Merge provider and AniSkip intro/outro fields independently; a provider marker always wins for the field it supplied. | `fix/skip-marker-field-merge` |
+| SKIP-001 | [x] | Merge provider and AniSkip intro/outro fields independently. Its original provider-first precedence is superseded by the typed, duration-bound family policy in SKIP-006 and SKIP-007. | `fix/skip-marker-field-merge` |
 | SKIP-002 | [x] | Keep a slow AniSkip lookup alive after the 2.5-second startup budget and publish it only into the still-matching playback generation. Superseded by the duration-bound typed policy in SKIP-006. | `fix/late-aniskip-publication` |
 | SKIP-003 | [x] | Keep Skip Outro independent from autoplay, and never auto-skip while playback is paused. | `fix/outro-skip-policy` |
 | SKIP-004 | [x] | Mark an embed auto-skip handled only after JavaScript confirms the seek; failed seeks are retried under the current navigation generation. | `fix/embed-seek-result-ack` |
@@ -97,8 +97,8 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   provider `postMessage` contract, a native stream, or an app-controlled player page. The app also
   cannot enumerate or pause two independent media elements inside an active cross-origin iframe;
   only whole-WebView pause and blanking during transitions are guaranteed. AniSkip is intentionally
-  not queried without a real duration on these embeds; provider markers remain a fail-open fallback
-  and cannot auto-seek while observable playback telemetry is unavailable.
+  not queried without a real duration on these embeds. Provider markers are retained, but without
+  observable telemetry they cannot drive app-controlled manual or automatic seeking.
 
 - [x] **OPEN-002 - Generic web fallback identity.** Generic fallback pages are now explicitly
   unmanaged: they cannot write route-owned progress/history, and cross-origin controls expose only
@@ -253,6 +253,9 @@ replacements:
 - [x] Compile the duration-bound AniSkip integration and run 53 focused JVM tests covering API
   parsing and URLs, relation mapping, duration correction and cache scope, mixed/recap policy,
   pending and stale publication, and source-policy regressions (July 21, 2026).
+- [x] Compile the transient-duration safety fix and run 15 focused JVM tests covering the exact
+  valid-duration -> `LOADING` -> zero-duration -> publication interleaving, fail-safe defaults, and
+  stale media/generation rejection (July 21, 2026).
 - [x] Compile the active-embed media handoff and run 31 focused JVM tests covering quality URL
   activation, stale navigation rejection, marker reset/reload, duration-bound publication, mixed
   segment policy, and hashed cache scope (July 21, 2026).
@@ -263,6 +266,11 @@ replacements:
   their release attestation, API digests, sidecar, package metadata, 16 KiB alignment, and pinned
   signer. Published APK SHA-256:
   `a426088687a4c70ddbeb791cd051ae808426aa76e155e6c9a385c0ef7a36bfd5` (July 21, 2026).
+- [x] Publish immutable GitHub Release `v0.2.2`, download both assets, and independently verify the
+  exact `e19b2e8d30a07ce40f3e95512f99f6bb3dc40f44` target, GitHub asset digest, checksum sidecar,
+  package `com.nassimarifette.anililiplus`, version code 31, 16 KiB alignment, and pinned signer.
+  Published APK SHA-256:
+  `a0c639fc93eb6d5baefb040321bb89fd68fd3af051032b151df975f8811b89b2` (July 21, 2026).
 - [ ] Validate rapid Watch A -> B transitions, embed/native handoff, pause/seek/exit resume,
   intro/outro, an airing show's latest episode, the actual series finale, Cast, renderer loss,
   account replacement, and provider exhaustion on a real device or emulator.
