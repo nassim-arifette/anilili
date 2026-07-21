@@ -1,5 +1,6 @@
 package com.miruronative.data.remote
 
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -38,7 +39,8 @@ class PipeRequestLifecycleTest {
     fun `page completion from an earlier navigation cannot mark the session ready`() = runBlocking {
         val lifecycle = PipeRequestLifecycle<String>()
         val attachment = lifecycle.attach()
-        val newerNavigation = requireNotNull(lifecycle.advanceReadinessGeneration(attachment.session))
+        val oldReadiness = requireNotNull(lifecycle.readinessSignal(attachment.session))
+        val newerNavigation = requireNotNull(lifecycle.beginNavigation(attachment.session))
 
         assertFalse(
             lifecycle.markReady(
@@ -47,9 +49,26 @@ class PipeRequestLifecycleTest {
                 successful = true,
             ),
         )
-        assertFalse(attachment.session.readiness.isCompleted)
-        assertTrue(lifecycle.markReady(attachment.session, newerNavigation, successful = true))
-        assertTrue(attachment.session.readiness.await())
+        assertFalse(oldReadiness.result.await())
+        assertTrue(
+            lifecycle.markReady(
+                attachment.session,
+                newerNavigation.readinessGeneration,
+                successful = true,
+            ),
+        )
+        assertTrue(requireNotNull(lifecycle.readinessSignal(attachment.session)).result.await())
+    }
+
+    @Test
+    fun `fetch started before WebView attach waits for the next session`() = runBlocking {
+        val lifecycle = PipeRequestLifecycle<String>()
+        val waiting = async { lifecycle.awaitSession() }
+
+        assertFalse(waiting.isCompleted)
+        val attachment = lifecycle.attach()
+
+        assertSame(attachment.session, waiting.await())
     }
 
     @Test
@@ -57,11 +76,12 @@ class PipeRequestLifecycleTest {
         val lifecycle = PipeRequestLifecycle<String>()
         val attachment = lifecycle.attach()
         val session = attachment.session
+        val readiness = requireNotNull(lifecycle.readinessSignal(session))
 
         assertTrue(lifecycle.markReady(session, attachment.readinessGeneration, successful = false))
-        assertFalse(session.readiness.await())
+        assertFalse(readiness.result.await())
         assertFalse(lifecycle.markReady(session, attachment.readinessGeneration, successful = true))
-        assertNull(lifecycle.register(session, "request"))
+        assertNull(lifecycle.register(readiness, "request"))
     }
 
     @Test
@@ -69,8 +89,9 @@ class PipeRequestLifecycleTest {
         val lifecycle = PipeRequestLifecycle<String>()
         val attachment = lifecycle.attach()
         val session = attachment.session
+        val readiness = requireNotNull(lifecycle.readinessSignal(session))
         lifecycle.markReady(session, attachment.readinessGeneration, successful = true)
-        val request = requireNotNull(lifecycle.register(session, "request"))
+        val request = requireNotNull(lifecycle.register(readiness, "request"))
 
         assertTrue(lifecycle.isPending(request))
         assertTrue(lifecycle.cancel(request))
@@ -83,14 +104,15 @@ class PipeRequestLifecycleTest {
         val lifecycle = PipeRequestLifecycle<String>()
         val oldAttachment = lifecycle.attach()
         val oldSession = oldAttachment.session
+        val oldReadiness = requireNotNull(lifecycle.readinessSignal(oldSession))
         lifecycle.markReady(oldSession, oldAttachment.readinessGeneration, successful = true)
-        val oldRequest = requireNotNull(lifecycle.register(oldSession, "old"))
+        val oldRequest = requireNotNull(lifecycle.register(oldReadiness, "old"))
 
         val replacement = lifecycle.attach()
 
         assertEquals(listOf(oldRequest), replacement.displacedRequests)
         assertFalse(lifecycle.isCurrent(oldSession))
-        assertNull(lifecycle.register(oldSession, "late-old"))
+        assertNull(lifecycle.register(oldReadiness, "late-old"))
         assertFalse(lifecycle.cancel(oldRequest))
         assertFalse(replacement.session.readiness.isCompleted)
     }
@@ -124,9 +146,10 @@ class PipeRequestLifecycleTest {
 
         val readyAttachment = lifecycle.attach()
         val readySession = readyAttachment.session
+        val readiness = requireNotNull(lifecycle.readinessSignal(readySession))
         lifecycle.markReady(readySession, readyAttachment.readinessGeneration, successful = true)
-        val first = requireNotNull(lifecycle.register(readySession, "first"))
-        val second = requireNotNull(lifecycle.register(readySession, "second"))
+        val first = requireNotNull(lifecycle.register(readiness, "first"))
+        val second = requireNotNull(lifecycle.register(readiness, "second"))
 
         assertEquals(listOf(first, second), lifecycle.detach(readySession))
         assertFalse(lifecycle.isPending(first))
@@ -138,10 +161,41 @@ class PipeRequestLifecycleTest {
         val lifecycle = PipeRequestLifecycle<String>()
         val attachment = lifecycle.attach()
         val session = attachment.session
+        val readiness = requireNotNull(lifecycle.readinessSignal(session))
         lifecycle.markReady(session, attachment.readinessGeneration, successful = true)
-        val request = requireNotNull(lifecycle.register(session, "request"))
+        val request = requireNotNull(lifecycle.register(readiness, "request"))
 
         assertSame(request, lifecycle.take("request"))
         assertNull(lifecycle.take("request"))
+    }
+
+    @Test
+    fun `navigation after ready drains old document requests and resets readiness`() = runBlocking {
+        val lifecycle = PipeRequestLifecycle<String>()
+        val attachment = lifecycle.attach()
+        val oldSignal = requireNotNull(lifecycle.readinessSignal(attachment.session))
+        lifecycle.markReady(
+            attachment.session,
+            attachment.readinessGeneration,
+            successful = true,
+        )
+        val oldRequest = requireNotNull(lifecycle.register(oldSignal, "old-document"))
+
+        val navigation = requireNotNull(lifecycle.beginNavigation(attachment.session))
+        val newSignal = requireNotNull(lifecycle.readinessSignal(attachment.session))
+
+        assertEquals(listOf(oldRequest), navigation.displacedRequests)
+        assertFalse(lifecycle.isCurrent(oldSignal))
+        assertFalse(newSignal.result.isCompleted)
+        assertNull(lifecycle.register(oldSignal, "late-old-document"))
+        assertTrue(
+            lifecycle.markReady(
+                attachment.session,
+                navigation.readinessGeneration,
+                successful = true,
+            ),
+        )
+        assertTrue(newSignal.result.await())
+        assertTrue(lifecycle.register(newSignal, "new-document") != null)
     }
 }
