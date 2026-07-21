@@ -11,12 +11,32 @@ internal enum class PlayerChromeLayout {
     CINEMA,
 }
 
-internal fun playerChromeLayout(widthDp: Float, heightDp: Float): PlayerChromeLayout =
-    when {
-        heightDp < 220f || widthDp < 340f -> PlayerChromeLayout.MINIMAL
-        heightDp < 280f || widthDp < 520f -> PlayerChromeLayout.COMPACT
-        else -> PlayerChromeLayout.CINEMA
-    }
+internal fun playerChromeLayout(
+    widthDp: Float,
+    heightDp: Float,
+    fontScale: Float = 1f,
+): PlayerChromeLayout = when {
+    heightDp < 220f || widthDp < 340f -> PlayerChromeLayout.MINIMAL
+    heightDp >= 280f && widthDp >= 520f -> PlayerChromeLayout.CINEMA
+    !compactMetadataClearsTransport(heightDp, fontScale) -> PlayerChromeLayout.MINIMAL
+    else -> PlayerChromeLayout.COMPACT
+}
+
+/**
+ * Compact chrome can show two metadata lines above a centred transport. At large Android font
+ * scales those lines grow while the 48 dp navigation target does not, so geometry alone is not
+ * enough to decide whether the header fits. Keep a small visual gap instead of letting the title
+ * collide with playback controls.
+ */
+private fun compactMetadataClearsTransport(heightDp: Float, fontScale: Float): Boolean {
+    val effectiveFontScale = if (fontScale.isFinite()) fontScale.coerceAtLeast(1f) else 1f
+    val metadataHeightDp = 36f * effectiveFontScale
+    val headerBottomDp = 4f + maxOf(48f, metadataHeightDp)
+    val compactMetrics = playerChromeVerticalMetrics(PlayerChromeLayout.COMPACT)
+    val transportTopDp =
+        heightDp / 2f + compactMetrics.transportOffsetDp - compactMetrics.transportSizeDp / 2f
+    return headerBottomDp + 4f <= transportTopDp
+}
 
 internal data class PlayerChromeVerticalMetrics(
     val transportSizeDp: Float,
@@ -43,8 +63,12 @@ internal fun playerChromeVerticalMetrics(layout: PlayerChromeLayout): PlayerChro
 }
 
 /** Mirrors the Compose geometry so small-size regressions are caught without screenshot tests. */
-internal fun playerTransportClearsFooter(widthDp: Float, heightDp: Float): Boolean {
-    val metrics = playerChromeVerticalMetrics(playerChromeLayout(widthDp, heightDp))
+internal fun playerTransportClearsFooter(
+    widthDp: Float,
+    heightDp: Float,
+    fontScale: Float = 1f,
+): Boolean {
+    val metrics = playerChromeVerticalMetrics(playerChromeLayout(widthDp, heightDp, fontScale))
     val transportBottom = heightDp / 2f + metrics.transportOffsetDp + metrics.transportSizeDp / 2f
     val footerTop = heightDp - metrics.footerHeightDp
     return transportBottom <= footerTop

@@ -5,14 +5,44 @@ import org.junit.Test
 
 class PlayerUiPolicyTest {
     @Test
-    fun `inline portrait player uses compact chrome`() {
-        assertEquals(PlayerChromeLayout.COMPACT, playerChromeLayout(widthDp = 390f, heightDp = 220f))
+    fun `short inline players retain metadata at normal font scale`() {
+        assertEquals(
+            PlayerChromeLayout.COMPACT,
+            playerChromeLayout(widthDp = 390f, heightDp = 220f, fontScale = 1f),
+        )
+        assertEquals(
+            PlayerChromeLayout.COMPACT,
+            playerChromeLayout(widthDp = 400f, heightDp = 225f, fontScale = 1f),
+        )
         assertEquals(true, playerTransportClearsFooter(widthDp = 390f, heightDp = 220f))
     }
 
     @Test
-    fun `fullscreen landscape player uses cinema chrome`() {
-        assertEquals(PlayerChromeLayout.CINEMA, playerChromeLayout(widthDp = 840f, heightDp = 390f))
+    fun `large text removes metadata before it can overlap inline transport`() {
+        assertEquals(
+            PlayerChromeLayout.MINIMAL,
+            playerChromeLayout(widthDp = 390f, heightDp = 220f, fontScale = 2f),
+        )
+        assertEquals(
+            PlayerChromeLayout.MINIMAL,
+            playerChromeLayout(widthDp = 400f, heightDp = 225f, fontScale = 2f),
+        )
+        assertEquals(
+            true,
+            playerTransportClearsFooter(widthDp = 400f, heightDp = 225f, fontScale = 2f),
+        )
+    }
+
+    @Test
+    fun `fullscreen landscape player keeps cinema chrome with large text`() {
+        assertEquals(
+            PlayerChromeLayout.CINEMA,
+            playerChromeLayout(widthDp = 840f, heightDp = 390f, fontScale = 1f),
+        )
+        assertEquals(
+            PlayerChromeLayout.CINEMA,
+            playerChromeLayout(widthDp = 840f, heightDp = 390f, fontScale = 2f),
+        )
     }
 
     @Test

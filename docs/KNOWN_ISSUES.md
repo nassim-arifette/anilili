@@ -79,6 +79,12 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | UPDATE-006 | [x] | Keep the repository-administration immutability check as an operator preflight because `GITHUB_TOKEN` cannot read it; require `immutable: true` from the published release and roll back a mutable publication and its generated tag. | `fix/release-immutability-token-scope` |
 | BRAND-001 | [x] | Replace the inherited anime-head launcher artwork, monochrome icon, and TV banner mark with a fork-specific AniLili+ orbit-and-plus identity. | `fix/distinct-rebrand-artwork` |
 
+### Player interface and accessibility
+
+| ID | Status | Fix | Topic branch |
+| --- | --- | --- | --- |
+| UI-001 | [x] | Make adaptive player chrome selection aware of Android font scale. Short inline players now omit metadata before enlarged two-line titles can overlap transport controls, while layouts with enough room retain their compact or cinema presentation. | `fix/player-large-font-overlap` |
+
 ## Follow-up issue checklist
 
 ### High priority: playback limitations
