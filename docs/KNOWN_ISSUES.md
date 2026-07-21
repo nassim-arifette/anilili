@@ -1,6 +1,6 @@
 # Known Issues and Fix Tracker
 
-Last updated: July 21, 2026.
+Last updated: July 22, 2026.
 
 This is the canonical audit tracker for the current repository tree. A checked item is implemented
 and merged into the integration history. An unchecked item is still open, even when the limitation
@@ -87,6 +87,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | --- | --- | --- | --- |
 | UI-001 | [x] | Make adaptive player chrome selection aware of Android font scale. Short inline players now omit metadata before enlarged two-line titles can overlap transport controls, while layouts with enough room retain their compact or cinema presentation. | `fix/player-large-font-overlap` |
 | UI-002 | [x] | Select cinema chrome only when its measured transport clears the footer. Wide players between 280 and 293 dp high now keep the compact layout instead of overlapping the timeline and controls. | `fix/cinema-footer-clearance` |
+| UI-003 | [x] | Gate Android TV embed transport, seeking, automation, and D-pad interception on authenticated bridge availability. Cross-origin providers now get an explicit focus handoff, receive D-pad/Select directly, and return to the app action bar on the first Back press without synthetic taps. | `fix/cross-origin-tv-handoff` |
 
 ## Follow-up issue checklist
 
@@ -101,7 +102,8 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   document with `about:blank`; it cannot confirm that inaccessible iframe media stopped before the
   blank document commits. AniSkip is intentionally not queried without a real duration on these
   embeds. Provider markers are retained, but without observable telemetry they cannot drive
-  app-controlled manual or automatic seeking.
+  app-controlled manual or automatic seeking. Android TV now hands D-pad/Select to the provider
+  explicitly, but the quality of that provider-owned remote interface remains server-dependent.
 
 - [x] **OPEN-002 - Generic web fallback identity.** Generic fallback pages are now explicitly
   unmanaged: they cannot write route-owned progress/history, and cross-origin controls expose only

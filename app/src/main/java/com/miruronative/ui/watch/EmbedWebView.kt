@@ -224,7 +224,9 @@ fun EmbedWebView(
     // While set, the page owns touches again: our overlay steps aside so the provider's own bar —
     // the only scrubber those servers give us — is reachable, then we take the screen back.
     var providerControlsMode by remember(playbackKey, url) { mutableStateOf(false) }
+    var tvProviderHandoffReady by remember(navigationSession.generation) { mutableStateOf(false) }
     val tvPlayPauseFocus = remember { FocusRequester() }
+    val tvProviderHandoffFocus = remember { FocusRequester() }
     val currentPositionMs by rememberUpdatedState(positionMs)
     val currentOnPlaybackError by rememberUpdatedState(onPlaybackError)
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
@@ -442,6 +444,21 @@ fun EmbedWebView(
     val currentToggleWebPlayback by rememberUpdatedState<(String) -> Unit> { navigationToken ->
         if (navigationGuard.acceptsBridgeToken(navigationToken)) requestTogglePlayback()
     }
+    val currentRevealProviderHandoff by rememberUpdatedState<(String) -> Unit> { navigationToken ->
+        if (navigationGuard.acceptsBridgeToken(navigationToken)) {
+            providerControlsMode = false
+            tvProviderHandoffReady = true
+            fallbackInteraction++
+        }
+    }
+    val currentRecoverFromProviderControls by rememberUpdatedState<(String) -> Unit> { navigationToken ->
+        if (navigationGuard.acceptsBridgeToken(navigationToken)) {
+            DiagnosticsLog.event("EmbedWebView TV provider controls returned to app")
+            providerControlsMode = false
+            tvProviderHandoffReady = true
+            fallbackInteraction++
+        }
+    }
 
     DisposableEffect(webView) {
         val web = webView
@@ -457,6 +474,16 @@ fun EmbedWebView(
     // answer — episode moves, device-volume settings, fullscreen, and an honest provider hand-off.
     val fallbackControlsActive =
         playbackMode.controlsPlayback && !device.isTv && !webPlaybackAvailable && loadError == null
+    val tvControlPolicy = embedTvControlPolicy(
+        playerOwnsRemote = device.isTv && focusPlayerOnStart,
+        managedControlsDeclared = playbackMode.controlsPlayback,
+        bridgeAvailable = canControlPlayback,
+        providerControlsMode = providerControlsMode,
+        automationSupported = canAutomatePlayback,
+        settingsSupported = playbackMode.controlsPlayback,
+        fullscreenSupported = onToggleFullscreen != null,
+    )
+    val currentTvControlPolicy by rememberUpdatedState(tvControlPolicy)
 
     LaunchedEffect(
         navigationSession.generation,
@@ -488,20 +515,79 @@ fun EmbedWebView(
     // the screen back on roughly that beat.
     LaunchedEffect(navigationSession.generation, providerControlsMode) {
         if (!providerControlsMode) return@LaunchedEffect
+        // Touch providers hide their chrome after a short idle period. TV providers keep the D-pad
+        // until Back explicitly returns focus to the app handoff; a timer would steal the remote.
+        if (device.isTv) return@LaunchedEffect
         delay(8_000)
         providerControlsMode = false
     }
 
-    LaunchedEffect(navigationSession.generation, tvControlsVisible, focusPlayerOnStart) {
-        if (!tvControlsVisible || !focusPlayerOnStart) return@LaunchedEffect
+    // Avoid flashing the handoff over a quickly discovered same-origin video. A remote key reveals
+    // it immediately, and this bounded delay still makes a slow or never-finished cross-origin page
+    // reachable. If a controllable video appears later, native TV transport takes over.
+    LaunchedEffect(navigationSession.generation, webView, device.isTv) {
+        if (!device.isTv || webView == null) return@LaunchedEffect
+        delay(1_200)
+        tvProviderHandoffReady = true
+    }
+
+    val tvProviderHandoffVisible = tvProviderHandoffReady &&
+        loadError == null &&
+        tvControlPolicy.showsProviderHandoff
+
+    LaunchedEffect(
+        navigationSession.generation,
+        tvProviderHandoffVisible,
+        fallbackInteraction,
+        settingsSheetVisible,
+        captionAppearanceVisible,
+    ) {
+        if (
+            !tvProviderHandoffVisible ||
+            settingsSheetVisible ||
+            captionAppearanceVisible
+        ) {
+            return@LaunchedEffect
+        }
+        delay(32)
+        runCatching { tvProviderHandoffFocus.requestFocus() }
+    }
+
+    LaunchedEffect(tvControlPolicy.showsAppTransport) {
+        if (!tvControlPolicy.showsAppTransport) tvControlsVisible = false
+    }
+
+    LaunchedEffect(
+        navigationSession.generation,
+        tvControlsVisible,
+        focusPlayerOnStart,
+        tvControlPolicy.showsAppTransport,
+    ) {
+        if (
+            !tvControlsVisible ||
+            !focusPlayerOnStart ||
+            !tvControlPolicy.showsAppTransport
+        ) {
+            return@LaunchedEffect
+        }
         delay(32)
         runCatching { tvPlayPauseFocus.requestFocus() }
     }
     val screenReaderActive = rememberScreenReaderActive()
     // TalkBack users can't discover the hidden control row through a key press, so present it
     // as soon as the fullscreen player opens instead of waiting for the semantic reveal action.
-    LaunchedEffect(screenReaderActive, focusPlayerOnStart, navigationSession.generation) {
-        if (device.isTv && screenReaderActive && focusPlayerOnStart) {
+    LaunchedEffect(
+        screenReaderActive,
+        focusPlayerOnStart,
+        navigationSession.generation,
+        tvControlPolicy.showsAppTransport,
+    ) {
+        if (
+            device.isTv &&
+            screenReaderActive &&
+            focusPlayerOnStart &&
+            tvControlPolicy.showsAppTransport
+        ) {
             tvControlsVisible = true
         }
     }
@@ -756,7 +842,7 @@ fun EmbedWebView(
         }
     }
 
-    val remoteModifier = if (playbackMode.controlsPlayback && device.isTv && focusPlayerOnStart) {
+    val remoteModifier = if (device.isTv && tvControlPolicy.showsAppTransport) {
         Modifier
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown || !opensTvPlayerControls(event.key)) {
@@ -793,6 +879,8 @@ fun EmbedWebView(
                     DiagnosticsLog.event("EmbedWebView factory create WebView")
                     DiagnosticsLog.webViewPackage("EmbedWebView factory")
                     object : WebView(ctx) {
+                        private var consumesProviderBackSequence = false
+
                         override fun dispatchKeyEvent(event: KeyEvent): Boolean {
                             // Only claim the remote while the player is the active surface. In the
                             // TV episode grid the list owns the D-pad: handling keys here ate them
@@ -802,37 +890,89 @@ fun EmbedWebView(
                             // own page act on the remote; unhandled keys let the framework move
                             // focus out of the player and back to the list.
                             if (device.isTv && !currentPlayerOwnsRemote) return false
-                            if (
-                                playbackMode.controlsPlayback &&
-                                event.action == KeyEvent.ACTION_DOWN &&
-                                event.repeatCount == 0
-                            ) {
-                                when {
-                                    device.isTv && (
-                                        event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
-                                            event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
-                                            event.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
-                                        event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN
-                                        ) -> {
+                            if (device.isTv) {
+                                val policy = currentTvControlPolicy
+                                if (
+                                    event.keyCode == KeyEvent.KEYCODE_BACK &&
+                                    (policy.recoversAppUiOnBack || consumesProviderBackSequence)
+                                ) {
+                                    // Consume the complete key pair. The first Back after a handoff
+                                    // restores app focus; a second Back follows the normal screen
+                                    // navigation path because the WebView no longer owns focus.
+                                    if (
+                                        event.action == KeyEvent.ACTION_DOWN &&
+                                        event.repeatCount == 0
+                                    ) {
+                                        consumesProviderBackSequence = true
                                         val navigationToken = currentNavigationSession.bridgeToken
-                                        mainHandler.post { currentRevealTvControls(navigationToken) }
-                                        return true
+                                        mainHandler.post {
+                                            currentRecoverFromProviderControls(navigationToken)
+                                        }
+                                    } else if (event.action == KeyEvent.ACTION_UP) {
+                                        consumesProviderBackSequence = false
                                     }
-                                    event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
-                                        event.keyCode == KeyEvent.KEYCODE_ENTER ||
-                                        event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER -> {
-                                        val navigationToken = currentNavigationSession.bridgeToken
-                                        mainHandler.post { currentToggleWebPlayback(navigationToken) }
-                                        return true
+                                    return true
+                                }
+
+                                when (policy.remoteOwner) {
+                                    EmbedTvRemoteOwner.APP_PROVIDER_HANDOFF -> {
+                                        if (opensTvPlayerControls(event.keyCode)) {
+                                            if (
+                                                event.action == KeyEvent.ACTION_DOWN &&
+                                                event.repeatCount == 0
+                                            ) {
+                                                val navigationToken = currentNavigationSession.bridgeToken
+                                                mainHandler.post {
+                                                    currentRevealProviderHandoff(navigationToken)
+                                                }
+                                            }
+                                            return true
+                                        }
                                     }
-                                    event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT && currentHasNextEpisode -> {
-                                        currentOnNextEpisode?.invoke(currentPlaybackKey)
-                                        return true
+                                    EmbedTvRemoteOwner.APP_TRANSPORT -> {
+                                        if (opensTvPlayerControls(event.keyCode)) {
+                                            if (
+                                                event.action == KeyEvent.ACTION_DOWN &&
+                                                event.repeatCount == 0
+                                            ) {
+                                                val navigationToken = currentNavigationSession.bridgeToken
+                                                val isSelect =
+                                                    event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                                                        event.keyCode == KeyEvent.KEYCODE_ENTER ||
+                                                        event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+                                                mainHandler.post {
+                                                    if (isSelect) {
+                                                        currentToggleWebPlayback(navigationToken)
+                                                    } else {
+                                                        currentRevealTvControls(navigationToken)
+                                                    }
+                                                }
+                                            }
+                                            return true
+                                        }
+                                        if (event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT) {
+                                            if (
+                                                event.action == KeyEvent.ACTION_DOWN &&
+                                                event.repeatCount == 0 &&
+                                                currentHasNextEpisode
+                                            ) {
+                                                currentOnNextEpisode?.invoke(currentPlaybackKey)
+                                            }
+                                            return currentHasNextEpisode
+                                        }
+                                        if (event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS) {
+                                            if (
+                                                event.action == KeyEvent.ACTION_DOWN &&
+                                                event.repeatCount == 0 &&
+                                                currentHasPreviousEpisode
+                                            ) {
+                                                currentOnPreviousEpisode?.invoke(currentPlaybackKey)
+                                            }
+                                            return currentHasPreviousEpisode
+                                        }
                                     }
-                                    event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS && currentHasPreviousEpisode -> {
-                                        currentOnPreviousEpisode?.invoke(currentPlaybackKey)
-                                        return true
-                                    }
+                                    EmbedTvRemoteOwner.PARENT,
+                                    EmbedTvRemoteOwner.PROVIDER -> Unit
                                 }
                             }
                             return super.dispatchKeyEvent(event)
@@ -1280,7 +1420,39 @@ fun EmbedWebView(
                 .fillMaxWidth(),
         )
 
-        if (playbackMode.controlsPlayback && device.isTv && focusPlayerOnStart && tvControlsVisible) {
+        if (tvProviderHandoffVisible) {
+            TvProviderHandoffControls(
+                providerFocusRequester = tvProviderHandoffFocus,
+                onUseProviderControls = {
+                    DiagnosticsLog.event("EmbedWebView TV remote handed to cross-origin provider")
+                    providerControlsMode = true
+                    fallbackInteraction++
+                    webView?.requestFocus()
+                },
+                onSettings = if (tvControlPolicy.showsSettings) {
+                    {
+                        settingsSheetVisible = true
+                        fallbackInteraction++
+                    }
+                } else {
+                    null
+                },
+                isFullscreen = isFullscreen,
+                onFullscreen = if (tvControlPolicy.showsFullscreen) {
+                    onToggleFullscreen?.let { toggle ->
+                        {
+                            toggle()
+                            fallbackInteraction++
+                        }
+                    }
+                } else {
+                    null
+                },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
+        }
+
+        if (tvControlPolicy.showsAppTransport && tvControlsVisible) {
             TvPlayerControls(
                 positionMs = positionMs,
                 durationMs = durationMs,
