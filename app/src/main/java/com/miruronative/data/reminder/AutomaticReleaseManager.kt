@@ -28,9 +28,14 @@ import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.library.LibraryStore
 import com.miruronative.data.model.Media
 import com.miruronative.data.settings.SettingsStore
+import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.nav.Routes
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -66,14 +71,24 @@ object AutomaticReleaseManager {
         val oldestUseful = System.currentTimeMillis() / 1000L - 24 * 60 * 60
         synchronized(lock) {
             alarms = read().filter { it.airingAt >= oldestUseful }
-            alarms.forEach(::schedule)
             persist(alarms)
         }
     }
 
+    /** Recreates OS alarms after boot/update, once notification settings are known. */
+    fun restoreAlarms() {
+        if (!::appContext.isInitialized || !SettingsStore.isLoaded.value) return
+        synchronized(lock) {
+            if (!SettingsStore.releaseNotifications.value) return@synchronized
+            alarms.forEach(::schedule)
+        }
+    }
+
     fun sync(media: Collection<Media>) {
+        // Future callers must not turn the in-memory default into scheduled alarms during startup.
+        if (!SettingsStore.isLoaded.value) return
         if (!SettingsStore.releaseNotifications.value) {
-            cancelAll()
+            cancelAllIfDisabled()
             return
         }
         val now = System.currentTimeMillis() / 1000L
@@ -93,6 +108,12 @@ object AutomaticReleaseManager {
 
         val desiredIds = desired.mapTo(hashSetOf()) { it.id }
         synchronized(lock) {
+            // Serialize the final setting check with scheduling/cancellation. A UI toggle can
+            // otherwise cancel first and let this older reconciliation recreate alarms after it.
+            if (!SettingsStore.releaseNotifications.value) {
+                cancelAllLocked()
+                return
+            }
             alarms.filterNot { it.id in desiredIds }.forEach(::cancel)
             desired.forEach(::schedule)
             alarms = desired
@@ -103,10 +124,22 @@ object AutomaticReleaseManager {
     fun cancelAll() {
         if (!::appContext.isInitialized) return
         synchronized(lock) {
-            alarms.forEach(::cancel)
-            alarms = emptyList()
-            persist(alarms)
+            cancelAllLocked()
         }
+    }
+
+    /** Cancels a stale background action only if the setting is still disabled under the lock. */
+    internal fun cancelAllIfDisabled() {
+        if (!::appContext.isInitialized || !SettingsStore.isLoaded.value) return
+        synchronized(lock) {
+            if (!SettingsStore.releaseNotifications.value) cancelAllLocked()
+        }
+    }
+
+    private fun cancelAllLocked() {
+        alarms.forEach(::cancel)
+        alarms = emptyList()
+        persist(alarms)
     }
 
     fun markDelivered(id: String?) {
@@ -160,6 +193,28 @@ object AutomaticReleaseManager {
 
 class AutomaticReleaseReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        val pendingResult = goAsync()
+        val appContext = context.applicationContext
+        val copiedIntent = Intent(intent)
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                SettingsStore.awaitLoaded()
+                if (!SettingsStore.releaseNotifications.value) {
+                    AutomaticReleaseManager.cancelAllIfDisabled()
+                    return@launch
+                }
+                deliver(appContext, copiedIntent)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                DiagnosticsLog.throwable("Automatic release receiver failed", error)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    private fun deliver(context: Context, intent: Intent) {
         AutomaticReleaseManager.markDelivered(intent.getStringExtra("releaseId"))
         ReleaseSyncScheduler.runNow(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -242,11 +297,12 @@ class ReleaseSyncWorker(
     params: WorkerParameters,
 ) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
-        if (!SettingsStore.releaseNotifications.value) {
-            AutomaticReleaseManager.cancelAll()
-            return Result.success()
-        }
         return try {
+            SettingsStore.awaitLoaded()
+            if (!SettingsStore.releaseNotifications.value) {
+                AutomaticReleaseManager.cancelAllIfDisabled()
+                return Result.success()
+            }
             val repo = AppGraph.repository
             // Reconciliation removes alarms that are absent from this list, so never feed it a
             // partial snapshot after a transient metadata failure.

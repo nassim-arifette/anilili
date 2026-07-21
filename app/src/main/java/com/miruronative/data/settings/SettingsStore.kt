@@ -13,6 +13,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import com.miruronative.diagnostics.CrashReporter
 import java.io.IOException
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -107,7 +108,8 @@ object SettingsStore {
 
     private val _preferredProvider = MutableStateFlow(DEFAULT_PREFERRED_PROVIDER)
     val preferredProvider = _preferredProvider.asStateFlow()
-    private val loaded = MutableStateFlow(false)
+    private val _isLoaded = MutableStateFlow(false)
+    val isLoaded = _isLoaded.asStateFlow()
 
     fun init(context: Context) {
         val app = context.applicationContext
@@ -116,10 +118,16 @@ object SettingsStore {
             produceFile = { app.preferencesDataStoreFile("anilili_settings") },
         )
         scope.launch {
-            runCatching { migrateLegacyPreferences(app) }
-                .onFailure { CrashReporter.logNonFatal("Settings migration failed", it) }
+            try {
+                migrateLegacyPreferences(app)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                CrashReporter.logNonFatal("Settings migration failed", error)
+            }
             store.data
                 .catch { error ->
+                    if (error is CancellationException) throw error
                     // A settings read must never take the process down; fall back to defaults.
                     if (error !is IOException) CrashReporter.logNonFatal("Settings read failed", error)
                     emit(emptyPreferences())
@@ -165,7 +173,7 @@ object SettingsStore {
 
     /** Guarantees cold-start consumers see the persisted preference instead of the in-memory default. */
     suspend fun awaitLoaded() {
-        loaded.first { it }
+        awaitSettingsReady(isLoaded)
     }
 
     private fun save(key: Preferences.Key<Boolean>, value: Boolean, state: MutableStateFlow<Boolean>) {
@@ -212,7 +220,7 @@ object SettingsStore {
         _defaultQuality.value = DefaultQuality.fromStored(prefs[DEFAULT_QUALITY])
         _preferredProvider.value =
             prefs[PREFERRED_PROVIDER]?.takeIf(String::isNotBlank) ?: DEFAULT_PREFERRED_PROVIDER
-        loaded.value = true
+        _isLoaded.value = true
     }
 
     private suspend fun migrateLegacyPreferences(context: Context) {

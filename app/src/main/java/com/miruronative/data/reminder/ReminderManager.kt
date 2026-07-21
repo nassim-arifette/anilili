@@ -16,9 +16,16 @@ import androidx.core.content.ContextCompat
 import com.miruronative.MainActivity
 import com.miruronative.R
 import com.miruronative.data.model.AiringSchedule
+import com.miruronative.data.settings.SettingsStore
+import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.ui.nav.Routes
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -177,8 +184,26 @@ class AiringReminderReceiver : BroadcastReceiver() {
 class ReminderRescheduleReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED && intent.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
-        ReminderManager.init(context)
-        AutomaticReleaseManager.init(context)
-        ReleaseSyncScheduler.runNow(context)
+        val pendingResult = goAsync()
+        val appContext = context.applicationContext
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                SettingsStore.awaitLoaded()
+                ReminderManager.init(appContext)
+                AutomaticReleaseManager.init(appContext)
+                if (SettingsStore.releaseNotifications.value) {
+                    AutomaticReleaseManager.restoreAlarms()
+                    ReleaseSyncScheduler.runNow(appContext)
+                } else {
+                    AutomaticReleaseManager.cancelAllIfDisabled()
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                DiagnosticsLog.throwable("Alarm restoration failed", error)
+            } finally {
+                pendingResult.finish()
+            }
+        }
     }
 }

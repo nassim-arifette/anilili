@@ -1,6 +1,5 @@
 package com.miruronative
 
-import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -79,7 +78,9 @@ import androidx.fragment.app.FragmentActivity
 import com.miruronative.data.auth.AuthManager
 import com.miruronative.data.library.LibraryStore
 import com.miruronative.data.reminder.AutomaticReleaseManager
+import com.miruronative.data.reminder.NotificationPermissionAction
 import com.miruronative.data.reminder.ReleaseSyncScheduler
+import com.miruronative.data.reminder.notificationPermissionAction
 import com.miruronative.diagnostics.CrashReportDialog
 import com.miruronative.diagnostics.CrashReporter
 import com.miruronative.diagnostics.DiagnosticsLog
@@ -108,6 +109,8 @@ import com.miruronative.playback.PlaybackService
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+
+private const val POST_NOTIFICATIONS_PERMISSION = "android.permission.POST_NOTIFICATIONS"
 
 class MainActivity : FragmentActivity() {
     private var inPictureInPicture by mutableStateOf(false)
@@ -453,29 +456,49 @@ private fun MiruroRoot(
 private fun NotificationPermissionEffect() {
     val context = LocalContext.current
     val device = LocalAppDeviceProfile.current
+    val settingsLoaded by SettingsStore.isLoaded.collectAsState()
     val enabled by SettingsStore.releaseNotifications.collectAsState()
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        SettingsStore.setReleaseNotifications(granted)
-        if (granted) ReleaseSyncScheduler.runNow(context) else AutomaticReleaseManager.cancelAll()
+        // A result can arrive during recreation; never apply it to the provisional default or
+        // undo a user's explicit disable while the system dialog was open.
+        if (SettingsStore.isLoaded.value && SettingsStore.releaseNotifications.value) {
+            SettingsStore.setReleaseNotifications(granted)
+            if (granted) ReleaseSyncScheduler.runNow(context) else AutomaticReleaseManager.cancelAll()
+        }
     }
 
-    LaunchedEffect(enabled, device.isTv) {
-        if (!enabled) {
-            AutomaticReleaseManager.cancelAll()
-            return@LaunchedEffect
-        }
-        if (device.isTv || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return@LaunchedEffect
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
-            ReleaseSyncScheduler.runNow(context)
-            return@LaunchedEffect
-        }
+    LaunchedEffect(settingsLoaded, enabled, device.isTv) {
+        val runtimePermissionRequired =
+            !device.isTv && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        val permissionGranted = !runtimePermissionRequired ||
+            ContextCompat.checkSelfPermission(
+                context,
+                POST_NOTIFICATIONS_PERMISSION,
+            ) == PackageManager.PERMISSION_GRANTED
         val prefs = context.getSharedPreferences("anilili_permissions", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("release_notifications_prompted", false)) {
-            prefs.edit().putBoolean("release_notifications_prompted", true).apply()
-            launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            SettingsStore.setReleaseNotifications(false)
-            AutomaticReleaseManager.cancelAll()
+        when (
+            notificationPermissionAction(
+                settingsLoaded = settingsLoaded,
+                releaseNotificationsEnabled = enabled,
+                runtimePermissionRequired = runtimePermissionRequired,
+                permissionGranted = permissionGranted,
+                permissionWasPrompted = prefs.getBoolean("release_notifications_prompted", false),
+            )
+        ) {
+            NotificationPermissionAction.WAIT_FOR_SETTINGS,
+            NotificationPermissionAction.NO_ACTION -> Unit
+
+            NotificationPermissionAction.CANCEL_RELEASES -> AutomaticReleaseManager.cancelAll()
+            NotificationPermissionAction.SYNC_RELEASES -> ReleaseSyncScheduler.runNow(context)
+            NotificationPermissionAction.REQUEST_PERMISSION -> {
+                prefs.edit().putBoolean("release_notifications_prompted", true).apply()
+                launcher.launch(POST_NOTIFICATIONS_PERMISSION)
+            }
+
+            NotificationPermissionAction.DISABLE_AND_CANCEL -> {
+                SettingsStore.setReleaseNotifications(false)
+                AutomaticReleaseManager.cancelAll()
+            }
         }
     }
 }
