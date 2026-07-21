@@ -47,6 +47,7 @@ streams play with ExoPlayer; embed providers and fallback playback use WebView.
 | `app/src/main/java/com/miruronative/data/remote` | AniList, Miruro pipe, and provider clients |
 | `app/src/main/java/com/miruronative/ui` | Compose screens and player UI |
 | `docs/PIPE_PROTOCOL.md` | Notes about the Miruro pipe format |
+| `docs/KNOWN_ISSUES.md` | Checklist of fixed and remaining issues from code review |
 | `showcase/mobile` | Six optimized 540×1170 WebP screenshots |
 
 ## Build
