@@ -8,6 +8,20 @@ data class PlaybackIdentity(
     val mediaId: String,
 )
 
+/**
+ * Compose state that belongs to one logical native playback must not use the media URL as its
+ * identity. Some providers reuse one manifest URL for several episodes, and quality changes can
+ * use several URLs for the same episode.
+ */
+internal data class NativePlaybackSessionKey(
+    val animeId: Int,
+    val episodeNumber: Double,
+    val generation: Int,
+)
+
+internal fun PlaybackIdentity.nativePlaybackSessionKey(): NativePlaybackSessionKey =
+    NativePlaybackSessionKey(animeId, episodeNumber, generation)
+
 /** The native media identities that the currently published watch state is allowed to report. */
 internal data class ActivePlaybackTarget(
     val animeId: Int,

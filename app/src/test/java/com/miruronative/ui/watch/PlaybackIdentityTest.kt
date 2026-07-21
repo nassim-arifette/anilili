@@ -1,6 +1,8 @@
 package com.miruronative.ui.watch
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -71,6 +73,22 @@ class PlaybackIdentityTest {
         assertTrue(acceptsPlaybackProgress(manual720, active))
         assertTrue(isSamePlaybackSession(auto, manual720))
         assertFalse(isSamePlaybackSession(auto, manual720.copy(generation = 13)))
+    }
+
+    @Test
+    fun `episode state resets even when a provider reuses the same URL`() {
+        val episodeSix = PlaybackIdentity(101, 6.0, 12, "https://cdn.example/shared.m3u8")
+        val episodeSeven = episodeSix.copy(episodeNumber = 7.0, generation = 13)
+
+        assertNotEquals(episodeSix.nativePlaybackSessionKey(), episodeSeven.nativePlaybackSessionKey())
+    }
+
+    @Test
+    fun `quality changes retain episode local state`() {
+        val auto = PlaybackIdentity(101, 6.0, 12, "https://cdn.example/auto.m3u8")
+        val manual = auto.copy(mediaId = "https://cdn.example/720.m3u8")
+
+        assertEquals(auto.nativePlaybackSessionKey(), manual.nativePlaybackSessionKey())
     }
 
     @Test
