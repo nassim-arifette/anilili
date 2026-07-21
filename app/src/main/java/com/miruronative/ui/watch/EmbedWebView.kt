@@ -422,11 +422,12 @@ fun EmbedWebView(
         onDispose { currentOnPlaybackStopperChanged?.invoke(null) }
     }
 
+    val canControlPlayback = playbackMode.controlsPlayback && webPlaybackAvailable
+    val canAutomatePlayback = canControlPlayback && playbackMode.automatesEpisode
     // Full touch controls — seek bar and all — whenever the injected JS can reach the <video>.
-    val touchControlsActive =
-        playbackMode.controlsPlayback && !device.isTv && webPlaybackAvailable && loadError == null
+    val touchControlsActive = canControlPlayback && !device.isTv && loadError == null
     // Everything else: the page is out of reach, so this bar carries only what the app itself can
-    // answer — episode moves, settings, fullscreen — plus a play/pause relayed as a real touch.
+    // answer — episode moves, device-volume settings, fullscreen, and an honest provider hand-off.
     val fallbackControlsActive =
         playbackMode.controlsPlayback && !device.isTv && !webPlaybackAvailable && loadError == null
 
@@ -611,8 +612,16 @@ fun EmbedWebView(
         hasNextEpisode,
         introAutoSkipAttempt,
         outroAutoSkipAttempt,
+        canAutomatePlayback,
     ) {
-        if (!autoSkipIntroOutro || !webIsPlaying || positionMs <= 0L) return@LaunchedEffect
+        if (
+            !canAutomatePlayback ||
+            !autoSkipIntroOutro ||
+            !webIsPlaying ||
+            positionMs <= 0L
+        ) {
+            return@LaunchedEffect
+        }
 
         if (!introAutoSkipped && isInSkipWindow(positionMs, introStartMs, introEndMs)) {
             if (!introAutoSkipPending) {
@@ -1182,7 +1191,8 @@ fun EmbedWebView(
                 onDismiss = { settingsSheetVisible = false },
                 autoplay = autoplay,
                 onAutoplayChange = SettingsStore::setAutoplay,
-                speed = if (webPlaybackAvailable) playbackSpeed else null,
+                canAutomatePlayback = canAutomatePlayback,
+                speed = if (canControlPlayback) playbackSpeed else null,
                 onSpeedChange = { playbackSpeed = it },
                 qualityOptions = embedQualityStreams.mapNotNull { option ->
                     val height = option.height ?: declaredVideoHeight(option.quality) ?: return@mapNotNull null
@@ -1200,12 +1210,12 @@ fun EmbedWebView(
                         },
                     )
                 },
-                onCaptionAppearance = if (webPlaybackAvailable) {
+                onCaptionAppearance = if (canControlPlayback) {
                     { captionAppearanceVisible = true }
                 } else {
                     null
                 },
-                autoSkip = autoSkipIntroOutro,
+                autoSkip = autoSkipIntroOutro.takeIf { canAutomatePlayback },
                 onAutoSkipChange = SettingsStore::setAutoSkipIntroOutro,
             )
         }
@@ -1316,7 +1326,7 @@ fun EmbedWebView(
         }
 
         val action: Pair<String, () -> Unit>? = when {
-            !playbackMode.automatesEpisode -> null
+            !canAutomatePlayback -> null
             introEndMs != null && isInSkipWindow(positionMs, introStartMs, introEndMs) ->
                 "Skip Intro" to {
                     requestSeek(introEndMs, null)

@@ -91,8 +91,14 @@ internal fun PlayerControlsScaffold(
             .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)),
     ) {
         val chromeLayout = playerChromeLayout(maxWidth.value, maxHeight.value)
-        val compact = chromeLayout == PlayerChromeLayout.COMPACT
-        val horizontalPadding = if (compact) 12.dp else 24.dp
+        val minimal = chromeLayout == PlayerChromeLayout.MINIMAL
+        val compact = chromeLayout != PlayerChromeLayout.CINEMA
+        val metrics = playerChromeVerticalMetrics(chromeLayout)
+        val horizontalPadding = when (chromeLayout) {
+            PlayerChromeLayout.MINIMAL -> 8.dp
+            PlayerChromeLayout.COMPACT -> 12.dp
+            PlayerChromeLayout.CINEMA -> 24.dp
+        }
 
         Box(
             Modifier
@@ -111,6 +117,7 @@ internal fun PlayerControlsScaffold(
             seriesTitle = seriesTitle,
             episodeTitle = episodeTitle,
             compact = compact,
+            showMetadata = !minimal,
             onExitFullscreen = onExitFullscreen,
             modifier = Modifier
                 .align(Alignment.TopStart)
@@ -121,21 +128,29 @@ internal fun PlayerControlsScaffold(
         Row(
             modifier = Modifier
                 .align(Alignment.Center)
-                .offset(y = if (compact) (-18).dp else 0.dp),
-            horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 18.dp),
+                .offset(y = metrics.transportOffsetDp.dp),
+            horizontalArrangement = Arrangement.spacedBy(
+                when (chromeLayout) {
+                    PlayerChromeLayout.MINIMAL -> 2.dp
+                    PlayerChromeLayout.COMPACT -> 4.dp
+                    PlayerChromeLayout.CINEMA -> 18.dp
+                },
+            ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            PlayerControlIconButton(
-                "Previous episode",
-                Icons.Default.SkipPrevious,
-                enabled = hasPrevious,
-                onClick = onPrevious,
-            )
+            if (!minimal) {
+                PlayerControlIconButton(
+                    "Previous episode",
+                    Icons.Default.SkipPrevious,
+                    enabled = hasPrevious,
+                    onClick = onPrevious,
+                )
+            }
             PlayerControlIconButton("Rewind 10 seconds", Icons.Default.Replay10, onClick = onRewind)
             IconButton(
                 onClick = onPlayPause,
                 modifier = Modifier
-                    .size(if (compact) 58.dp else 70.dp)
+                    .size(metrics.transportSizeDp.dp)
                     .clip(CircleShape)
                     .background(PlayerInk.copy(alpha = 0.14f))
                     .border(1.dp, PlayerInk.copy(alpha = 0.34f), CircleShape)
@@ -145,69 +160,153 @@ internal fun PlayerControlsScaffold(
                     if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                     contentDescription = null,
                     tint = PlayerInk,
-                    modifier = Modifier.size(if (compact) 34.dp else 42.dp),
+                    modifier = Modifier.size(
+                        when (chromeLayout) {
+                            PlayerChromeLayout.MINIMAL -> 30.dp
+                            PlayerChromeLayout.COMPACT -> 34.dp
+                            PlayerChromeLayout.CINEMA -> 42.dp
+                        },
+                    ),
                 )
             }
             PlayerControlIconButton("Forward 10 seconds", Icons.Default.Forward10, onClick = onForward)
-            PlayerControlIconButton(
-                "Next episode",
-                Icons.Default.SkipNext,
-                enabled = hasNext,
-                onClick = onNext,
-            )
+            if (!minimal) {
+                PlayerControlIconButton(
+                    "Next episode",
+                    Icons.Default.SkipNext,
+                    enabled = hasNext,
+                    onClick = onNext,
+                )
+            }
         }
 
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(horizontal = horizontalPadding, vertical = if (compact) 2.dp else 8.dp),
+                .padding(
+                    horizontal = horizontalPadding,
+                    vertical = when (chromeLayout) {
+                        PlayerChromeLayout.MINIMAL -> 0.dp
+                        PlayerChromeLayout.COMPACT -> 0.dp
+                        PlayerChromeLayout.CINEMA -> 8.dp
+                    },
+                ),
         ) {
             val fraction = scrubFraction
                 ?: if (durationMs > 0L) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
-            Slider(
-                value = fraction,
-                onValueChange = {
-                    if (durationMs > 0L) scrubFraction = it
-                    onInteract()
-                },
-                onValueChangeFinished = {
-                    scrubFraction?.let { onSeek((it * durationMs).toLong()) }
-                    scrubFraction = null
-                },
-                enabled = durationMs > 0L,
-                colors = playerSliderColors(),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp)
-                    .semantics { contentDescription = "Playback position" },
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                val shownMs = scrubFraction?.let { (it * durationMs).toLong() } ?: positionMs
+            val shownMs = scrubFraction?.let { (it * durationMs).toLong() } ?: positionMs
+            if (minimal) {
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
                         formatPlayerTime(shownMs),
-                        style = MaterialTheme.typography.labelLarge,
+                        style = MaterialTheme.typography.labelSmall,
                         color = PlayerInk,
                         fontWeight = FontWeight.Bold,
                     )
+                    PlayerSeekSlider(
+                        fraction = fraction,
+                        durationMs = durationMs,
+                        onFractionChange = {
+                            scrubFraction = it
+                            onInteract()
+                        },
+                        onFinished = {
+                            scrubFraction?.let { onSeek((it * durationMs).toLong()) }
+                            scrubFraction = null
+                        },
+                        modifier = Modifier.weight(1f),
+                    )
                     Text(
                         "−${formatPlayerTime((durationMs - shownMs).coerceAtLeast(0L))}",
-                        style = MaterialTheme.typography.labelMedium,
+                        style = MaterialTheme.typography.labelSmall,
                         color = PlayerMutedInk,
                     )
                 }
-                Row(verticalAlignment = Alignment.CenterVertically, content = bottomRightIcons)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        PlayerControlIconButton(
+                            "Previous episode",
+                            Icons.Default.SkipPrevious,
+                            enabled = hasPrevious,
+                            onClick = onPrevious,
+                        )
+                        PlayerControlIconButton(
+                            "Next episode",
+                            Icons.Default.SkipNext,
+                            enabled = hasNext,
+                            onClick = onNext,
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, content = bottomRightIcons)
+                }
+            } else {
+                PlayerSeekSlider(
+                    fraction = fraction,
+                    durationMs = durationMs,
+                    onFractionChange = {
+                        scrubFraction = it
+                        onInteract()
+                    },
+                    onFinished = {
+                        scrubFraction?.let { onSeek((it * durationMs).toLong()) }
+                        scrubFraction = null
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            formatPlayerTime(shownMs),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = PlayerInk,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text(
+                            "−${formatPlayerTime((durationMs - shownMs).coerceAtLeast(0L))}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = PlayerMutedInk,
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, content = bottomRightIcons)
+                }
             }
         }
     }
+}
+
+@Composable
+private fun PlayerSeekSlider(
+    fraction: Float,
+    durationMs: Long,
+    onFractionChange: (Float) -> Unit,
+    onFinished: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Slider(
+        value = fraction,
+        onValueChange = { if (durationMs > 0L) onFractionChange(it) },
+        onValueChangeFinished = onFinished,
+        enabled = durationMs > 0L,
+        colors = playerSliderColors(),
+        modifier = modifier
+            .height(48.dp)
+            .semantics { contentDescription = "Playback position" },
+    )
 }
 
 @Composable
@@ -215,10 +314,13 @@ private fun PlayerChromeHeader(
     seriesTitle: String?,
     episodeTitle: String?,
     compact: Boolean,
+    showMetadata: Boolean,
     onExitFullscreen: (() -> Unit)?,
     modifier: Modifier = Modifier,
 ) {
-    if (seriesTitle.isNullOrBlank() && episodeTitle.isNullOrBlank() && onExitFullscreen == null) return
+    if ((!showMetadata || (seriesTitle.isNullOrBlank() && episodeTitle.isNullOrBlank())) && onExitFullscreen == null) {
+        return
+    }
     Row(
         modifier = modifier,
         horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 12.dp),
@@ -230,12 +332,12 @@ private fun PlayerChromeHeader(
                 icon = Icons.AutoMirrored.Filled.ArrowBack,
                 onClick = onExitFullscreen,
             )
-        } else {
+        } else if (showMetadata) {
             // WatchScreen owns the route-back button outside the player when it is inline. Keep
             // title context out from under that 48 dp target without duplicating its action here.
             Box(Modifier.size(48.dp))
         }
-        Column(Modifier.weight(1f)) {
+        if (showMetadata) Column(Modifier.weight(1f)) {
             if (!compact && !seriesTitle.isNullOrBlank()) {
                 Text(
                     "NOW PLAYING",
@@ -312,9 +414,21 @@ private fun playerSliderColors() = androidx.compose.material3.SliderDefaults.col
 )
 
 @Preview(name = "Fullscreen landscape", widthDp = 840, heightDp = 390, backgroundColor = 0xFF141217, showBackground = true)
-@Preview(name = "Inline portrait", widthDp = 390, heightDp = 220, backgroundColor = 0xFF141217, showBackground = true)
 @Composable
-private fun PlayerControlsPreview() {
+private fun FullscreenPlayerControlsPreview() {
+    PlayerControlsPreviewContent(onExitFullscreen = {})
+}
+
+@Preview(name = "Inline portrait", widthDp = 390, heightDp = 220, backgroundColor = 0xFF141217, showBackground = true)
+@Preview(name = "Small inline 360", widthDp = 360, heightDp = 202, backgroundColor = 0xFF141217, showBackground = true)
+@Preview(name = "Small inline 320", widthDp = 320, heightDp = 180, backgroundColor = 0xFF141217, showBackground = true)
+@Composable
+private fun InlinePlayerControlsPreview() {
+    PlayerControlsPreviewContent(onExitFullscreen = null)
+}
+
+@Composable
+private fun PlayerControlsPreviewContent(onExitFullscreen: (() -> Unit)?) {
     MaterialTheme {
         PlayerControlsScaffold(
             isPlaying = true,
@@ -330,7 +444,7 @@ private fun PlayerControlsPreview() {
             onSeek = {},
             seriesTitle = "Hunter × Hunter",
             episodeTitle = "Episode 12 · Last Test × Of × Resolve",
-            onExitFullscreen = {},
+            onExitFullscreen = onExitFullscreen,
         )
     }
 }

@@ -113,6 +113,7 @@ internal fun PlayerSettingsSheet(
     onDismiss: () -> Unit,
     autoplay: Boolean,
     onAutoplayChange: (Boolean) -> Unit,
+    canAutomatePlayback: Boolean = true,
     speed: Float? = null,
     onSpeedChange: (Float) -> Unit = {},
     qualityOptions: List<PlayerQualityOption> = emptyList(),
@@ -131,6 +132,7 @@ internal fun PlayerSettingsSheet(
     val headerFocusRequester = remember { FocusRequester() }
     var selectedSection by remember { mutableStateOf<PlayerSettingsSection?>(null) }
     val availability = PlayerSettingsAvailability(
+        hasPlaybackAutomation = canAutomatePlayback,
         hasSpeed = speed != null,
         hasQuality = qualityOptions.isNotEmpty(),
         hasContentScale = contentScale != null,
@@ -145,6 +147,11 @@ internal fun PlayerSettingsSheet(
     val navigateBack = { selectedSection = null }
 
     val content: @Composable () -> Unit = {
+        // ModalBottomSheet lives in a ComponentDialog. Registering this outside its content makes
+        // the dialog consume Back first and dismiss the whole sheet. Inside the dialog, Back from
+        // a detail section returns to the section list; TV uses this same handler before its panel
+        // handler closes the landing page.
+        BackHandler(enabled = selectedSection != null, onBack = navigateBack)
         SettingsHeader(
             title = title,
             canNavigateBack = selectedSection != null,
@@ -157,6 +164,7 @@ internal fun PlayerSettingsSheet(
             SettingsLanding(
                 sections = sections,
                 autoplay = autoplay,
+                canAutomatePlayback = canAutomatePlayback,
                 speed = speed,
                 qualityOptions = qualityOptions,
                 audioOptions = audioOptions,
@@ -169,6 +177,7 @@ internal fun PlayerSettingsSheet(
                 section = selectedSection!!,
                 autoplay = autoplay,
                 onAutoplayChange = onAutoplayChange,
+                canAutomatePlayback = canAutomatePlayback,
                 speed = speed,
                 onSpeedChange = onSpeedChange,
                 qualityOptions = qualityOptions,
@@ -186,7 +195,6 @@ internal fun PlayerSettingsSheet(
         }
     }
 
-    BackHandler(enabled = selectedSection != null, onBack = navigateBack)
     if (isTv) {
         TvSettingsPanel(
             title = title,
@@ -233,6 +241,7 @@ private fun SettingsHeader(
                 IconButton(
                     onClick = onBack,
                     modifier = Modifier
+                        .focusHighlight(RoundedCornerShape(24.dp))
                         .then(initialFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
                         .size(48.dp),
                 ) {
@@ -249,6 +258,7 @@ private fun SettingsHeader(
         IconButton(
             onClick = onClose,
             modifier = Modifier
+                .focusHighlight(RoundedCornerShape(24.dp))
                 .then(
                     if (!canNavigateBack) {
                         initialFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier
@@ -267,6 +277,7 @@ private fun SettingsHeader(
 private fun SettingsLanding(
     sections: List<PlayerSettingsSection>,
     autoplay: Boolean,
+    canAutomatePlayback: Boolean,
     speed: Float?,
     qualityOptions: List<PlayerQualityOption>,
     audioOptions: List<PlayerQualityOption>,
@@ -286,6 +297,7 @@ private fun SettingsLanding(
             summary = sectionSummary(
                 section = section,
                 autoplay = autoplay,
+                canAutomatePlayback = canAutomatePlayback,
                 speed = speed,
                 qualityOptions = qualityOptions,
                 audioOptions = audioOptions,
@@ -348,6 +360,7 @@ private fun PlayerSettingsSection.icon(): ImageVector = when (this) {
 private fun sectionSummary(
     section: PlayerSettingsSection,
     autoplay: Boolean,
+    canAutomatePlayback: Boolean,
     speed: Float?,
     qualityOptions: List<PlayerQualityOption>,
     audioOptions: List<PlayerQualityOption>,
@@ -355,7 +368,7 @@ private fun sectionSummary(
     contentScale: PlayerContentScale?,
 ): String = when (section) {
     PlayerSettingsSection.PLAYBACK -> buildList {
-        add(if (autoplay) "Auto next on" else "Auto next off")
+        if (canAutomatePlayback) add(if (autoplay) "Auto next on" else "Auto next off")
         speed?.let { add(it.formatPlaybackSpeed()) }
     }.joinToString(" · ")
     PlayerSettingsSection.VIDEO -> listOfNotNull(
@@ -375,6 +388,7 @@ private fun SettingsSectionContent(
     section: PlayerSettingsSection,
     autoplay: Boolean,
     onAutoplayChange: (Boolean) -> Unit,
+    canAutomatePlayback: Boolean,
     speed: Float?,
     onSpeedChange: (Float) -> Unit,
     qualityOptions: List<PlayerQualityOption>,
@@ -391,14 +405,16 @@ private fun SettingsSectionContent(
 ) {
     when (section) {
         PlayerSettingsSection.PLAYBACK -> {
-            ToggleRow("Auto-play next episode", autoplay, onAutoplayChange)
-            autoSkip?.let {
-                ToggleRow(
-                    label = "Auto-skip standard intro/outro",
-                    checked = it,
-                    onCheckedChange = onAutoSkipChange,
-                    supportingText = "Mixed themes and recaps stay manual.",
-                )
+            if (canAutomatePlayback) {
+                ToggleRow("Auto-play next episode", autoplay, onAutoplayChange)
+                autoSkip?.let {
+                    ToggleRow(
+                        label = "Auto-skip standard intro/outro",
+                        checked = it,
+                        onCheckedChange = onAutoSkipChange,
+                        supportingText = "Mixed themes and recaps stay manual.",
+                    )
+                }
             }
             speed?.let { current ->
                 SectionLabel("Speed")
