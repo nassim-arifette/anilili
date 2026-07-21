@@ -44,6 +44,13 @@ internal fun acceptsPlaybackProgress(
     callback.mediaId.isNotBlank() &&
     callback.mediaId in active.mediaIds
 
+/** A native failure can affect source selection only for the exact current MediaItem. */
+internal fun acceptsNativePlaybackError(
+    callback: PlaybackIdentity,
+    reportedMediaId: String,
+    active: ActivePlaybackTarget,
+): Boolean = callback.mediaId == reportedMediaId && acceptsPlaybackProgress(callback, active)
+
 /** Media/quality changes share one save throttle only while the logical playback stays the same. */
 internal fun isSamePlaybackSession(
     first: PlaybackIdentity,

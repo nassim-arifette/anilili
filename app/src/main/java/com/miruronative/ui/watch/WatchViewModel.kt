@@ -1255,6 +1255,25 @@ class WatchViewModel : ViewModel() {
         }
     }
 
+    /** Reject failures queued by a MediaItem after another episode/source has taken ownership. */
+    fun onNativePlaybackError(
+        identity: PlaybackIdentity,
+        message: String,
+        streamUrl: String,
+        positionMs: Long,
+    ) {
+        val data = (_state.value as? UiState.Success)?.data ?: return
+        val active = data.nativePlaybackTarget()
+        if (active == null || !acceptsNativePlaybackError(identity, streamUrl, active)) {
+            DiagnosticsLog.event(
+                "Watch ignored stale native error episode=${fmt(identity.episodeNumber)} " +
+                    "generation=${identity.generation}",
+            )
+            return
+        }
+        onPlaybackError(message, streamUrl, positionMs)
+    }
+
     private fun sourceOptions(number: Double): List<WatchSourceOption> =
         visibleSourceOptions(
             candidates = availableSourceOptions(mergedEpisodes, number),

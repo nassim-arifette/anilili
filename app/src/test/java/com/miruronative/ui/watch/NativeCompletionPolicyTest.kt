@@ -1,6 +1,7 @@
 package com.miruronative.ui.watch
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -13,6 +14,13 @@ class NativeCompletionPolicyTest {
         episodeNumber = 3.0,
     )
     private val availableMediaIds = setOf(identity.mediaId)
+
+    @Test
+    fun `terminal event requires the exact media item to have played`() {
+        assertFalse(isConfirmedNativeTerminalEvent(identity, null))
+        assertFalse(isConfirmedNativeTerminalEvent(identity, identity.copy(playbackId = "replacement")))
+        assertTrue(isConfirmedNativeTerminalEvent(identity, identity))
+    }
 
     @Test
     fun `valid ended event commits the terminal duration`() {

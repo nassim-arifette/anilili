@@ -66,6 +66,15 @@ class PlaybackIdentityTest {
     }
 
     @Test
+    fun `native error requires matching callback identity and media id`() {
+        val current = PlaybackIdentity(101, 6.0, 12, "https://cdn.example/episode-6.m3u8")
+
+        assertTrue(acceptsNativePlaybackError(current, current.mediaId, active))
+        assertFalse(acceptsNativePlaybackError(current, "https://old.example/video.m3u8", active))
+        assertFalse(acceptsNativePlaybackError(current.copy(generation = 11), current.mediaId, active))
+    }
+
+    @Test
     fun `quality media ids share the logical playback session`() {
         val auto = PlaybackIdentity(101, 6.0, 12, "https://cdn.example/episode-6.m3u8")
         val manual720 = PlaybackIdentity(101, 6.0, 12, "https://cdn.example/episode-6-720.m3u8")
