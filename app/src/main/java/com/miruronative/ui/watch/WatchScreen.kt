@@ -102,6 +102,7 @@ import com.miruronative.data.model.EpisodeItem
 import com.miruronative.data.model.StreamItem
 import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.PlaybackService
+import com.miruronative.playback.WatchPlaybackOwnerToken
 import com.miruronative.ui.UiState
 import com.miruronative.ui.components.ErrorBox
 import com.miruronative.ui.components.LoadingBox
@@ -159,23 +160,35 @@ fun WatchScreen(
         successData.chosenStream.isEmbed || ProviderCatalog.isEmbed(successData.provider) -> WatchPlayerMode.EMBED
         else -> WatchPlayerMode.NATIVE
     }
+    var playbackOwner by remember(animeId, provider, category, episode) {
+        mutableStateOf<WatchPlaybackOwnerToken?>(null)
+    }
     // Do not compose a WebView (or expose a terminal state) in the same frame that removes the
     // native surface. The service owns its player beyond PlayerSurface's lifetime, so disposal
     // alone cannot silence it. This explicit barrier stops/clears Media3 first, then permits the
     // requested owner to render on the following frame.
     var renderedPlayerMode by remember(animeId) { mutableStateOf<WatchPlayerMode?>(null) }
     val playerModeHandoff = playerModeHandoffAction(renderedPlayerMode, requestedPlayerMode)
-    LaunchedEffect(animeId, requestedPlayerMode) {
+    LaunchedEffect(animeId, provider, category, episode, requestedPlayerMode) {
+        // This runs while the handoff placeholder is still rendered. Claim the process-wide
+        // player before exposing any player surface so late work from the outgoing destination
+        // is already invalid by the time this screen can touch PlaybackService.
+        val owner = playbackOwner ?: PlaybackService.activateWatchPlaybackOwner().also {
+            playbackOwner = it
+        }
         if (playerModeHandoff == PlayerModeHandoffAction.STOP_NATIVE_THEN_RENDER) {
-            PlaybackService.stopActivePlayback()
+            // The incoming owner is allowed to clear media left by the previous screen. The
+            // previous token can no longer stop media after this point.
+            PlaybackService.stopActivePlayback(owner)
         }
         renderedPlayerMode = requestedPlayerMode
     }
-    val playerModeReady = renderedPlayerMode == requestedPlayerMode
+    val playerModeReady = playbackOwner != null && renderedPlayerMode == requestedPlayerMode
     val activity = remember(context) { context.findActivity() }
     val currentOnBack by rememberUpdatedState(onBack)
     var embeddedPlaybackStopper by remember { mutableStateOf<(() -> Unit)?>(null) }
     val currentEmbeddedPlaybackStopper by rememberUpdatedState(embeddedPlaybackStopper)
+    val currentPlaybackOwner by rememberUpdatedState(playbackOwner)
     // YouTube-style leave: native playback PAUSES (media stays loaded, so the notification can
     // resume it and re-entering the episode continues in place); the position is committed past
     // the periodic-save throttle so "continue watching" lands exactly where the user left off.
@@ -183,8 +196,12 @@ fun WatchScreen(
     val pauseAndBack = remember {
         {
             currentEmbeddedPlaybackStopper?.invoke()
-            vm.commitPlaybackPosition()
-            PlaybackService.pauseActivePlayback()
+            currentPlaybackOwner?.let { owner ->
+                PlaybackService.runIfWatchPlaybackOwnerActive(owner) {
+                    vm.commitPlaybackPosition()
+                }
+                PlaybackService.pauseActivePlayback(owner)
+            }
             currentOnBack()
         }
     }
@@ -193,11 +210,12 @@ fun WatchScreen(
     // loading/error/no-source/embed state, the native PlayerSurface disappears but the service
     // keeps playing unless it is stopped explicitly. Key this to the actual state transition so
     // consecutive unavailable states still reassert the terminal state if anything completed late.
-    LaunchedEffect(state, webFallback) {
+    LaunchedEffect(state, webFallback, playbackOwner) {
         DiagnosticsLog.event("WatchScreen webFallback=$webFallback")
-        if (shouldStopNativePlayback) {
+        val owner = playbackOwner
+        if (shouldStopNativePlayback && owner != null) {
             DiagnosticsLog.event("WatchScreen stopping playback because no native surface is available")
-            PlaybackService.stopActivePlayback()
+            PlaybackService.stopActivePlayback(owner)
         }
     }
 
@@ -259,11 +277,17 @@ fun WatchScreen(
     // Back gesture. PiP keeps this screen composed, so picture-in-picture is unaffected.
     // Pause rather than stop: the loaded session powers the notification's resume button,
     // and background media-button events are suppressed so it can't restart by itself.
-    DisposableEffect(Unit) {
+    DisposableEffect(playbackOwner) {
+        val owner = playbackOwner
         onDispose {
             currentEmbeddedPlaybackStopper?.invoke()
-            vm.commitPlaybackPosition()
-            PlaybackService.pauseActivePlayback()
+            if (owner != null) {
+                PlaybackService.runIfWatchPlaybackOwnerActive(owner) {
+                    vm.commitPlaybackPosition()
+                }
+                PlaybackService.pauseActivePlayback(owner)
+                PlaybackService.releaseWatchPlaybackOwner(owner)
+            }
         }
     }
 
@@ -335,6 +359,7 @@ fun WatchScreen(
                 val saved = watchlist.any { it.anilistId == s.data.anilistId }
                 WatchContent(
                     data = s.data,
+                    playbackOwner = checkNotNull(playbackOwner),
                     fullscreen = fullscreen || inPictureInPicture,
                     saved = saved,
                     onToggleSaved = {
@@ -382,6 +407,7 @@ fun WatchScreen(
 @Composable
 private fun WatchContent(
     data: WatchData,
+    playbackOwner: WatchPlaybackOwnerToken,
     fullscreen: Boolean,
     saved: Boolean,
     onToggleSaved: () -> Unit,
@@ -517,8 +543,10 @@ private fun WatchContent(
                         // player only exists in fullscreen. Leaving fullscreen stops playback, so
                         // first bank the position it reached — every resume path reads it.
                         LaunchedEffect(embedPlaybackKey, stream?.url) {
-                            PlaybackService.stopActivePlayback()
-                            onPlayerClosed()
+                            PlaybackService.stopActivePlayback(playbackOwner)
+                            PlaybackService.runIfWatchPlaybackOwnerActive(playbackOwner) {
+                                onPlayerClosed()
+                            }
                         }
                         // A real focusable play button (not a decoration): Fire TV users expect
                         // to click play here to continue watching, which re-enters fullscreen.
@@ -565,6 +593,7 @@ private fun WatchContent(
                     stream.isEmbed || ProviderCatalog.isEmbed(data.provider) ->
                         Box(Modifier.fillMaxSize()) {
                             EmbedEpisodeNavigationEffect(
+                                playbackOwner = playbackOwner,
                                 hasPrevious = data.hasPrev,
                                 hasNext = data.hasNext,
                                 onPrevious = { onEmbedPrevious(embedPlaybackKey) },
@@ -613,6 +642,7 @@ private fun WatchContent(
                             }
                         }
                     else -> PlayerSurface(
+                        playbackOwner = playbackOwner,
                         stream = stream,
                         qualityStreams = data.sources.streams.filterNot(StreamItem::isEmbed),
                         subtitles = data.sources.subtitles,
@@ -1742,6 +1772,7 @@ private fun NoSource(onWebFallback: () -> Unit) {
 
 @Composable
 private fun EmbedEpisodeNavigationEffect(
+    playbackOwner: WatchPlaybackOwnerToken,
     hasPrevious: Boolean,
     hasNext: Boolean,
     onPrevious: () -> Unit,
@@ -1760,12 +1791,13 @@ private fun EmbedEpisodeNavigationEffect(
                 direction < 0 && currentHasPrevious -> currentOnPrevious()
             }
         }
-        PlaybackService.episodeNavigator = navigator
-        DiagnosticsLog.event("Embed player episode navigator registered hasPrev=$hasPrevious hasNext=$hasNext")
+        val registered = PlaybackService.registerEpisodeNavigator(playbackOwner, navigator)
+        DiagnosticsLog.event(
+            "Embed player episode navigator registered=$registered " +
+                "hasPrev=$hasPrevious hasNext=$hasNext",
+        )
         onDispose {
-            if (PlaybackService.episodeNavigator === navigator) {
-                PlaybackService.episodeNavigator = null
-            }
+            PlaybackService.clearEpisodeNavigator(playbackOwner)
             DiagnosticsLog.event("Embed player episode navigator cleared")
         }
     }

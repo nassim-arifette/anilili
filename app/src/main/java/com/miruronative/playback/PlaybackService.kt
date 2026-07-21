@@ -43,6 +43,11 @@ object PlaybackStatus {
     }
 }
 
+private class EpisodeNavigatorRegistration(
+    val owner: WatchPlaybackOwnerToken,
+    val navigate: (direction: Int) -> Unit,
+)
+
 /**
  * Owns the app playback player so playback survives activity backgrounding and exposes Android
  * notification, lock-screen, headset, Bluetooth, and Cast controls through a MediaSession.
@@ -204,27 +209,31 @@ class PlaybackService : MediaSessionService() {
                     command == Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM ||
                     super.isCommandAvailable(command)
 
-            override fun hasNextMediaItem(): Boolean = episodeNavigator != null
-            override fun hasPreviousMediaItem(): Boolean = episodeNavigator != null
+            override fun hasNextMediaItem(): Boolean = hasActiveEpisodeNavigator()
+            override fun hasPreviousMediaItem(): Boolean = hasActiveEpisodeNavigator()
 
             override fun seekToNext() {
-                DiagnosticsLog.event("PlaybackService seekToNext navigator=${episodeNavigator != null}")
-                episodeNavigator?.invoke(1) ?: super.seekToNext()
+                val handled = navigateActiveEpisode(1)
+                DiagnosticsLog.event("PlaybackService seekToNext navigator=$handled")
+                if (!handled) super.seekToNext()
             }
 
             override fun seekToNextMediaItem() {
-                DiagnosticsLog.event("PlaybackService seekToNextMediaItem navigator=${episodeNavigator != null}")
-                episodeNavigator?.invoke(1) ?: super.seekToNextMediaItem()
+                val handled = navigateActiveEpisode(1)
+                DiagnosticsLog.event("PlaybackService seekToNextMediaItem navigator=$handled")
+                if (!handled) super.seekToNextMediaItem()
             }
 
             override fun seekToPrevious() {
-                DiagnosticsLog.event("PlaybackService seekToPrevious navigator=${episodeNavigator != null}")
-                episodeNavigator?.invoke(-1) ?: super.seekToPrevious()
+                val handled = navigateActiveEpisode(-1)
+                DiagnosticsLog.event("PlaybackService seekToPrevious navigator=$handled")
+                if (!handled) super.seekToPrevious()
             }
 
             override fun seekToPreviousMediaItem() {
-                DiagnosticsLog.event("PlaybackService seekToPreviousMediaItem navigator=${episodeNavigator != null}")
-                episodeNavigator?.invoke(-1) ?: super.seekToPreviousMediaItem()
+                val handled = navigateActiveEpisode(-1)
+                DiagnosticsLog.event("PlaybackService seekToPreviousMediaItem navigator=$handled")
+                if (!handled) super.seekToPreviousMediaItem()
             }
         }
 
@@ -294,6 +303,7 @@ class PlaybackService : MediaSessionService() {
         activeHttpFactory = null
         activePlayer = null
         episodeNavigator = null
+        watchPlaybackOwners.clear()
         PlaybackStatus.update(false)
         if (::session.isInitialized) session.release()
         if (::castPlayer.isInitialized) {
@@ -332,6 +342,10 @@ class PlaybackService : MediaSessionService() {
         @Volatile
         private var activePlayer: Player? = null
         private val localPlaybackOwners = LocalPlaybackOwnerRegistry()
+        private val watchPlaybackOwners = WatchPlaybackOwnerRegistry()
+
+        @Volatile
+        private var episodeNavigator: EpisodeNavigatorRegistration? = null
 
         internal fun acquireLocalPlaybackOwner(): LocalPlaybackOwnerToken {
             val token = localPlaybackOwners.acquire()
@@ -345,13 +359,60 @@ class PlaybackService : MediaSessionService() {
             }
         }
 
+        internal fun activateWatchPlaybackOwner(): WatchPlaybackOwnerToken {
+            val token = watchPlaybackOwners.activate()
+            DiagnosticsLog.event("PlaybackService watch playback owner activated generation=${token.generation}")
+            return token
+        }
+
+        internal fun releaseWatchPlaybackOwner(token: WatchPlaybackOwnerToken) {
+            val released = watchPlaybackOwners.runIfActive(token) {
+                if (episodeNavigator?.owner === token) episodeNavigator = null
+                watchPlaybackOwners.release(token)
+            }
+            if (released) {
+                DiagnosticsLog.event(
+                    "PlaybackService watch playback owner released generation=${token.generation}",
+                )
+            }
+        }
+
+        internal fun isWatchPlaybackOwnerActive(token: WatchPlaybackOwnerToken): Boolean =
+            watchPlaybackOwners.isActive(token)
+
+        internal fun runIfWatchPlaybackOwnerActive(
+            token: WatchPlaybackOwnerToken,
+            action: () -> Unit,
+        ): Boolean = watchPlaybackOwners.runIfActive(token, action)
+
         /**
-         * Set by the watch screen while it is visible: receives +1/-1 and resolves the
-         * next/previous episode through the normal source-resolution flow. Invoked on the
-         * main thread (session commands arrive on the application looper).
+         * Register navigation for the current watch-screen generation. A late effect from an
+         * outgoing screen cannot overwrite or clear the incoming screen's callback.
          */
-        @Volatile
-        var episodeNavigator: ((direction: Int) -> Unit)? = null
+        internal fun registerEpisodeNavigator(
+            owner: WatchPlaybackOwnerToken,
+            navigator: (direction: Int) -> Unit,
+        ): Boolean = watchPlaybackOwners.runIfActive(owner) {
+            episodeNavigator = EpisodeNavigatorRegistration(owner, navigator)
+        }
+
+        internal fun clearEpisodeNavigator(owner: WatchPlaybackOwnerToken) {
+            watchPlaybackOwners.runIfActive(owner) {
+                if (episodeNavigator?.owner === owner) episodeNavigator = null
+            }
+        }
+
+        private fun hasActiveEpisodeNavigator(): Boolean {
+            val registration = episodeNavigator ?: return false
+            return watchPlaybackOwners.isActive(registration.owner)
+        }
+
+        private fun navigateActiveEpisode(direction: Int): Boolean {
+            val registration = episodeNavigator ?: return false
+            return watchPlaybackOwners.runIfActive(registration.owner) {
+                registration.navigate(direction)
+            }
+        }
 
         /** Used when switching explicitly from native playback to a provider WebView. */
         fun stopActivePlayback() {
@@ -361,6 +422,10 @@ class PlaybackService : MediaSessionService() {
                 clearMediaItems()
             }
         }
+
+        /** Stop only if this screen is still the newest watch destination. */
+        internal fun stopActivePlayback(owner: WatchPlaybackOwnerToken): Boolean =
+            watchPlaybackOwners.runIfActive(owner) { stopActivePlayback() }
 
         @Volatile
         private var suppressMediaButtonResume = false
@@ -378,6 +443,10 @@ class PlaybackService : MediaSessionService() {
             // events (Bluetooth reconnects) must not restart it while the app is away.
             suppressMediaButtonResume = true
         }
+
+        /** Pause only if this screen is still the newest watch destination. */
+        internal fun pauseActivePlayback(owner: WatchPlaybackOwnerToken): Boolean =
+            watchPlaybackOwners.runIfActive(owner) { pauseActivePlayback() }
 
         /** The app is visible again (or playback deliberately restarted): buttons act normally. */
         fun allowMediaButtonResume() {

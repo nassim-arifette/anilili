@@ -108,6 +108,7 @@ import com.miruronative.diagnostics.DiagnosticsLog
 import com.miruronative.playback.LocalPlaybackOwnerToken
 import com.miruronative.playback.PlaybackService
 import com.miruronative.playback.SubtitleDelay
+import com.miruronative.playback.WatchPlaybackOwnerToken
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
@@ -286,7 +287,8 @@ private fun MediaItem.playbackIdentityOrNull(): PlaybackIdentity? {
 /** Media3 player surface backed by [PlaybackService] for PiP and system media controls. */
 @OptIn(UnstableApi::class)
 @Composable
-fun PlayerSurface(
+internal fun PlayerSurface(
+    playbackOwner: WatchPlaybackOwnerToken,
     stream: StreamItem,
     qualityStreams: List<StreamItem> = listOf(stream),
     subtitles: List<SubtitleItem>,
@@ -321,17 +323,17 @@ fun PlayerSurface(
     DisposableEffect(Unit) { onDispose { resetPlayerBrightness(context) } }
     val lifecycleOwner = remember(context) { context.findPlayerLifecycleOwner() }
     DisposableEffect(lifecycleOwner) {
-        var playbackOwner: LocalPlaybackOwnerToken? = null
+        var localPlaybackOwner: LocalPlaybackOwnerToken? = null
 
         fun acquirePlaybackOwner() {
-            if (playbackOwner == null) {
-                playbackOwner = PlaybackService.acquireLocalPlaybackOwner()
+            if (localPlaybackOwner == null) {
+                localPlaybackOwner = PlaybackService.acquireLocalPlaybackOwner()
             }
         }
 
         fun releasePlaybackOwner() {
-            playbackOwner?.let { PlaybackService.releaseLocalPlaybackOwner(it) }
-            playbackOwner = null
+            localPlaybackOwner?.let { PlaybackService.releaseLocalPlaybackOwner(it) }
+            localPlaybackOwner = null
         }
 
         val lifecycle = lifecycleOwner?.lifecycle
@@ -363,6 +365,8 @@ fun PlayerSurface(
         MediaController.Builder(context, token).buildAsync()
     }
     val playbackSurfaceLease = remember { NativePlaybackSurfaceLease() }
+    fun runIfPlaybackOwnerActive(action: () -> Unit): Boolean =
+        PlaybackService.runIfWatchPlaybackOwnerActive(playbackOwner, action)
     var controller by remember { mutableStateOf<MediaController?>(null) }
     val currentProvider by rememberUpdatedState(provider)
     val currentCategory by rememberUpdatedState(category)
@@ -395,18 +399,23 @@ fun PlayerSurface(
     DisposableEffect(controllerFuture) {
         controllerFuture.addListener(
             {
-                val accepted = playbackSurfaceLease.runIfActive {
-                    runCatching { controllerFuture.get() }
-                        .onSuccess {
-                            DiagnosticsLog.event("PlayerSurface MediaController connected")
-                            controller = it
-                        }
-                        .onFailure {
-                            DiagnosticsLog.throwable("PlayerSurface MediaController connection failed", it)
-                        }
+                var ownerAccepted = false
+                val surfaceAccepted = playbackSurfaceLease.runIfActive {
+                    ownerAccepted = runIfPlaybackOwnerActive {
+                        runCatching { controllerFuture.get() }
+                            .onSuccess {
+                                DiagnosticsLog.event("PlayerSurface MediaController connected")
+                                controller = it
+                            }
+                            .onFailure {
+                                DiagnosticsLog.throwable("PlayerSurface MediaController connection failed", it)
+                            }
+                    }
                 }
-                if (!accepted) {
+                if (!surfaceAccepted) {
                     DiagnosticsLog.event("PlayerSurface ignored late MediaController connection")
+                } else if (!ownerAccepted) {
+                    DiagnosticsLog.event("PlayerSurface ignored MediaController connection for stale watch owner")
                 }
             },
             ContextCompat.getMainExecutor(context),
@@ -429,126 +438,151 @@ fun PlayerSurface(
     }
 
     LaunchedEffect(controller, playbackSessionKey) {
-        controller?.let(::clearVideoSelection)
+        controller?.let { activeController ->
+            runIfPlaybackOwnerActive { clearVideoSelection(activeController) }
+        }
     }
 
-    DisposableEffect(controller, playbackSessionKey) {
+    DisposableEffect(controller, playbackSessionKey, playbackOwner) {
         val activeController = controller
         if (activeController == null) {
             onDispose { }
         } else {
-            playbackIsPlaying = activeController.isPlaying
             val listener = object : Player.Listener {
                 private var audioPreferenceAppliedFor: String? = null
 
                 override fun onPlaybackStateChanged(playbackState: Int) {
-                    DiagnosticsLog.event(
-                        "PlayerSurface playbackState=${playbackState.stateName()} " +
-                            "mediaId=${activeController.currentMediaItem?.mediaId?.take(120) ?: "none"}",
-                    )
-                    // The default-quality effect waits for READY; re-trigger it when we get there.
-                    if (playbackState == Player.STATE_READY) tracksRevision++
-                    if (playbackState == Player.STATE_ENDED) {
-                        val item = activeController.currentMediaItem
-                        val identity = item?.nativePlaybackIdentity()
-                        val navigationIdentity = item?.playbackNavigationIdentityOrNull()
-                        if (
-                            identity == null ||
-                            navigationIdentity == null ||
-                            !isConfirmedNativeTerminalEvent(identity, confirmedNativePlaybackIdentity)
-                        ) {
-                            DiagnosticsLog.event("PlayerSurface ignored unconfirmed/stale terminal event")
-                        } else {
-                            currentOnEnded(
-                                NativePlaybackCompletion(
-                                    identity = identity,
-                                    reportedPositionMs = activeController.currentPosition,
-                                    durationMs = activeController.duration,
-                                ),
-                                navigationIdentity,
-                            )
+                    val accepted = runIfPlaybackOwnerActive {
+                        DiagnosticsLog.event(
+                            "PlayerSurface playbackState=${playbackState.stateName()} " +
+                                "mediaId=${activeController.currentMediaItem?.mediaId?.take(120) ?: "none"}",
+                        )
+                        // The default-quality effect waits for READY; re-trigger it when we get there.
+                        if (playbackState == Player.STATE_READY) tracksRevision++
+                        if (playbackState == Player.STATE_ENDED) {
+                            val item = activeController.currentMediaItem
+                            val identity = item?.nativePlaybackIdentity()
+                            val navigationIdentity = item?.playbackNavigationIdentityOrNull()
+                            if (
+                                identity == null ||
+                                navigationIdentity == null ||
+                                !isConfirmedNativeTerminalEvent(identity, confirmedNativePlaybackIdentity)
+                            ) {
+                                DiagnosticsLog.event("PlayerSurface ignored unconfirmed/stale terminal event")
+                            } else {
+                                currentOnEnded(
+                                    NativePlaybackCompletion(
+                                        identity = identity,
+                                        reportedPositionMs = activeController.currentPosition,
+                                        durationMs = activeController.duration,
+                                    ),
+                                    navigationIdentity,
+                                )
+                            }
                         }
                     }
+                    if (!accepted) DiagnosticsLog.event("PlayerSurface ignored state for stale watch owner")
                 }
 
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
-                    playbackIsPlaying = isPlaying
-                    if (isPlaying) {
-                        val item = activeController.currentMediaItem
-                        item?.playbackIdentityOrNull()?.let { confirmedPlaybackIdentity = it }
-                        item?.nativePlaybackIdentity()?.let { confirmedNativePlaybackIdentity = it }
+                    val accepted = runIfPlaybackOwnerActive {
+                        playbackIsPlaying = isPlaying
+                        if (isPlaying) {
+                            val item = activeController.currentMediaItem
+                            item?.playbackIdentityOrNull()?.let { confirmedPlaybackIdentity = it }
+                            item?.nativePlaybackIdentity()?.let { confirmedNativePlaybackIdentity = it }
+                        }
+                        DiagnosticsLog.event("PlayerSurface isPlaying=$isPlaying")
                     }
-                    DiagnosticsLog.event("PlayerSurface isPlaying=$isPlaying")
+                    if (!accepted) DiagnosticsLog.event("PlayerSurface ignored play state for stale watch owner")
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
-                    DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
-                    val failedItem = activeController.currentMediaItem
-                    val failedIdentity = failedItem?.playbackIdentityOrNull()
-                    val failedMediaId = failedItem?.mediaId
-                    if (
-                        failedIdentity == null ||
-                        failedMediaId == null ||
-                        !isSamePlaybackSession(failedIdentity, playbackIdentity)
-                    ) {
-                        DiagnosticsLog.event("PlayerSurface ignored error without current playback identity")
-                        return
+                    val accepted = runIfPlaybackOwnerActive {
+                        DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
+                        val failedItem = activeController.currentMediaItem
+                        val failedIdentity = failedItem?.playbackIdentityOrNull()
+                        val failedMediaId = failedItem?.mediaId
+                        if (
+                            failedIdentity == null ||
+                            failedMediaId == null ||
+                            !isSamePlaybackSession(failedIdentity, playbackIdentity)
+                        ) {
+                            DiagnosticsLog.event("PlayerSurface ignored error without current playback identity")
+                        } else if (
+                            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED &&
+                            decoderRetryPolicy.tryConsumeRetry(failedMediaId)
+                        ) {
+                            val resumeAt = activeController.currentPosition.coerceAtLeast(0L)
+                            activeController.trackSelectionParameters = activeController.trackSelectionParameters
+                                .buildUpon()
+                                .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                                .setMaxVideoSize(1280, 720)
+                                .build()
+                            activeController.prepare()
+                            activeController.seekTo(resumeAt)
+                            activeController.play()
+                            DiagnosticsLog.event(
+                                "PlayerSurface decoder failed; retrying same stream capped at 720p resumeMs=$resumeAt",
+                            )
+                        } else {
+                            currentOnError(
+                                failedIdentity,
+                                error.localizedMessage ?: "Playback failed",
+                                failedMediaId,
+                                activeController.currentPosition.coerceAtLeast(0L),
+                            )
+                        }
                     }
-                    if (
-                        error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED &&
-                        decoderRetryPolicy.tryConsumeRetry(failedMediaId)
-                    ) {
-                        val resumeAt = activeController.currentPosition.coerceAtLeast(0L)
-                        activeController.trackSelectionParameters = activeController.trackSelectionParameters
-                            .buildUpon()
-                            .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
-                            .setMaxVideoSize(1280, 720)
-                            .build()
-                        activeController.prepare()
-                        activeController.seekTo(resumeAt)
-                        activeController.play()
-                        DiagnosticsLog.event(
-                            "PlayerSurface decoder failed; retrying same stream capped at 720p resumeMs=$resumeAt",
-                        )
-                        return
-                    }
-                    currentOnError(
-                        failedIdentity,
-                        error.localizedMessage ?: "Playback failed",
-                        failedMediaId,
-                        activeController.currentPosition.coerceAtLeast(0L),
-                    )
+                    if (!accepted) DiagnosticsLog.event("PlayerSurface ignored error for stale watch owner")
                 }
 
                 override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
-                    DiagnosticsLog.event("PlayerSurface tracks ${tracks.diagnosticSummary()}")
-                    tracksRevision++
-                    val mediaId = activeController.currentMediaItem?.mediaId ?: return
-                    if (currentProvider !in MULTI_AUDIO_PROVIDERS || audioPreferenceAppliedFor == mediaId) return
-                    if (applyCategoryAudioPreference(activeController, currentCategory, currentProvider)) {
-                        audioPreferenceAppliedFor = mediaId
+                    runIfPlaybackOwnerActive {
+                        DiagnosticsLog.event("PlayerSurface tracks ${tracks.diagnosticSummary()}")
+                        tracksRevision++
+                        val mediaId = activeController.currentMediaItem?.mediaId
+                        if (
+                            mediaId != null &&
+                            currentProvider in MULTI_AUDIO_PROVIDERS &&
+                            audioPreferenceAppliedFor != mediaId &&
+                            applyCategoryAudioPreference(activeController, currentCategory, currentProvider)
+                        ) {
+                            audioPreferenceAppliedFor = mediaId
+                        }
                     }
                 }
             }
-            DiagnosticsLog.event("PlayerSurface listener attached")
-            activeController.addListener(listener)
+            val listenerAttached = runIfPlaybackOwnerActive {
+                playbackIsPlaying = activeController.isPlaying
+                activeController.addListener(listener)
+                DiagnosticsLog.event("PlayerSurface listener attached")
+            }
             onDispose {
-                activeController.currentMediaItem?.playbackIdentityOrNull()?.let { identity ->
-                    currentOnProgress?.invoke(
-                        identity,
-                        activeController.currentPosition.coerceAtLeast(0),
-                        activeController.duration.coerceAtLeast(0),
-                        confirmedPlaybackIdentity?.let { isSamePlaybackSession(it, identity) } == true,
-                    )
+                runIfPlaybackOwnerActive {
+                    activeController.currentMediaItem?.playbackIdentityOrNull()?.let { identity ->
+                        currentOnProgress?.invoke(
+                            identity,
+                            activeController.currentPosition.coerceAtLeast(0),
+                            activeController.duration.coerceAtLeast(0),
+                            confirmedPlaybackIdentity?.let { isSamePlaybackSession(it, identity) } == true,
+                        )
+                    }
                 }
-                activeController.removeListener(listener)
-                DiagnosticsLog.event("PlayerSurface listener removed")
+                if (listenerAttached) {
+                    activeController.removeListener(listener)
+                    DiagnosticsLog.event("PlayerSurface listener removed")
+                }
             }
         }
     }
 
     LaunchedEffect(controller, activeStream.url, subtitles, playbackIdentity, playbackNavigationIdentity) {
         val activeController = controller ?: return@LaunchedEffect
+        if (!PlaybackService.isWatchPlaybackOwnerActive(playbackOwner)) {
+            DiagnosticsLog.event("PlayerSurface ignored media item work for stale watch owner")
+            return@LaunchedEffect
+        }
         val progressIdentity = playbackIdentity.copy(mediaId = activeStream.url)
         val currentItem = activeController.currentMediaItem
         val currentIdentity = currentItem?.nativePlaybackIdentity()
@@ -560,11 +594,13 @@ fun PlayerSurface(
             currentIdentity.animeId == playbackNavigationIdentity.animeId &&
             currentIdentity.episodeNumber == playbackNavigationIdentity.episodeNumber
         ) {
-            currentOnPlaybackIdentityChanged(currentIdentity)
-            DiagnosticsLog.event(
-                "PlayerSurface media item already active " +
-                    "host=${activeStream.host()} type=${activeStream.typeLabel()}",
-            )
+            runIfPlaybackOwnerActive {
+                currentOnPlaybackIdentityChanged(currentIdentity)
+                DiagnosticsLog.event(
+                    "PlayerSurface media item already active " +
+                        "host=${activeStream.host()} type=${activeStream.typeLabel()}",
+                )
+            }
             return@LaunchedEffect
         }
 
@@ -625,17 +661,22 @@ fun PlayerSurface(
                 },
             )
             .build()
-        val prepared = playbackSurfaceLease.runIfActive {
-            PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
-            currentOnPlaybackIdentityChanged(nativePlaybackIdentity)
-            activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
-            decoderRetryPolicy.onMediaItemSet()
-            activeController.prepare()
-            activeController.playWhenReady = true
-            DiagnosticsLog.event("PlayerSurface prepare called playWhenReady=true")
+        var ownerAccepted = false
+        val surfaceAccepted = playbackSurfaceLease.runIfActive {
+            ownerAccepted = runIfPlaybackOwnerActive {
+                PlaybackService.configureRequestHeaders(activeStream.referer, activeStream.playlistKey)
+                currentOnPlaybackIdentityChanged(nativePlaybackIdentity)
+                activeController.setMediaItem(item, nextStartPositionMs.coerceAtLeast(0))
+                decoderRetryPolicy.onMediaItemSet()
+                activeController.prepare()
+                activeController.playWhenReady = true
+                DiagnosticsLog.event("PlayerSurface prepare called playWhenReady=true")
+            }
         }
-        if (!prepared) {
+        if (!surfaceAccepted) {
             DiagnosticsLog.event("PlayerSurface ignored prepare after surface disposal")
+        } else if (!ownerAccepted) {
+            DiagnosticsLog.event("PlayerSurface ignored prepare for stale watch owner")
         }
     }
 
@@ -644,16 +685,19 @@ fun PlayerSurface(
     LaunchedEffect(controller, playbackSessionKey) {
         val activeController = controller ?: return@LaunchedEffect
         while (isActive) {
-            positionMs = activeController.currentPosition.coerceAtLeast(0)
-            durationMs = activeController.duration.coerceAtLeast(0)
-            if (activeController.isPlaying) {
-                val item = activeController.currentMediaItem
-                item?.playbackIdentityOrNull()?.let { identity ->
-                    confirmedPlaybackIdentity = identity
-                    currentOnProgress?.invoke(identity, positionMs, durationMs, true)
+            val accepted = runIfPlaybackOwnerActive {
+                positionMs = activeController.currentPosition.coerceAtLeast(0)
+                durationMs = activeController.duration.coerceAtLeast(0)
+                if (activeController.isPlaying) {
+                    val item = activeController.currentMediaItem
+                    item?.playbackIdentityOrNull()?.let { identity ->
+                        confirmedPlaybackIdentity = identity
+                        currentOnProgress?.invoke(identity, positionMs, durationMs, true)
+                    }
+                    item?.nativePlaybackIdentity()?.let { confirmedNativePlaybackIdentity = it }
                 }
-                item?.nativePlaybackIdentity()?.let { confirmedNativePlaybackIdentity = it }
             }
+            if (!accepted) break
             delay(500)
         }
     }
@@ -718,21 +762,22 @@ fun PlayerSurface(
     val currentHasNext by rememberUpdatedState(hasNextEpisode)
     val currentHasPrevious by rememberUpdatedState(hasPreviousEpisode)
     val canGoPrevious = hasPreviousEpisode && onPreviousEpisode != null
-    val playerControls = remember(controller, hasNextEpisode, canGoPrevious) {
+    val playerControls = remember(controller, hasNextEpisode, canGoPrevious, playbackOwner) {
         controller?.let { activeController ->
             EpisodeControlPlayer(
                 player = activeController,
                 hasNextEpisode = hasNextEpisode,
                 hasPreviousEpisode = canGoPrevious,
-                onNextEpisode = { currentOnNextEpisode() },
-                onPreviousEpisode = { currentOnPreviousEpisode?.invoke() },
+                onNextEpisode = { runIfPlaybackOwnerActive { currentOnNextEpisode() } },
+                onPreviousEpisode = {
+                    runIfPlaybackOwnerActive { currentOnPreviousEpisode?.invoke() }
+                },
             )
         }
     }
 
     // Bridges notification, remote, and hardware media-key commands into episode resolution.
-    DisposableEffect(Unit) {
-        DiagnosticsLog.event("PlayerSurface episode navigator registered hasPrev=$hasPreviousEpisode hasNext=$hasNextEpisode")
+    DisposableEffect(playbackOwner) {
         val navigator: (Int) -> Unit = { direction ->
             DiagnosticsLog.event("PlayerSurface episode navigator direction=$direction")
             when {
@@ -740,11 +785,13 @@ fun PlayerSurface(
                 direction < 0 && currentHasPrevious -> currentOnPreviousEpisode?.invoke()
             }
         }
-        PlaybackService.episodeNavigator = navigator
+        val registered = PlaybackService.registerEpisodeNavigator(playbackOwner, navigator)
+        DiagnosticsLog.event(
+            "PlayerSurface episode navigator registered=$registered " +
+                "hasPrev=$hasPreviousEpisode hasNext=$hasNextEpisode",
+        )
         onDispose {
-            if (PlaybackService.episodeNavigator === navigator) {
-                PlaybackService.episodeNavigator = null
-            }
+            PlaybackService.clearEpisodeNavigator(playbackOwner)
             DiagnosticsLog.event("PlayerSurface episode navigator cleared")
         }
     }
@@ -762,36 +809,39 @@ fun PlayerSurface(
     val captionStyle by SettingsStore.captionStyle.collectAsState()
     var pinnedVideoHeight by remember(controller, playbackSessionKey) { mutableStateOf<Int?>(null) }
     fun changeVideoHeight(activeController: MediaController, height: Int?): Boolean {
-        val applied = when {
-            height == null -> {
-                clearVideoSelection(activeController)
-                if (activeStream.url != stream.url) {
-                    nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0)
-                    activeStream = stream
-                }
-                DiagnosticsLog.event("PlayerSurface quality selection mode=auto")
-                true
-            }
-            activeController.hasVideoHeight(height) -> applyVideoHeight(activeController, height)
-            else -> {
-                val source = nativeQualityStreams.firstOrNull { it.declaredVideoHeight() == height }
-                if (source == null) {
-                    DiagnosticsLog.event("PlayerSurface quality selection rejected height=$height unavailable")
-                    false
-                } else {
+        var applied = false
+        val accepted = runIfPlaybackOwnerActive {
+            applied = when {
+                height == null -> {
                     clearVideoSelection(activeController)
-                    nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0)
-                    activeStream = source
-                    DiagnosticsLog.event(
-                        "PlayerSurface quality selection mode=manual height=$height " +
-                            "source=${source.typeLabel()} host=${source.host()}",
-                    )
+                    if (activeStream.url != stream.url) {
+                        nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0)
+                        activeStream = stream
+                    }
+                    DiagnosticsLog.event("PlayerSurface quality selection mode=auto")
                     true
                 }
+                activeController.hasVideoHeight(height) -> applyVideoHeight(activeController, height)
+                else -> {
+                    val source = nativeQualityStreams.firstOrNull { it.declaredVideoHeight() == height }
+                    if (source == null) {
+                        DiagnosticsLog.event("PlayerSurface quality selection rejected height=$height unavailable")
+                        false
+                    } else {
+                        clearVideoSelection(activeController)
+                        nextStartPositionMs = activeController.currentPosition.coerceAtLeast(0)
+                        activeStream = source
+                        DiagnosticsLog.event(
+                            "PlayerSurface quality selection mode=manual height=$height " +
+                                "source=${source.typeLabel()} host=${source.host()}",
+                        )
+                        true
+                    }
+                }
             }
+            if (applied) pinnedVideoHeight = height
         }
-        if (applied) pinnedVideoHeight = height
-        return applied
+        return accepted && applied
     }
     val defaultQuality by SettingsStore.defaultQuality.collectAsState()
     var defaultQualityApplied by remember(playbackSessionKey) { mutableStateOf(false) }
@@ -808,11 +858,10 @@ fun PlayerSurface(
         if (activeController.playbackState != Player.STATE_READY) return@LaunchedEffect
         val heights = availableVideoHeights(activeController, nativeQualityStreams)
         val target = defaultQuality.pickHeight(heights) ?: return@LaunchedEffect
-        defaultQualityApplied = true
         DiagnosticsLog.event(
             "PlayerSurface default quality=${defaultQuality.storedValue} target=${target}p heights=$heights",
         )
-        changeVideoHeight(activeController, target)
+        if (changeVideoHeight(activeController, target)) defaultQualityApplied = true
     }
     // The speed to restore once a hold-for-2x gesture ends (the user's chosen playback speed).
     var preHoldSpeed by remember { mutableStateOf(1f) }
@@ -846,38 +895,44 @@ fun PlayerSurface(
         playbackSessionKey,
     ) {
         val activeController = controller ?: return@LaunchedEffect
+        if (!PlaybackService.isWatchPlaybackOwnerActive(playbackOwner)) return@LaunchedEffect
         if (!autoSkipIntroOutro || !activeController.isPlaying) return@LaunchedEffect
         val currentIdentity = activeController.currentMediaItem?.playbackIdentityOrNull()
         if (currentIdentity == null || !isSamePlaybackSession(currentIdentity, playbackIdentity)) {
             return@LaunchedEffect
         }
 
-        if (!introAutoSkipped && isInSkipWindow(positionMs, introStartMs, introEndMs)) {
-            introAutoSkipped = true
-            activeController.seekTo(introEndMs ?: return@LaunchedEffect)
-            return@LaunchedEffect
-        }
-
-        when (
-            outroSkipAction(
-                autoSkip = autoSkipIntroOutro,
-                autoplay = autoplay,
-                hasNextEpisode = hasNextEpisode,
-                isPlaying = activeController.isPlaying,
-                alreadyHandled = outroAutoHandled,
-                positionMs = positionMs,
-                startMs = outroStartMs,
-                endMs = outroEndMs,
-            )
-        ) {
-            OutroSkipAction.NONE -> Unit
-            OutroSkipAction.SEEK_TO_END -> {
-                outroAutoHandled = true
-                activeController.seekTo(outroEndMs ?: return@LaunchedEffect)
-            }
-            OutroSkipAction.NEXT_EPISODE -> {
-                outroAutoHandled = true
-                onNextEpisode()
+        runIfPlaybackOwnerActive {
+            val introTarget = introEndMs
+            if (!introAutoSkipped && introTarget != null && isInSkipWindow(positionMs, introStartMs, introEndMs)) {
+                introAutoSkipped = true
+                activeController.seekTo(introTarget)
+            } else {
+                when (
+                    outroSkipAction(
+                        autoSkip = autoSkipIntroOutro,
+                        autoplay = autoplay,
+                        hasNextEpisode = hasNextEpisode,
+                        isPlaying = activeController.isPlaying,
+                        alreadyHandled = outroAutoHandled,
+                        positionMs = positionMs,
+                        startMs = outroStartMs,
+                        endMs = outroEndMs,
+                    )
+                ) {
+                    OutroSkipAction.NONE -> Unit
+                    OutroSkipAction.SEEK_TO_END -> {
+                        val outroTarget = outroEndMs
+                        if (outroTarget != null) {
+                            outroAutoHandled = true
+                            activeController.seekTo(outroTarget)
+                        }
+                    }
+                    OutroSkipAction.NEXT_EPISODE -> {
+                        outroAutoHandled = true
+                        onNextEpisode()
+                    }
+                }
             }
         }
     }
@@ -919,7 +974,9 @@ fun PlayerSurface(
             factory = { ctx ->
                 DiagnosticsLog.event("PlayerSurface AndroidView factory create PlayerView")
                 PlayerView(ctx).apply {
-                    player = playerControls
+                    player = playerControls.takeIf {
+                        PlaybackService.isWatchPlaybackOwnerActive(playbackOwner)
+                    }
                     setMediaRouteButtonViewProvider(mediaRouteButtonViewProvider)
                     // Phone and TV both draw their own controls (Compose bar / TvPlayerControls),
                     // so Media3's built-in controller is off everywhere.
@@ -962,7 +1019,9 @@ fun PlayerSurface(
                 }
             },
             update = {
-                it.player = playerControls
+                it.player = playerControls.takeIf {
+                    PlaybackService.isWatchPlaybackOwnerActive(playbackOwner)
+                }
                 it.isFocusable = !device.isTv
                 it.isFocusableInTouchMode = !device.isTv
                 if (device.isTv) it.clearFocus()
@@ -995,22 +1054,26 @@ fun PlayerSurface(
                 },
                 onDoubleTap = { isRightHalf ->
                     val active = controller ?: return@PlayerGestureControls
-                    if (isRightHalf) {
-                        active.seekForward()
-                        seekFlash = +10
-                    } else {
-                        active.seekBack()
-                        seekFlash = -10
+                    runIfPlaybackOwnerActive {
+                        if (isRightHalf) {
+                            active.seekForward()
+                            seekFlash = +10
+                        } else {
+                            active.seekBack()
+                            seekFlash = -10
+                        }
+                        seekFlashTick++
                     }
-                    seekFlashTick++
                 },
                 onHoldSpeed = { active ->
                     val activeController = controller ?: return@PlayerGestureControls
-                    if (active) {
-                        preHoldSpeed = activeController.playbackParameters.speed
-                        activeController.setPlaybackSpeed(2f)
-                    } else {
-                        activeController.setPlaybackSpeed(preHoldSpeed)
+                    runIfPlaybackOwnerActive {
+                        if (active) {
+                            preHoldSpeed = activeController.playbackParameters.speed
+                            activeController.setPlaybackSpeed(2f)
+                        } else {
+                            activeController.setPlaybackSpeed(preHoldSpeed)
+                        }
                     }
                 },
             )
@@ -1030,23 +1093,33 @@ fun PlayerSurface(
                 durationMs = durationMs,
                 hasPrevious = canGoPrevious,
                 hasNext = hasNextEpisode,
-                onPrevious = { currentOnPreviousEpisode?.invoke() },
+                onPrevious = {
+                    runIfPlaybackOwnerActive { currentOnPreviousEpisode?.invoke() }
+                },
                 onRewind = {
-                    controller?.seekBack()
-                    phoneControlsInteraction++
+                    runIfPlaybackOwnerActive {
+                        controller?.seekBack()
+                        phoneControlsInteraction++
+                    }
                 },
                 onPlayPause = {
-                    controller?.let { if (it.isPlaying) it.pause() else it.play() }
-                    phoneControlsInteraction++
+                    runIfPlaybackOwnerActive {
+                        controller?.let { if (it.isPlaying) it.pause() else it.play() }
+                        phoneControlsInteraction++
+                    }
                 },
                 onForward = {
-                    controller?.seekForward()
-                    phoneControlsInteraction++
+                    runIfPlaybackOwnerActive {
+                        controller?.seekForward()
+                        phoneControlsInteraction++
+                    }
                 },
-                onNext = { currentOnNextEpisode() },
+                onNext = { runIfPlaybackOwnerActive { currentOnNextEpisode() } },
                 onSeek = { target ->
-                    controller?.seekTo(target)
-                    phoneControlsInteraction++
+                    runIfPlaybackOwnerActive {
+                        controller?.seekTo(target)
+                        phoneControlsInteraction++
+                    }
                 },
                 onInteract = { phoneControlsInteraction++ },
             ) {
@@ -1054,8 +1127,10 @@ fun PlayerSurface(
                     "Subtitles",
                     Icons.Default.ClosedCaption,
                     onClick = {
-                        controller?.let { toggleSubtitles(it, trackNameProvider) }
-                        phoneControlsInteraction++
+                        runIfPlaybackOwnerActive {
+                            controller?.let { toggleSubtitles(it, trackNameProvider) }
+                            phoneControlsInteraction++
+                        }
                     },
                 )
                 CastButton(Modifier.size(48.dp))
@@ -1104,10 +1179,12 @@ fun PlayerSurface(
             val hasAudioOverride = activeController.hasTrackOverride(C.TRACK_TYPE_AUDIO)
             val audioOptions = if (audioTracks.size > 1) {
                 buildList {
-                    add(PlayerQualityOption("Auto", !hasAudioOverride) { applyAudioTrack(activeController, null) })
+                    add(PlayerQualityOption("Auto", !hasAudioOverride) {
+                        runIfPlaybackOwnerActive { applyAudioTrack(activeController, null) }
+                    })
                     audioTracks.forEach { track ->
                         add(PlayerQualityOption(track.name, hasAudioOverride && track.selected) {
-                            applyAudioTrack(activeController, track)
+                            runIfPlaybackOwnerActive { applyAudioTrack(activeController, track) }
                         })
                     }
                 }
@@ -1118,10 +1195,12 @@ fun PlayerSurface(
             val subtitleOptions = if (subtitleTracks.isNotEmpty()) {
                 buildList {
                     add(PlayerQualityOption("Off", subtitleTracks.none { it.selected }) {
-                        applyTextTrack(activeController, null)
+                        runIfPlaybackOwnerActive { applyTextTrack(activeController, null) }
                     })
                     subtitleTracks.forEach { track ->
-                        add(PlayerQualityOption(track.name, track.selected) { applyTextTrack(activeController, track) })
+                        add(PlayerQualityOption(track.name, track.selected) {
+                            runIfPlaybackOwnerActive { applyTextTrack(activeController, track) }
+                        })
                     }
                 }
             } else {
@@ -1132,7 +1211,9 @@ fun PlayerSurface(
                 autoplay = autoplay,
                 onAutoplayChange = SettingsStore::setAutoplay,
                 speed = activeController.playbackParameters.speed,
-                onSpeedChange = { activeController.setPlaybackSpeed(it) },
+                onSpeedChange = { speed ->
+                    runIfPlaybackOwnerActive { activeController.setPlaybackSpeed(speed) }
+                },
                 qualityOptions = qualityOptions,
                 subtitleOptions = subtitleOptions,
                 audioOptions = audioOptions,
@@ -1176,43 +1257,57 @@ fun PlayerSurface(
                 hasPrevious = canGoPrevious,
                 hasNext = hasNextEpisode,
                 playPauseFocusRequester = tvPlayPauseFocus,
-                onPrevious = { currentOnPreviousEpisode?.invoke() },
+                onPrevious = {
+                    runIfPlaybackOwnerActive { currentOnPreviousEpisode?.invoke() }
+                },
                 onRewind = {
-                    DiagnosticsLog.event("PlayerSurface TV control rewind")
-                    controller?.seekBack()
+                    runIfPlaybackOwnerActive {
+                        DiagnosticsLog.event("PlayerSurface TV control rewind")
+                        controller?.seekBack()
+                    }
                 },
                 onPlayPause = {
-                    DiagnosticsLog.event("PlayerSurface TV control playPause")
-                    controller?.let { active -> if (active.isPlaying) active.pause() else active.play() }
+                    runIfPlaybackOwnerActive {
+                        DiagnosticsLog.event("PlayerSurface TV control playPause")
+                        controller?.let { active -> if (active.isPlaying) active.pause() else active.play() }
+                    }
                 },
                 onForward = {
-                    DiagnosticsLog.event("PlayerSurface TV control forward")
-                    controller?.seekForward()
+                    runIfPlaybackOwnerActive {
+                        DiagnosticsLog.event("PlayerSurface TV control forward")
+                        controller?.seekForward()
+                    }
                 },
-                onNext = currentOnNextEpisode,
+                onNext = { runIfPlaybackOwnerActive { currentOnNextEpisode() } },
                 onVolumeDown = {
-                    DiagnosticsLog.event("PlayerSurface TV control volumeDown")
-                    controller?.let { active ->
-                        active.volume = (active.volume - 0.1f).coerceAtLeast(0f)
-                        if (active.volume > 0f) lastAudibleVolume = active.volume
+                    runIfPlaybackOwnerActive {
+                        DiagnosticsLog.event("PlayerSurface TV control volumeDown")
+                        controller?.let { active ->
+                            active.volume = (active.volume - 0.1f).coerceAtLeast(0f)
+                            if (active.volume > 0f) lastAudibleVolume = active.volume
+                        }
                     }
                 },
                 onToggleMute = {
-                    DiagnosticsLog.event("PlayerSurface TV control toggleMute")
-                    controller?.let { active ->
-                        if (active.volume > 0.001f) {
-                            lastAudibleVolume = active.volume
-                            active.volume = 0f
-                        } else {
-                            active.volume = lastAudibleVolume.coerceAtLeast(0.1f)
+                    runIfPlaybackOwnerActive {
+                        DiagnosticsLog.event("PlayerSurface TV control toggleMute")
+                        controller?.let { active ->
+                            if (active.volume > 0.001f) {
+                                lastAudibleVolume = active.volume
+                                active.volume = 0f
+                            } else {
+                                active.volume = lastAudibleVolume.coerceAtLeast(0.1f)
+                            }
                         }
                     }
                 },
                 onVolumeUp = {
-                    DiagnosticsLog.event("PlayerSurface TV control volumeUp")
-                    controller?.let { active ->
-                        active.volume = (active.volume + 0.1f).coerceAtMost(1f)
-                        lastAudibleVolume = active.volume
+                    runIfPlaybackOwnerActive {
+                        DiagnosticsLog.event("PlayerSurface TV control volumeUp")
+                        controller?.let { active ->
+                            active.volume = (active.volume + 0.1f).coerceAtMost(1f)
+                            lastAudibleVolume = active.volume
+                        }
                     }
                 },
                 onSettings = {
@@ -1226,12 +1321,21 @@ fun PlayerSurface(
 
         val action: Pair<String, () -> Unit>? = when {
             introEndMs != null && positionMs in introStartMs..introEndMs ->
-                "Skip Intro" to { controller?.seekTo(introEndMs); Unit }
+                "Skip Intro" to {
+                    runIfPlaybackOwnerActive { controller?.seekTo(introEndMs) }
+                    Unit
+                }
             outroStartMs != null && outroEndMs != null && positionMs in outroStartMs..outroEndMs ->
                 if (hasNextEpisode) {
-                    "Next Episode" to onNextEpisode
+                    "Next Episode" to {
+                        runIfPlaybackOwnerActive { onNextEpisode() }
+                        Unit
+                    }
                 } else {
-                    "Skip Outro" to { controller?.seekTo(outroEndMs); Unit }
+                    "Skip Outro" to {
+                        runIfPlaybackOwnerActive { controller?.seekTo(outroEndMs) }
+                        Unit
+                    }
                 }
             else -> null
         }
