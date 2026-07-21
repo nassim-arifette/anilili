@@ -170,11 +170,10 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 - [x] **OPEN-022 - GitHub Actions Node runtime migration.** Checkout, Java, Gradle, Android SDK,
   upload, and download actions are pinned to reviewed exact releases whose manifests use Node 24.
 
-- [ ] **OPEN-023 - GitHub-enforced release immutability.** The workflow refuses to replace an
-  existing release or move its tag, and Android still rejects APKs without the pinned signing key,
-  but GitHub reports the first `v0.2.0` release as mutable. A future release workflow can publish a
-  fully populated draft after repository release immutability is enabled; making `v0.2.0`
-  immutable would require deliberately republishing it.
+- [x] **OPEN-023 - GitHub-enforced release immutability.** Repository release immutability is
+  enabled. The workflow uploads and verifies both assets on a draft before publishing, requires the
+  release response to be immutable, and `v0.2.1` has a valid GitHub release attestation. Historical
+  `v0.2.0` remains mutable because the setting only applies to future releases.
 
 ## Superseded candidates retired without tree changes
 
@@ -206,8 +205,10 @@ replacements:
 - [x] Publish and download GitHub Release `v0.2.0`, then independently verify its sidecar and API
   SHA-256 (`3c0897f11fb5763cf5eb71d51043321fb56b11835d8a5a719ed7e9fd9b45f6ad`),
   package metadata, 16 KiB alignment, and pinned signer (July 21, 2026).
-- [ ] Publish immutable GitHub Release `v0.2.1`, download both assets, and independently verify
-  their API digests, sidecar, package metadata, 16 KiB alignment, and pinned signer.
+- [x] Publish immutable GitHub Release `v0.2.1`, download both assets, and independently verify
+  their release attestation, API digests, sidecar, package metadata, 16 KiB alignment, and pinned
+  signer. Published APK SHA-256:
+  `a426088687a4c70ddbeb791cd051ae808426aa76e155e6c9a385c0ef7a36bfd5` (July 21, 2026).
 - [ ] Validate rapid Watch A -> B transitions, embed/native handoff, pause/seek/exit resume,
   intro/outro, an airing show's latest episode, the actual series finale, Cast, renderer loss,
   account replacement, and provider exhaustion on a real device or emulator.
