@@ -12,6 +12,7 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.withTransaction
 import com.miruronative.diagnostics.DiagnosticsLog
 import java.util.LinkedHashMap
 import kotlinx.coroutines.CoroutineScope
@@ -41,9 +42,6 @@ interface CacheDao {
     suspend fun get(key: String): CacheEntry?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun put(entry: CacheEntry)
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun putAll(entries: List<CacheEntry>)
 
     @Query("UPDATE cache_entries SET lastAccessedAt = :now WHERE `key` = :key OR instr(`key`, :chunkPrefix) = 1")
@@ -55,14 +53,14 @@ interface CacheDao {
     @Query("DELETE FROM cache_entries WHERE expiresAt < :cutoff")
     suspend fun deleteOlderThan(cutoff: Long)
 
-    @Query("SELECT COUNT(*) FROM cache_entries")
-    suspend fun count(): Int
+    @Query("SELECT COUNT(*) FROM cache_entries WHERE instr(`key`, :chunkSeparator) = 0")
+    suspend fun rootCount(chunkSeparator: String): Int
 
     @Query(
-        "DELETE FROM cache_entries WHERE `key` IN " +
-            "(SELECT `key` FROM cache_entries ORDER BY lastAccessedAt ASC LIMIT :count)",
+        "SELECT `key` FROM cache_entries WHERE instr(`key`, :chunkSeparator) = 0 " +
+            "ORDER BY lastAccessedAt ASC LIMIT :count",
     )
-    suspend fun deleteLeastRecentlyUsed(count: Int)
+    suspend fun leastRecentlyUsedRoots(chunkSeparator: String, count: Int): List<String>
 }
 
 @Database(entities = [CacheEntry::class], version = 1, exportSchema = false)
@@ -81,11 +79,12 @@ class AppCache(
     context: Context,
     private val json: Json,
 ) {
-    private val dao = Room.databaseBuilder(
+    private val database = Room.databaseBuilder(
         context.applicationContext,
         CacheDatabase::class.java,
         "anilili-cache.db",
-    ).fallbackToDestructiveMigration(true).build().cacheDao()
+    ).fallbackToDestructiveMigration(true).build()
+    private val dao = database.cacheDao()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val keyLocks = Array(64) { Mutex() }
     private val memory = object : LinkedHashMap<String, CacheEntry>(MEMORY_ENTRIES, 0.75f, true) {
@@ -144,6 +143,7 @@ class AppCache(
     }
 
     suspend fun putBatch(entries: Map<String, String>, ttlMs: Long) {
+        if (entries.isEmpty()) return
         val now = System.currentTimeMillis()
         val cacheEntries = entries.map { (key, jsonString) ->
             CacheEntry(
@@ -154,7 +154,21 @@ class AppCache(
                 lastAccessedAt = now,
             )
         }
-        dao.putAll(cacheEntries)
+        val preparedTrees = cacheEntries.map(::prepareCacheTree)
+        withKeyLocks(cacheEntries.map(CacheEntry::key)) {
+            database.withTransaction {
+                preparedTrees.forEach { tree ->
+                    dao.deleteTree(tree.memoryEntry.key, cacheChunkPrefix(tree.memoryEntry.key))
+                }
+                dao.putAll(preparedTrees.flatMap(PreparedCacheTree::diskEntries))
+            }
+            // A failed transaction leaves both levels untouched. Publish the new memory snapshot
+            // only after every root and chunk is durably visible together.
+            synchronized(memory) {
+                preparedTrees.forEach { tree -> memory[tree.memoryEntry.key] = tree.memoryEntry }
+            }
+            prune(now)
+        }
     }
 
     private suspend fun <T> refresh(
@@ -164,78 +178,76 @@ class AppCache(
         forceRefresh: Boolean,
         fetch: suspend () -> T,
     ): T {
-        val lock = keyLocks[(key.hashCode() and Int.MAX_VALUE) % keyLocks.size]
+        val lock = keyLocks[cacheStripeIndex(key, keyLocks.size)]
         return lock.withLock {
-                val now = System.currentTimeMillis()
-                val newer = read(key)
-                if (!forceRefresh && newer != null && now <= newer.expiresAt) {
-                    decode(newer, serializer)?.let { return@withLock it }
-                }
+            val now = System.currentTimeMillis()
+            val newer = read(key)
+            if (!forceRefresh && newer != null && now <= newer.expiresAt) {
+                decode(newer, serializer)?.let { return@withLock it }
+            }
 
-                val value = fetch()
-                val payload = CachePayloadCodec.encode(json.encodeToString(serializer, value))
-                val entry = CacheEntry(
-                    key = key,
-                    payload = payload,
-                    createdAt = now,
-                    expiresAt = now + ttlMs,
-                    lastAccessedAt = now,
-                )
-                write(entry)
-                synchronized(memory) { memory[key] = entry }
-                prune(now)
-                value
+            val value = fetch()
+            val payload = CachePayloadCodec.encode(json.encodeToString(serializer, value))
+            val entry = CacheEntry(
+                key = key,
+                payload = payload,
+                createdAt = now,
+                expiresAt = now + ttlMs,
+                lastAccessedAt = now,
+            )
+            write(entry)
+            synchronized(memory) { memory[key] = entry }
+            prune(now)
+            value
         }
     }
 
     private suspend fun read(key: String): CacheEntry? {
         synchronized(memory) { memory[key] }?.let { return it }
         return try {
-            val stored = dao.get(key) ?: return null
-            val chunkCount = stored.payload.removePrefix(CHUNK_MARKER).toIntOrNull()
-                ?.takeIf { stored.payload.startsWith(CHUNK_MARKER) && it > 0 }
-            val entry = if (chunkCount == null) {
-                stored
-            } else {
-                val payload = buildString {
-                    for (index in 0 until chunkCount) {
-                        val chunk = dao.get(chunkKey(key, index)) ?: run {
-                            dao.deleteTree(key, chunkPrefix(key))
-                            DiagnosticsLog.event("Cache chunks incomplete key=$key; deleting")
-                            return null
+            val entry = database.withTransaction readTransaction@{
+                val stored = dao.get(key) ?: return@readTransaction null
+                val chunkCount = stored.payload.removePrefix(CACHE_CHUNK_MARKER).toIntOrNull()
+                    ?.takeIf { stored.payload.startsWith(CACHE_CHUNK_MARKER) && it > 0 }
+                if (chunkCount == null) {
+                    stored
+                } else {
+                    val payload = buildString {
+                        for (index in 0 until chunkCount) {
+                            val chunk = dao.get(cacheChunkKey(key, index)) ?: run {
+                                dao.deleteTree(key, cacheChunkPrefix(key))
+                                DiagnosticsLog.event("Cache chunks incomplete key=$key; deleting")
+                                return@readTransaction null
+                            }
+                            append(chunk.payload)
                         }
-                        append(chunk.payload)
                     }
+                    stored.copy(payload = payload)
                 }
-                stored.copy(payload = payload)
             }
-            synchronized(memory) { memory[key] = entry }
-            entry
+            entry ?: return null
+            // If a batch committed while this disk read was in flight, its memory entry wins.
+            synchronized(memory) { memory[key] ?: entry.also { memory[key] = it } }
         } catch (e: SQLiteBlobTooBigException) {
             DiagnosticsLog.throwable("Cache row exceeded CursorWindow key=$key; deleting", e)
-            dao.deleteTree(key, chunkPrefix(key))
+            dao.deleteTree(key, cacheChunkPrefix(key))
             null
         }
     }
 
     private suspend fun write(entry: CacheEntry) {
-        val parts = CachePayloadCodec.split(entry.payload)
-        dao.deleteTree(entry.key, chunkPrefix(entry.key))
-        if (parts.size == 1) {
-            dao.put(entry)
-            return
+        val tree = prepareCacheTree(entry)
+        database.withTransaction {
+            dao.deleteTree(entry.key, cacheChunkPrefix(entry.key))
+            dao.putAll(tree.diskEntries)
         }
-        parts.forEachIndexed { index, payload ->
-            dao.put(entry.copy(key = chunkKey(entry.key, index), payload = payload))
-        }
-        dao.put(entry.copy(payload = "$CHUNK_MARKER${parts.size}"))
     }
 
     private suspend fun <T> decode(entry: CacheEntry, serializer: KSerializer<T>): T? =
         try {
             json.decodeFromString(serializer, CachePayloadCodec.decode(entry.payload))
         } catch (_: Exception) {
-            dao.deleteTree(entry.key, chunkPrefix(entry.key))
+            dao.deleteTree(entry.key, cacheChunkPrefix(entry.key))
             synchronized(memory) { memory.remove(entry.key) }
             null
         }
@@ -243,23 +255,72 @@ class AppCache(
     private fun touch(entry: CacheEntry, now: Long) {
         val touched = entry.copy(lastAccessedAt = now)
         synchronized(memory) { memory[entry.key] = touched }
-        scope.launch { dao.touchTree(entry.key, chunkPrefix(entry.key), now) }
+        scope.launch { dao.touchTree(entry.key, cacheChunkPrefix(entry.key), now) }
     }
 
     private suspend fun prune(now: Long) {
-        dao.deleteOlderThan(now - DISK_STALE_RETENTION_MS)
-        val overflow = dao.count() - DISK_ENTRIES
-        if (overflow > 0) dao.deleteLeastRecentlyUsed(overflow)
+        database.withTransaction {
+            dao.deleteOlderThan(now - DISK_STALE_RETENTION_MS)
+            val overflow = dao.rootCount(CACHE_CHUNK_SEPARATOR) - DISK_ENTRIES
+            if (overflow > 0) {
+                dao.leastRecentlyUsedRoots(CACHE_CHUNK_SEPARATOR, overflow).forEach { key ->
+                    dao.deleteTree(key, cacheChunkPrefix(key))
+                }
+            }
+        }
+    }
+
+    private suspend fun <T> withKeyLocks(keys: Collection<String>, block: suspend () -> T): T {
+        val locks = cacheStripeIndices(keys, keyLocks.size).map(keyLocks::get)
+        return withLocks(locks, index = 0, block)
+    }
+
+    private suspend fun <T> withLocks(
+        locks: List<Mutex>,
+        index: Int,
+        block: suspend () -> T,
+    ): T = if (index >= locks.size) {
+        block()
+    } else {
+        locks[index].withLock { withLocks(locks, index + 1, block) }
     }
 
     private companion object {
-        const val CHUNK_MARKER = "cache-chunks:"
         const val MEMORY_ENTRIES = 80
         const val DISK_ENTRIES = 500
         const val DEFAULT_STALE_MS = 7L * 24 * 60 * 60 * 1000
         const val DISK_STALE_RETENTION_MS = 30L * 24 * 60 * 60 * 1000
-
-        fun chunkPrefix(key: String): String = "$key|chunk|"
-        fun chunkKey(key: String, index: Int): String = "${chunkPrefix(key)}$index"
     }
 }
+
+internal const val CACHE_CHUNK_MARKER = "cache-chunks:"
+internal const val CACHE_CHUNK_SEPARATOR = "|chunk|"
+
+internal data class PreparedCacheTree(
+    val memoryEntry: CacheEntry,
+    val diskEntries: List<CacheEntry>,
+)
+
+internal fun prepareCacheTree(entry: CacheEntry): PreparedCacheTree {
+    val parts = CachePayloadCodec.split(entry.payload)
+    if (parts.size == 1) return PreparedCacheTree(entry, listOf(entry))
+    val chunks = parts.mapIndexed { index, payload ->
+        entry.copy(key = cacheChunkKey(entry.key, index), payload = payload)
+    }
+    return PreparedCacheTree(
+        memoryEntry = entry,
+        diskEntries = chunks + entry.copy(payload = "$CACHE_CHUNK_MARKER${parts.size}"),
+    )
+}
+
+internal fun cacheChunkPrefix(key: String): String = "$key$CACHE_CHUNK_SEPARATOR"
+
+internal fun cacheChunkKey(key: String, index: Int): String = "${cacheChunkPrefix(key)}$index"
+
+internal fun cacheStripeIndex(key: String, stripeCount: Int): Int {
+    require(stripeCount > 0)
+    return (key.hashCode() and Int.MAX_VALUE) % stripeCount
+}
+
+internal fun cacheStripeIndices(keys: Collection<String>, stripeCount: Int): List<Int> =
+    keys.map { cacheStripeIndex(it, stripeCount) }.distinct().sorted()

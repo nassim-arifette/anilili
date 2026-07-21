@@ -45,4 +45,37 @@ class CachePayloadCodecTest {
         assertFalse(stored.startsWith("gzip:"))
         assertEquals(value, CachePayloadCodec.decode(stored))
     }
+
+    @Test
+    fun batchTreePreparationKeepsLargePayloadChunksBehindOneRootMarker() {
+        val stored = "0123456789abcdef".repeat(60_000)
+        val entry = CacheEntry(
+            key = "episodes:1",
+            payload = stored,
+            createdAt = 10L,
+            expiresAt = 20L,
+            lastAccessedAt = 10L,
+        )
+
+        val tree = prepareCacheTree(entry)
+        val root = tree.diskEntries.last()
+        val chunks = tree.diskEntries.dropLast(1)
+
+        assertEquals(entry, tree.memoryEntry)
+        assertEquals("$CACHE_CHUNK_MARKER${chunks.size}", root.payload)
+        assertEquals(entry.key, root.key)
+        assertTrue(chunks.all { it.key.startsWith(cacheChunkPrefix(entry.key)) })
+        assertEquals(stored, chunks.joinToString(separator = "") { it.payload })
+    }
+
+    @Test
+    fun batchLockStripesAreUniqueAndGloballyOrdered() {
+        val indices = cacheStripeIndices(
+            keys = listOf("series:1", "series:2", "series:1", "series:99"),
+            stripeCount = 64,
+        )
+
+        assertEquals(indices.distinct(), indices)
+        assertEquals(indices.sorted(), indices)
+    }
 }
