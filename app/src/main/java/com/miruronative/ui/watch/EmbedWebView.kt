@@ -1154,7 +1154,7 @@ private fun RESUME_WHEN_READY_JS(targetSec: Double): String = """
 
 private fun seekWebVideo(webView: WebView?, targetMs: Long?) {
     val targetSec = targetMs?.div(1000.0) ?: return
-    runCatching { webView?.evaluateJavascript(SEEK_VIDEO_JS(targetSec), null) }
+    runCatching { webView?.evaluateJavascript(embedSeekJs(targetSec), null) }
 }
 
 private fun adjustWebVolume(webView: WebView?, delta: Float, onChanged: (Float) -> Unit) {
@@ -1205,36 +1205,6 @@ private fun WEB_VOLUME_JS(delta: Float?, absolute: Float?): String {
         })();
     """.trimIndent()
 }
-
-private fun SEEK_VIDEO_JS(targetSec: Double): String = """
-    (function() {
-      function findVideo() {
-        var v = document.querySelector('video');
-        if (v) return v;
-        var frames = document.querySelectorAll('iframe');
-        for (var i = 0; i < frames.length; i++) {
-          try {
-            var d = frames[i].contentDocument;
-            if (d) {
-              var fv = d.querySelector('video');
-              if (fv) return fv;
-            }
-          } catch (e) { /* cross-origin */ }
-        }
-        return null;
-      }
-      try {
-        var v = findVideo();
-        if (!v) return false;
-        var target = $targetSec;
-        v.currentTime = isFinite(v.duration) && v.duration > 0 ? Math.min(target, v.duration) : target;
-        if (v.paused) v.play();
-        return true;
-      } catch (e) {
-        return false;
-      }
-    })();
-""".trimIndent()
 
 private fun readDeviceVolume(audioManager: android.media.AudioManager?): Float {
     audioManager ?: return 1f
