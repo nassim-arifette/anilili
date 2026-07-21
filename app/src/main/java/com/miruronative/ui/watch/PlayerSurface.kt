@@ -1412,6 +1412,9 @@ internal fun PlayerSurface(
                         phoneControlsInteraction++
                     }
                 },
+                seriesTitle = seriesTitle,
+                episodeTitle = episodeTitle,
+                onExitFullscreen = if (isFullscreen) onToggleFullscreen else null,
                 onInteract = { phoneControlsInteraction++ },
             ) {
                 PlayerControlIconButton(

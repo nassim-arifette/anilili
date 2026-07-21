@@ -731,6 +731,9 @@ private fun WatchContent(
                                 qualityStreams = data.sources.embedStreams,
                                 startPositionMs = data.startPositionMs,
                                 skip = data.sources.skip,
+                                seriesTitle = data.seriesTitle,
+                                episodeTitle = "Episode ${data.current.displayNumber}" +
+                                    (data.current.title?.let { ": $it" } ?: ""),
                                 onPreviousEpisode = onEmbedPrevious,
                                 onNextEpisode = onEmbedNext,
                                 hasPreviousEpisode = data.hasPrev,
