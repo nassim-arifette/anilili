@@ -17,6 +17,48 @@ internal fun acceptsEmbedPlaybackCallback(
     current: EmbedPlaybackKey,
 ): Boolean = reported == current
 
+/**
+ * Identifies the concrete embed document that currently owns playback callbacks.
+ *
+ * [mediaId] is kept in memory only. It may be a signed URL, so callers must not log it or use it
+ * verbatim as a persistent key. AniSkip hashes it before adding it to its encode-scoped cache key.
+ */
+data class EmbedMediaIdentity(
+    val playbackKey: EmbedPlaybackKey,
+    val navigationGeneration: Long,
+    val mediaId: String,
+)
+
+/** A callback must belong to both the current route and its latest concrete embed navigation. */
+internal fun acceptsEmbedMediaCallback(
+    reported: EmbedMediaIdentity,
+    active: EmbedMediaIdentity?,
+    currentPlaybackKey: EmbedPlaybackKey,
+): Boolean = reported.mediaId.isNotBlank() &&
+    reported.playbackKey == currentPlaybackKey &&
+    reported == active
+
+internal enum class EmbedMediaHandoffDecision {
+    REJECT,
+    KEEP,
+    ACTIVATE_AND_RESET_ANISKIP,
+}
+
+/**
+ * A quality URL starts a new concrete media session even though the logical episode key is stable.
+ * The replacement must clear duration-adjusted markers until its own duration-bearing tick arrives.
+ */
+internal fun planEmbedMediaHandoff(
+    active: EmbedMediaIdentity?,
+    reported: EmbedMediaIdentity,
+    currentPlaybackKey: EmbedPlaybackKey,
+): EmbedMediaHandoffDecision = when {
+    reported.mediaId.isBlank() || reported.playbackKey != currentPlaybackKey ->
+        EmbedMediaHandoffDecision.REJECT
+    reported == active -> EmbedMediaHandoffDecision.KEEP
+    else -> EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP
+}
+
 /** Compose remember key for one logical playback plus its selected embed document. */
 internal data class EmbedNavigationIdentity(
     val playbackKey: EmbedPlaybackKey,

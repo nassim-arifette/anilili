@@ -55,9 +55,10 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | SKIP-003 | [x] | Keep Skip Outro independent from autoplay, and never auto-skip while playback is paused. | `fix/outro-skip-policy` |
 | SKIP-004 | [x] | Mark an embed auto-skip handled only after JavaScript confirms the seek; failed seeks are retried under the current navigation generation. | `fix/embed-seek-result-ack` |
 | SKIP-005 | [x] | Query AniSkip v2 with the measured media duration, decimal episode number, all five segment types, and MAL relation rules; retain typed intervals, reference durations, and contribution IDs. | `feature/aniskip-segments` |
-| SKIP-006 | [x] | Bind duration-adjusted AniSkip results to the exact request, episode, provider, category, generation, media item, and stable duration. Provider markers remain manual-only while the typed lookup is pending, then act as fallback only for families AniSkip did not identify. | `feature/aniskip-segments` |
+| SKIP-006 | [x] | Bind duration-adjusted AniSkip results to the exact request, episode, provider, category, generation, duration-bearing media identity, and stable duration. Provider markers remain manual-only while the typed lookup is pending, then act as fallback only for families AniSkip did not identify. | `feature/aniskip-segments` |
 | SKIP-007 | [x] | Auto-skip only pure openings/endings. Mixed openings, mixed endings, and recaps have explicit manual actions; mixed typed markers suppress untyped provider auto-skip for the same family, including late responses. | `feature/aniskip-segments` |
 | SKIP-008 | [x] | Retain the last measured duration across transient zero-duration callbacks for the exact same media identity, so an in-flight AniSkip response cannot strand the player in `LOADING`. Default skip policy inputs now fail safe and keep provider auto-skip disabled until the typed lookup completes. | `fix/aniskip-zero-duration-loading` |
+| SKIP-009 | [x] | Hand the exact active embed navigation and quality URL to the ViewModel. A quality change immediately clears duration-adjusted markers, rejects callbacks from the replaced document, and reloads AniSkip only after the replacement reports its own duration. Signed URLs remain absent from logs and are SHA-256 scoped in cache keys. | `fix/aniskip-embed-media-identity` |
 | EMBED-001 | [x] | Authenticate bridge callbacks and isolate every embed navigation so an old page cannot update the new episode. | `fix/webview-bridge-capabilities`, `fix/embed-navigation-generation` |
 | EMBED-002 | [x] | Retry resume until a same-origin video is ready, including accessible iframes, and preserve pause state during seeks. | `fix/embed-resume-readiness`, `fix/embed-seek-preserves-pause` |
 | EMBED-003 | [x] | Accept natural embed completion only after content-like playback samples, commit it before autoplay, and advance at most once. | `fix/embed-safe-natural-end-autoplay`, `fix/embed-terminal-progress-commit` |
@@ -252,6 +253,9 @@ replacements:
 - [x] Compile the duration-bound AniSkip integration and run 53 focused JVM tests covering API
   parsing and URLs, relation mapping, duration correction and cache scope, mixed/recap policy,
   pending and stale publication, and source-policy regressions (July 21, 2026).
+- [x] Compile the active-embed media handoff and run 31 focused JVM tests covering quality URL
+  activation, stale navigation rejection, marker reset/reload, duration-bound publication, mixed
+  segment policy, and hashed cache scope (July 21, 2026).
 - [x] Publish and download GitHub Release `v0.2.0`, then independently verify its sidecar and API
   SHA-256 (`3c0897f11fb5763cf5eb71d51043321fb56b11835d8a5a719ed7e9fd9b45f6ad`),
   package metadata, 16 KiB alignment, and pinned signer (July 21, 2026).

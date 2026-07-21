@@ -45,6 +45,78 @@ class EmbedNavigationGuardTest {
     }
 
     @Test
+    fun qualityUrlHandoffActivatesAndResetsDurationBoundMarkers() {
+        val playback = EmbedPlaybackKey(21, "allanime", "sub", 12.0, sourceGeneration = 8)
+        val quality720 = EmbedMediaIdentity(
+            playbackKey = playback,
+            navigationGeneration = 4,
+            mediaId = "https://embed.example/episode-12-720",
+        )
+        val quality1080 = quality720.copy(
+            navigationGeneration = 5,
+            mediaId = "https://embed.example/episode-12-1080",
+        )
+
+        assertTrue(
+            planEmbedMediaHandoff(null, quality720, playback) ==
+                EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP,
+        )
+        assertTrue(
+            planEmbedMediaHandoff(quality720, quality1080, playback) ==
+                EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP,
+        )
+        assertTrue(
+            planEmbedMediaHandoff(quality1080, quality1080, playback) ==
+                EmbedMediaHandoffDecision.KEEP,
+        )
+    }
+
+    @Test
+    fun staleQualityProgressIsRejectedAfterActiveUrlHandoff() {
+        val playback = EmbedPlaybackKey(21, "allanime", "sub", 12.0, sourceGeneration = 8)
+        val oldQuality = EmbedMediaIdentity(
+            playbackKey = playback,
+            navigationGeneration = 4,
+            mediaId = "https://embed.example/episode-12-720",
+        )
+        val activeQuality = oldQuality.copy(
+            navigationGeneration = 5,
+            mediaId = "https://embed.example/episode-12-1080",
+        )
+
+        assertFalse(acceptsEmbedMediaCallback(oldQuality, activeQuality, playback))
+        assertTrue(acceptsEmbedMediaCallback(activeQuality, activeQuality, playback))
+        assertFalse(
+            acceptsEmbedMediaCallback(
+                activeQuality,
+                activeQuality,
+                playback.copy(sourceGeneration = 9),
+            ),
+        )
+    }
+
+    @Test
+    fun replacementNavigationCanReloadMarkersOnlyForItsOwnMediaIdentity() {
+        val playback = EmbedPlaybackKey(21, "allanime", "sub", 12.0, sourceGeneration = 8)
+        val oldQuality = EmbedMediaIdentity(
+            playbackKey = playback,
+            navigationGeneration = 4,
+            mediaId = "https://embed.example/episode-12-720",
+        )
+        val replacement = oldQuality.copy(
+            navigationGeneration = 5,
+            mediaId = "https://embed.example/episode-12-1080",
+        )
+
+        assertTrue(
+            planEmbedMediaHandoff(oldQuality, replacement, playback) ==
+                EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP,
+        )
+        assertFalse(acceptsEmbedMediaCallback(oldQuality, replacement, playback))
+        assertTrue(acceptsEmbedMediaCallback(replacement, replacement, playback))
+    }
+
+    @Test
     fun beginningNavigationBImmediatelyRejectsBridgeAndClientCallbacksFromA() {
         val guard = EmbedNavigationGuard()
         val navigationA = guard.begin(request("https://player.example/episode-a"))
