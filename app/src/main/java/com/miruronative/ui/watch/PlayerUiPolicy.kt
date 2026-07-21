@@ -17,7 +17,9 @@ internal fun playerChromeLayout(
     fontScale: Float = 1f,
 ): PlayerChromeLayout = when {
     heightDp < 220f || widthDp < 340f -> PlayerChromeLayout.MINIMAL
-    heightDp >= 280f && widthDp >= 520f -> PlayerChromeLayout.CINEMA
+    heightDp >= 280f &&
+        widthDp >= 520f &&
+        transportClearsFooter(PlayerChromeLayout.CINEMA, heightDp) -> PlayerChromeLayout.CINEMA
     !compactMetadataClearsTransport(heightDp, fontScale) -> PlayerChromeLayout.MINIMAL
     else -> PlayerChromeLayout.COMPACT
 }
@@ -68,7 +70,12 @@ internal fun playerTransportClearsFooter(
     heightDp: Float,
     fontScale: Float = 1f,
 ): Boolean {
-    val metrics = playerChromeVerticalMetrics(playerChromeLayout(widthDp, heightDp, fontScale))
+    val layout = playerChromeLayout(widthDp, heightDp, fontScale)
+    return transportClearsFooter(layout, heightDp)
+}
+
+private fun transportClearsFooter(layout: PlayerChromeLayout, heightDp: Float): Boolean {
+    val metrics = playerChromeVerticalMetrics(layout)
     val transportBottom = heightDp / 2f + metrics.transportOffsetDp + metrics.transportSizeDp / 2f
     val footerTop = heightDp - metrics.footerHeightDp
     return transportBottom <= footerTop

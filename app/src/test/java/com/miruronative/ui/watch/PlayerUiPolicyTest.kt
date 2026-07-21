@@ -51,6 +51,16 @@ class PlayerUiPolicyTest {
     }
 
     @Test
+    fun `cinema chrome starts only after its transport clears the footer`() {
+        assertEquals(PlayerChromeLayout.COMPACT, playerChromeLayout(widthDp = 520f, heightDp = 280f))
+        assertEquals(PlayerChromeLayout.COMPACT, playerChromeLayout(widthDp = 520f, heightDp = 293f))
+        assertEquals(PlayerChromeLayout.CINEMA, playerChromeLayout(widthDp = 520f, heightDp = 294f))
+        assertEquals(true, playerTransportClearsFooter(widthDp = 520f, heightDp = 280f))
+        assertEquals(true, playerTransportClearsFooter(widthDp = 520f, heightDp = 293f))
+        assertEquals(true, playerTransportClearsFooter(widthDp = 520f, heightDp = 294f))
+    }
+
+    @Test
     fun `small inline players use minimal non-overlapping chrome`() {
         assertEquals(PlayerChromeLayout.MINIMAL, playerChromeLayout(widthDp = 320f, heightDp = 180f))
         assertEquals(PlayerChromeLayout.MINIMAL, playerChromeLayout(widthDp = 360f, heightDp = 202f))

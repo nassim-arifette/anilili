@@ -86,6 +86,7 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | ID | Status | Fix | Topic branch |
 | --- | --- | --- | --- |
 | UI-001 | [x] | Make adaptive player chrome selection aware of Android font scale. Short inline players now omit metadata before enlarged two-line titles can overlap transport controls, while layouts with enough room retain their compact or cinema presentation. | `fix/player-large-font-overlap` |
+| UI-002 | [x] | Select cinema chrome only when its measured transport clears the footer. Wide players between 280 and 293 dp high now keep the compact layout instead of overlapping the timeline and controls. | `fix/cinema-footer-clearance` |
 
 ## Follow-up issue checklist
 
