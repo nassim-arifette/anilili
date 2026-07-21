@@ -87,6 +87,7 @@ import androidx.compose.ui.semantics.semantics
 import com.miruronative.ui.adaptive.LocalAppDeviceProfile
 import com.miruronative.ui.adaptive.rememberScreenReaderActive
 import com.miruronative.ui.components.CaptionAppearanceDialog
+import java.util.UUID
 import kotlinx.coroutines.delay
 
 /**
@@ -149,6 +150,9 @@ fun EmbedWebView(
     val currentOnNextEpisode by rememberUpdatedState(onNextEpisode)
     val currentHasPreviousEpisode by rememberUpdatedState(hasPreviousEpisode)
     val currentHasNextEpisode by rememberUpdatedState(hasNextEpisode)
+    // addJavascriptInterface is visible to every frame. Only the top-level script receives this
+    // unguessable capability, so third-party iframes cannot forge progress callbacks.
+    val progressBridgeToken = remember { UUID.randomUUID().toString() }
     // The WebView is built once, so the remote handler below has to read this live rather than
     // capture the value it was created with.
     val currentPlayerOwnsRemote by rememberUpdatedState(focusPlayerOnStart)
@@ -363,7 +367,7 @@ fun EmbedWebView(
                 navigationLock.locked = true
                 finishedUrl = url
                 DiagnosticsLog.event("EmbedWebView page finished host=${url.hostOrNone()} title=${view?.title ?: "none"}")
-                view?.evaluateJavascript(PROGRESS_POLL_JS, null)
+                view?.evaluateJavascript(progressPollJs(progressBridgeToken), null)
                 if (currentPendingSeekMs > 0L) {
                     view?.evaluateJavascript(RESUME_WHEN_READY_JS(currentPendingSeekMs / 1000.0), null)
                 }
@@ -570,6 +574,7 @@ fun EmbedWebView(
                         // verify its @JavascriptInterface methods through Kotlin's apply block.
                         addJavascriptInterface(
                             WebProgressBridge(
+                                expectedToken = progressBridgeToken,
                                 onTickCallback = { positionSec, durationSec, isPlaying, muted, volume ->
                                     if (positionSec > 0 && durationSec > 0) {
                                         val nextPositionMs = (positionSec * 1000).toLong()
@@ -971,7 +976,7 @@ private fun WebSkipButton(label: String, onClick: () -> Unit, modifier: Modifier
  * every second while playing and report position/duration to the Kotlin bridge. Cross-origin
  * iframes are unreachable by design — those hosts simply won't report progress.
  */
-private val PROGRESS_POLL_JS = """
+private fun progressPollJs(token: String): String = """
     (function() {
       if (window.__aniliProgressHooked) return;
       window.__aniliProgressHooked = true;
@@ -995,10 +1000,10 @@ private val PROGRESS_POLL_JS = """
           var v = findVideo();
           if (v && !window.__aniliVideoReported) {
             window.__aniliVideoReported = true;
-            AniliProgress.onVideoAvailable();
+            AniliProgress.onVideoAvailable('$token');
           }
           if (v && isFinite(v.duration) && v.duration > 0 && v.currentTime >= 0) {
-            AniliProgress.onTick(v.currentTime, v.duration, !v.paused, v.muted, v.volume);
+            AniliProgress.onTick('$token', v.currentTime, v.duration, !v.paused, v.muted, v.volume);
           }
         } catch (e) { /* bridge detached */ }
       }, 1000);
@@ -1319,17 +1324,27 @@ private fun isInSkipWindow(positionMs: Long, startMs: Long?, endMs: Long?): Bool
 private fun String?.hostOrNone(): String =
     this?.let { runCatching { Uri.parse(it).host }.getOrNull() } ?: "none"
 
-private class WebProgressBridge(
+internal class WebProgressBridge(
+    private val expectedToken: String,
     private val onTickCallback: (Double, Double, Boolean, Boolean, Double) -> Unit,
     private val onVideoAvailableCallback: () -> Unit,
 ) {
     @JavascriptInterface
-    fun onTick(positionSec: Double, durationSec: Double, isPlaying: Boolean, muted: Boolean, volume: Double) {
+    fun onTick(
+        token: String?,
+        positionSec: Double,
+        durationSec: Double,
+        isPlaying: Boolean,
+        muted: Boolean,
+        volume: Double,
+    ) {
+        if (token != expectedToken) return
         onTickCallback(positionSec, durationSec, isPlaying, muted, volume)
     }
 
     @JavascriptInterface
-    fun onVideoAvailable() {
+    fun onVideoAvailable(token: String?) {
+        if (token != expectedToken) return
         onVideoAvailableCallback()
     }
 }

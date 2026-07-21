@@ -15,12 +15,26 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.miruronative.diagnostics.DiagnosticsLog
+import java.net.URI
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+
+/** Only requests made by a trusted Flixcloud execution origin may use the native fallback. */
+internal fun isTrustedFlixcloudRequest(headers: Map<String, String>): Boolean {
+    val origin = headers.entries
+        .singleOrNull { (name, _) -> name.equals("origin", true) }
+        ?.value
+        ?: return false
+    val uri = runCatching { URI(origin) }.getOrNull() ?: return false
+    val host = uri.host.orEmpty().lowercase()
+    val trustedPort = uri.port == -1 || uri.port == 443
+    return uri.scheme.equals("https", true) && trustedPort &&
+        (host == "flixcloud.cc" || host.endsWith(".flixcloud.cc"))
+}
 
 /**
  * Hidden flixcloud resolver. The embed owns rotating JS/WASM decryption, so we let a real WebView
@@ -32,7 +46,6 @@ object FlixcloudBridge {
     private const val TAG = "FlixcloudBridge"
 
     private val main = Handler(Looper.getMainLooper())
-    private val counter = AtomicLong(0)
     private val mutex = Mutex()
     private val pending = ConcurrentHashMap<String, CompletableDeferred<FlixcloudResolvedStream?>>()
 
@@ -89,9 +102,11 @@ object FlixcloudBridge {
                 request: WebResourceRequest?,
             ): WebResourceResponse? {
                 val url = request?.url?.toString().orEmpty()
-                if (isHlsUrl(url)) {
+                if (isHlsUrl(url) && isTrustedFlixcloudRequest(request?.requestHeaders.orEmpty())) {
                     val id = activeId
                     main.postDelayed({ complete(id, url, "request") }, 250)
+                } else if (isHlsUrl(url)) {
+                    DiagnosticsLog.event("$TAG ignored HLS request without trusted provenance")
                 }
                 return null
             }
@@ -131,7 +146,9 @@ object FlixcloudBridge {
         referer: String?,
         timeoutMs: Long = 12_000,
     ): FlixcloudResolvedStream? = mutex.withLock {
-        val id = counter.incrementAndGet().toString()
+        // The request id is also the bridge capability: third-party frames can see the bridge
+        // name, but cannot guess the id injected into the trusted top-level document.
+        val id = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<FlixcloudResolvedStream?>()
         pending[id] = deferred
         activeId = id
@@ -169,8 +186,8 @@ object FlixcloudBridge {
 
     object Bridge {
         @JavascriptInterface
-        fun onResolved(id: String, url: String, playlistKey: String) {
-            if (isHlsUrl(url)) complete(id, url, "js", playlistKey.ifBlank { null })
+        fun onResolved(id: String?, url: String?, playlistKey: String?) {
+            if (url != null && isHlsUrl(url)) complete(id, url, "js", playlistKey?.ifBlank { null })
         }
     }
 
