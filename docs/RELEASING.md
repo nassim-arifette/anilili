@@ -29,8 +29,8 @@ the ability to update existing installations. Do not commit the keystore or its 
 
 ## GitHub Actions secrets
 
-Create a GitHub Actions environment named `release`. The `Publish signed APK` workflow needs these
-environment secrets:
+Create a GitHub Actions environment named `release`, and restrict its deployment branches to
+`main`. The `Publish signed APK` workflow needs these environment secrets:
 
 | Secret | Value |
 | --- | --- |
@@ -56,8 +56,8 @@ base64 -w 0 release-signing.jks
 
 1. Increase both `versionCode` and `versionName` in `app/build.gradle.kts`.
 2. Merge and push the change to `main`.
-3. Run **Actions > Publish signed APK > Run workflow**, or push a tag matching the Gradle version,
-   such as `v0.2.1`.
+3. Run **Actions > Publish signed APK > Run workflow** from `main`. The workflow creates the
+   matching version tag after all verification succeeds.
 4. Confirm that the workflow tests the app and publishes exactly one release APK plus its SHA-256
    checksum.
 

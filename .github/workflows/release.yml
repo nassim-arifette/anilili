@@ -2,9 +2,6 @@ name: Publish signed APK
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -71,10 +68,6 @@ jobs:
           fi
 
           tag="v$version"
-          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "$tag" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match Gradle version $tag" >&2
-            exit 1
-          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -285,8 +278,7 @@ jobs:
             echo "Release $TAG already exists and will not be replaced" >&2
             exit 1
           fi
-          if [[ "$GITHUB_REF_TYPE" != "tag" ]] && \
-             gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG already exists and will not be moved" >&2
             exit 1
           fi
