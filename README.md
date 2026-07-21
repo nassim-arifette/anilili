@@ -55,7 +55,7 @@ streams play with ExoPlayer; embed providers and fallback playback use WebView.
 Requirements:
 
 - JDK 17
-- Android Studio or Android SDK API 35
+- Android Studio or Android SDK API 36
 - Gradle 8.13 if building from the command line without a generated wrapper
 
 Android Studio:
@@ -77,7 +77,7 @@ On Windows, use:
 gradlew.bat assembleDebug
 ```
 
-The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
+The debug APK is generated at `app/build/outputs/apk/debug/anilili.apk`.
 
 ## Notes
 
