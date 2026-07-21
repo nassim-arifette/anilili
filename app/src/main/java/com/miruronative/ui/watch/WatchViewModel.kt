@@ -303,7 +303,7 @@ class WatchViewModel : ViewModel() {
             val late = lateResult?.getOrNull() ?: return@launch
             if (late.isEmpty) return@launch
             mergedEpisodes = repo.mergeProviders(late, mergedEpisodes)
-            spine = pickSpine(mergedEpisodes)
+            val rebuiltSpine = pickSpine(mergedEpisodes)
             DiagnosticsLog.event(
                 "Watch miruro late merge applied id=$id providers=" + late.providerNames.joinToString(),
             )
@@ -311,7 +311,14 @@ class WatchViewModel : ViewModel() {
             val activeRequest = requestGate.currentRequest()
             val data = (_state.value as? UiState.Success)?.data ?: return@launch
             val number = data.current.number
-            val index = spine.indexOfFirst { it.number == number }.coerceAtLeast(0)
+            val index = navigationEpisodeIndex(rebuiltSpine, number)
+            if (index == null) {
+                DiagnosticsLog.event(
+                    "Watch miruro late merge ignored: active episode=${fmt(number)} missing from rebuilt spine",
+                )
+                return@launch
+            }
+            spine = rebuiltSpine
             _state.value = UiState.Success(
                 data.copy(
                     episodes = spine,
@@ -338,12 +345,14 @@ class WatchViewModel : ViewModel() {
                 }
                 .getOrNull()
             ensureCurrentSession(session)
-            if (anivexa != null && !anivexa.isEmpty) {
+            val rebuiltSpine = if (anivexa != null && !anivexa.isEmpty) {
                 mergedEpisodes = repo.mergeProviders(mergedEpisodes, anivexa)
-                spine = pickSpine(mergedEpisodes)
                 DiagnosticsLog.event(
                     "Watch anivexa merge applied id=$id providers=" + mergedEpisodes.providerNames.joinToString(),
                 )
+                pickSpine(mergedEpisodes)
+            } else {
+                spine
             }
             mergedIncludesAnivexa = true
             // Reflect completion whether or not Anivexa added anything: the extra servers become
@@ -352,7 +361,14 @@ class WatchViewModel : ViewModel() {
             val activeRequest = requestGate.currentRequest()
             val data = (_state.value as? UiState.Success)?.data ?: return@launch
             val number = data.current.number
-            val index = spine.indexOfFirst { it.number == number }.coerceAtLeast(0)
+            val index = navigationEpisodeIndex(rebuiltSpine, number)
+            if (index == null) {
+                DiagnosticsLog.event(
+                    "Watch anivexa merge ignored: active episode=${fmt(number)} missing from rebuilt spine",
+                )
+                return@launch
+            }
+            spine = rebuiltSpine
             _state.value = UiState.Success(
                 data.copy(
                     episodes = spine,
@@ -366,9 +382,10 @@ class WatchViewModel : ViewModel() {
     }
 
     /**
-     * Navigation spine: the longest provider episode list, so Next never dead-ends just because
-     * the launched provider's list lags behind the others. Ties keep the chosen provider; source
-     * resolution still tries the preferred provider first and falls back per episode.
+     * Navigation spine: the union of every provider episode list, so a longer but incomplete
+     * catalog cannot hide episodes carried by another provider. When providers overlap, the
+     * preferred provider supplies the row metadata; source resolution still falls back per
+     * episode independently.
      */
     private fun pickSpine(merged: EpisodesResult): List<EpisodeItem> {
         val spine = pickNavigationSpine(merged, preferred, category)
@@ -516,7 +533,8 @@ class WatchViewModel : ViewModel() {
         if (resolved.provider != requestedProvider && requestedProvider != DEFAULT_PREFERRED_PROVIDER) {
             unavailableSources += EpisodeSourceKey(number, requestedProvider, requestedCategory)
         }
-        val index = spine.indexOfFirst { it.number == number }.coerceAtLeast(0)
+        val index = navigationEpisodeIndex(spine, number)
+            ?: error("Resolved episode ${fmt(number)} is missing from the navigation catalog")
         val resume = LibraryStore.historyFor(requestAnimeId)?.takeIf { it.episodeNumber == number }?.positionMs ?: 0L
         val chosen = pickProviderStream(resolved.provider, sources)
         DiagnosticsLog.event(
@@ -574,12 +592,14 @@ class WatchViewModel : ViewModel() {
     private fun switchSource(providerName: String, categoryApi: String, rememberProvider: Boolean) {
         val nextCategory = Category.from(categoryApi)
         val provider = mergedEpisodes.provider(providerName) ?: return
-        val nextSpine = provider.episodes(nextCategory).takeIf { it.isNotEmpty() } ?: return
+        val selectedProviderEpisodes = provider.episodes(nextCategory)
+            .takeIf { it.isNotEmpty() }
+            ?: return
         val current = (_state.value as? UiState.Success)?.data
         val currentNumber = current?.current?.number ?: lastRequestedNumber
         // Source controls are episode-scoped. Never let a stale selection jump the viewer to the
         // first episode merely because that server/audio pair lacks the episode being watched.
-        if (nextSpine.none { it.number == currentNumber }) return
+        if (selectedProviderEpisodes.none { it.number == currentNumber }) return
 
         if (rememberProvider) {
             preferred = providerName
@@ -598,7 +618,9 @@ class WatchViewModel : ViewModel() {
             return
         }
         category = nextCategory
-        spine = nextSpine
+        // Selecting a server changes metadata priority, not which episodes are navigable. Keep
+        // the category-wide union so switching source cannot silently shrink the season again.
+        spine = pickNavigationSpine(mergedEpisodes, providerName, nextCategory)
         failedProviders.clear()
         if (current != null) {
             _state.value = UiState.Success(
@@ -1038,11 +1060,19 @@ internal fun pickNavigationSpine(
         .distinctBy(EpisodeItem::number)
         .sortedBy(EpisodeItem::number)
 
-    val preferredList = normalized(preferred)
-    val longest = episodes.providerNames
+    val providerOrder = buildList {
+        if (episodes.provider(preferred) != null) add(preferred)
+        addAll(episodes.providerNames.filterNot { it == preferred })
+    }
+    return providerOrder
         .asSequence()
-        .map(::normalized)
-        .maxByOrNull(List<EpisodeItem>::size)
-        .orEmpty()
-    return if (preferredList.size >= longest.size) preferredList else longest
+        .flatMap { normalized(it).asSequence() }
+        // Provider order is significant: distinctBy keeps preferred metadata for overlaps.
+        .distinctBy(EpisodeItem::number)
+        .sortedBy(EpisodeItem::number)
+        .toList()
 }
+
+/** Never silently turn a missing requested episode into the first row. */
+internal fun navigationEpisodeIndex(episodes: List<EpisodeItem>, number: Double): Int? =
+    episodes.indexOfFirst { it.number == number }.takeIf { it >= 0 }
