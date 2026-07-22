@@ -179,6 +179,10 @@ class EmbedContentVideoSelectorTest {
         assertTrue(script.contains("media[i].pause()"))
         assertTrue(script.contains("media[i].muted = true"))
         assertTrue(script.contains("silenceMedia(child)"))
+        assertTrue(script.contains("desiredPlaying: false"))
+        assertTrue(
+            script.indexOf("supersedePendingPlay();") < script.indexOf("silenceMedia(document)"),
+        )
     }
 
     @Test
@@ -188,6 +192,10 @@ class EmbedContentVideoSelectorTest {
         assertTrue(script.contains("querySelectorAll('video,audio')"))
         assertTrue(script.contains("media[i].pause()"))
         assertTrue(script.contains("pauseMedia(child)"))
+        assertTrue(script.contains("desiredPlaying: false"))
+        assertTrue(
+            script.indexOf("supersedePendingPlay();") < script.indexOf("pauseMedia(document)"),
+        )
         assertFalse(script.contains("muted"))
         assertFalse(script.contains("volume"))
     }

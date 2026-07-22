@@ -1,50 +1,105 @@
 package com.miruronative.ui.watch
 
-private const val EMBED_RESUME_RETRY_INTERVAL_MS = 250
-private const val EMBED_RESUME_TIMEOUT_MS = 60_000
-
 /**
- * Waits for a directly accessible HTML5 video, seeks to the saved position, then starts it.
- *
- * Embed pages often finish loading before their player or same-origin iframe exists. Keep retrying
- * for a bounded period, and re-check the navigation generation and revocation state before every
- * attempt so a timer created by a replaced document cannot control the new playback session.
+ * Identity-scoped saved-position seek that also preserves the former resume-and-start behavior.
+ * The native command coordinator accepts completion only from this exact video and generation.
  */
-internal fun embedResumeWhenReadyJs(
+internal fun resumeVideoCommandJs(
     targetSec: Double,
     navigationGeneration: Long,
+    capabilityToken: String,
+    commandId: Long,
+    expectedMediaIdentity: String,
+    expectedMediaGeneration: Long,
 ): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
-      var deadline = Date.now() + $EMBED_RESUME_TIMEOUT_MS;
-      function isCurrentNavigation() {
-        return window.__aniliNavigationToken === '$navigationGeneration' &&
-          window.__aniliNavigationRevoked !== true;
-      }
       ${embedContentVideoSelectorJs()}
-      function scheduleRetry() {
-        if (Date.now() >= deadline) return;
-        setTimeout(attemptResume, $EMBED_RESUME_RETRY_INTERVAL_MS);
+      ${embedPlaybackMutationEpochJs()}
+      var expectedMediaIdentity = ${expectedMediaIdentity.toJsStringLiteral()};
+      var expectedMediaGeneration = $expectedMediaGeneration;
+      var reported = false;
+      var seekConfirmed = false;
+      var bounded = null;
+      var playbackMutationEpoch = null;
+      function matches(video) {
+        return !!video && findContentVideo() === video &&
+          __aniliMediaIdentity(video) === expectedMediaIdentity &&
+          __aniliMediaGeneration(video) === expectedMediaGeneration;
       }
-      function attemptResume() {
-        if (!isCurrentNavigation()) return;
-        if (Date.now() >= deadline) return;
+      function remainsAtOrBeyondTarget(video) {
+        return !!video && bounded !== null && isFinite(video.currentTime) &&
+          video.currentTime + 1.5 >= bounded;
+      }
+      function stillOwnsPlaybackMutation(video) {
+        return playbackMutationEpoch !== null &&
+          __aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch);
+      }
+      function report(success, video) {
+        if (reported) return;
+        reported = true;
+        var position = video && isFinite(video.currentTime) ? video.currentTime : 0;
+        var playing = !!video && !video.paused && !video.ended;
+        success = success && matches(video) && stillOwnsPlaybackMutation(video) && playing &&
+          remainsAtOrBeyondTarget(video);
         try {
-          var video = findContentVideo();
-          if (video && video.readyState >= 1) {
-            var target = $targetSec;
-            video.currentTime = isFinite(video.duration) && video.duration > 0
-              ? Math.min(target, video.duration)
-              : target;
-            var playResult = video.play();
-            if (playResult && typeof playResult.catch === 'function') {
-              playResult.catch(function() { /* autoplay may require a user gesture */ });
-            }
-            return;
-          }
-        } catch (e) { /* player still initializing */ }
-        scheduleRetry();
+          AniliProgress.onCommandResult(
+            '$capabilityToken', '$navigationGeneration', '$commandId', success, position, playing,
+            __aniliMediaIdentity(video), __aniliMediaGeneration(video)
+          );
+        } catch (e) { /* bridge detached */ }
       }
-      attemptResume();
+      function ensurePlaying(video) {
+        if (reported || !matches(video) || !stillOwnsPlaybackMutation(video)) {
+          report(false, video); return;
+        }
+        if (!video.paused && !video.ended) { report(true, video); return; }
+        try {
+          __aniliPauseCompetingMedia(video);
+          var playResult = video.play();
+          function settleResumePlay() {
+            if (!matches(video) || !stillOwnsPlaybackMutation(video)) {
+              __aniliReconcileStaleResumePlay(video, playbackMutationEpoch);
+              report(false, video);
+              return;
+            }
+            report(!video.paused && !video.ended, video);
+          }
+          if (playResult && typeof playResult.then === 'function') {
+            playResult.then(settleResumePlay)
+              .catch(function() { report(false, video); });
+          } else {
+            setTimeout(settleResumePlay, 0);
+          }
+        } catch (e) { report(false, video); }
+      }
+      try {
+        var video = findContentVideo();
+        if (!matches(video)) { report(false, video); return; }
+        var target = $targetSec;
+        bounded = isFinite(video.duration) && video.duration > 0
+          ? Math.min(Math.max(0, target), video.duration)
+          : Math.max(0, target);
+        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, true);
+        function resumeAfterSeek() {
+          if (reported || seekConfirmed) return;
+          if (!matches(video) || !stillOwnsPlaybackMutation(video)) {
+            report(false, video); return;
+          }
+          if (remainsAtOrBeyondTarget(video)) {
+            seekConfirmed = true;
+            ensurePlaying(video);
+          }
+        }
+        if (remainsAtOrBeyondTarget(video)) {
+          seekConfirmed = true;
+          ensurePlaying(video);
+        } else {
+          video.addEventListener('seeked', resumeAfterSeek, { once: true });
+          video.currentTime = bounded;
+          setTimeout(resumeAfterSeek, 150);
+        }
+        setTimeout(function() { report(false, video); }, 1800);
+      } catch (e) { report(false, null); }
     })();
 """.trimIndent()
