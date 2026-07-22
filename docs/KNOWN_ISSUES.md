@@ -147,6 +147,11 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   episode or encode. The app validates duration drift and ranges and preserves provider fallback,
   but it cannot infer a trustworthy missing opening, ending, mixed segment, or recap locally.
 
+- [ ] **OPEN-028 - Explicit rewind-to-start persistence.** A confirmed managed-embed seek to exactly
+  `0 ms` followed by an immediate exit can retain the previous resume point because zero positions
+  are intentionally excluded from generic final-save paths. Preserving an intentional reset needs a
+  distinct, identity-checked user-seek intent so an unplayed zero sample cannot create history.
+
 - [x] **OPEN-006 - Optimistic manual embed controls.** Seek, play/pause, speed, volume, resume, and
   skip commands now carry a generation, command ID, and media identity. UI state changes only after
   a matching acknowledgement; superseded, rejected, stale, and timed-out commands cannot commit.
