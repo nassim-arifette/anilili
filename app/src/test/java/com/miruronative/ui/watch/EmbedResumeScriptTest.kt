@@ -30,7 +30,7 @@ class EmbedResumeScriptTest {
     }
 
     @Test
-    fun `resume starts paused video and acknowledges only confirmed playing state`() {
+    fun `resume starts paused video and acknowledges only its requested playing state`() {
         val script = resumeVideoCommandJs(
             targetSec = 10.0,
             navigationGeneration = 18L,
@@ -43,9 +43,11 @@ class EmbedResumeScriptTest {
         assertTrue(script.contains("video.play()"))
         assertTrue(script.contains("playResult.then"))
         assertTrue(script.contains("!video.paused && !video.ended"))
+        assertTrue(script.contains("var desiredPlaying = true"))
+        assertTrue(script.contains("matchesDesiredPlaybackState(video)"))
         assertTrue(
             script.contains(
-                "success = success && matches(video) && stillOwnsPlaybackMutation(video) && playing &&",
+                "matchesDesiredPlaybackState(video) && remainsAtOrBeyondTarget(video)",
             ),
         )
         assertTrue(script.contains("video.currentTime + 1.5 >= bounded"))
@@ -67,7 +69,9 @@ class EmbedResumeScriptTest {
             expectedMediaGeneration = 5L,
         )
 
-        val claim = script.indexOf("playbackMutationEpoch = __aniliBeginPlaybackMutation(video, true)")
+        val claim = script.indexOf(
+            "playbackMutationEpoch = __aniliBeginPlaybackMutation(video, desiredPlaying)",
+        )
         val delayedGuard = script.indexOf("!stillOwnsPlaybackMutation(video)")
         val playMutation = script.indexOf("var playResult = video.play()")
         assertTrue(script.contains("window.__aniliPlaybackMutationState"))
@@ -82,6 +86,33 @@ class EmbedResumeScriptTest {
         )
         assertTrue(script.contains("playResult.then(settleResumePlay)"))
         assertTrue(script.contains("__aniliReconcileStaleResumePlay(video, playbackMutationEpoch)"))
+    }
+
+    @Test
+    fun `paused restore pauses every reachable media before seeking and acknowledging`() {
+        val script = resumeVideoCommandJs(
+            targetSec = 42.0,
+            navigationGeneration = 21L,
+            capabilityToken = "capability",
+            commandId = 13L,
+            expectedMediaIdentity = "episode-a|1440000",
+            expectedMediaGeneration = 7L,
+            desiredPlaying = false,
+        )
+
+        val mutationClaim = script.indexOf(
+            "playbackMutationEpoch = __aniliBeginPlaybackMutation(video, desiredPlaying)",
+        )
+        val initialPauseAll = script.indexOf("if (!desiredPlaying) __aniliPauseAllMedia()")
+        val positionMutation = script.indexOf("video.currentTime = bounded")
+        assertTrue(script.contains("var desiredPlaying = false"))
+        assertTrue(script.contains("function ensurePaused(video)"))
+        assertTrue(script.contains("if (desiredPlaying) ensurePlaying(video); else ensurePaused(video)"))
+        assertTrue(script.contains("report(video.paused || video.ended, video)"))
+        assertTrue(mutationClaim >= 0)
+        assertTrue(initialPauseAll > mutationClaim)
+        assertTrue(positionMutation > initialPauseAll)
+        assertTrue(script.indexOf("__aniliPauseAllMedia();", initialPauseAll + 1) > initialPauseAll)
     }
 
     @Test

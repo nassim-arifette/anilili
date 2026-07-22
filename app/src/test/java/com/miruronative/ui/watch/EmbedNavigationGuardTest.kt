@@ -452,10 +452,24 @@ class EmbedNavigationGuardTest {
         assertTrue(REVOKE_EMBED_NAVIGATION_JS.contains("__aniliNavigationRevoked = true"))
     }
 
+    @Test
+    fun navigationSessionCarriesPausedResumeIntentExactly() {
+        val guard = EmbedNavigationGuard()
+        val pausedRequest = request("https://player.example/episode-b").copy(
+            resumeDesiredPlaying = false,
+        )
+
+        val session = guard.begin(pausedRequest)
+
+        assertFalse(session.request.resumeDesiredPlaying)
+        assertEquals(pausedRequest, session.request)
+    }
+
     private fun request(url: String): EmbedNavigationRequest = EmbedNavigationRequest(
         streamUrl = url,
         documentUrl = url,
         allowedMainFrameHost = "player.example",
         resumePositionMs = 12_000L,
+        resumeDesiredPlaying = true,
     )
 }

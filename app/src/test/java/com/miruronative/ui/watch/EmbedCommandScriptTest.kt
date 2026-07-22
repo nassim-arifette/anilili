@@ -15,6 +15,7 @@ class EmbedCommandScriptTest {
             commandId = 9,
             expectedMediaIdentity = "episode|1440000",
             expectedMediaGeneration = 3,
+            desiredPlaying = true,
         )
 
         assertTrue(script.contains("findContentVideo()"))
@@ -26,14 +27,20 @@ class EmbedCommandScriptTest {
         assertTrue(script.contains("expectedMediaGeneration = 3"))
         assertTrue(script.contains("__aniliMediaGeneration(video)"))
         assertTrue(script.contains("findContentVideo() === video"))
-        assertTrue(script.contains("shouldRemainPlaying = !video.paused && !video.ended"))
+        assertTrue(script.contains("var desiredPlaying = true"))
         assertTrue(
             script.contains(
-                "playbackMutationEpoch = __aniliBeginPlaybackMutation(video, shouldRemainPlaying)",
+                "playbackMutationEpoch = __aniliBeginPlaybackMutation(video, desiredPlaying)",
             ),
         )
         assertTrue(
             script.contains("__aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch)"),
+        )
+        assertTrue(script.contains("var forwardOnly = false"))
+        assertTrue(
+            script.contains(
+                "window.__aniliPlaybackDesiredPlaying = desiredPlaying === true",
+            ),
         )
     }
 
@@ -48,6 +55,8 @@ class EmbedCommandScriptTest {
         assertTrue(script.contains("'capability', '18', '10'"))
         assertTrue(script.contains("__aniliPauseCompetingMedia(video)"))
         assertTrue(script.contains("__aniliPauseAllMedia()"))
+        assertTrue(script.contains("root.addEventListener('play'"))
+        assertTrue(script.contains("window.__aniliPlaybackDesiredPlaying !== true"))
         assertTrue(script.contains("shouldPlay = video.paused || video.ended"))
         assertTrue(
             script.contains("playbackMutationEpoch = __aniliBeginPlaybackMutation(video, shouldPlay)"),
@@ -55,6 +64,61 @@ class EmbedCommandScriptTest {
         assertTrue(
             script.contains("__aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch)"),
         )
+        assertTrue(
+            script.contains(
+                "window.__aniliPlaybackDesiredPlaying = desiredPlaying === true",
+            ),
+        )
+    }
+
+    @Test
+    fun `automatic forward-only seek acknowledges a crossed target without rewinding`() {
+        val script = seekVideoCommandJs(
+            targetSec = 90.0,
+            navigationGeneration = 17,
+            capabilityToken = "capability",
+            commandId = 10,
+            expectedMediaIdentity = "episode|1440000",
+            expectedMediaGeneration = 3,
+            forwardOnly = true,
+            desiredPlaying = true,
+        )
+
+        val crossedTargetGuard = script.indexOf(
+            "if (forwardOnly && isFinite(video.currentTime) && video.currentTime >= bounded)",
+        )
+        val positionMutation = script.indexOf("video.currentTime = bounded")
+        assertTrue(script.contains("var forwardOnly = true"))
+        assertTrue(script.contains("? video.currentTime + 1.5 >= bounded"))
+        assertTrue(crossedTargetGuard >= 0)
+        assertTrue(positionMutation > crossedTargetGuard)
+        assertTrue(script.substring(crossedTargetGuard, positionMutation).contains("confirmSeek();"))
+    }
+
+    @Test
+    fun `suppressed manual seek keeps native pause intent despite provider DOM playback`() {
+        val script = seekVideoCommandJs(
+            targetSec = 42.0,
+            navigationGeneration = 22,
+            capabilityToken = "capability",
+            commandId = 11,
+            expectedMediaIdentity = "episode|1440000",
+            expectedMediaGeneration = 4,
+            desiredPlaying = false,
+        )
+
+        val pauseAll = script.indexOf("if (!desiredPlaying) __aniliPauseAllMedia()")
+        val seek = script.indexOf("video.currentTime = bounded")
+        assertTrue(script.contains("var desiredPlaying = false"))
+        assertFalse(script.contains("shouldRemainPlaying = !video.paused"))
+        assertTrue(
+            script.contains(
+                "playbackMutationEpoch = __aniliBeginPlaybackMutation(video, desiredPlaying)",
+            ),
+        )
+        assertTrue(script.contains("(desiredPlaying ? playing : !playing)"))
+        assertTrue(pauseAll >= 0)
+        assertTrue(seek > pauseAll)
     }
 
     @Test

@@ -186,6 +186,7 @@ internal data class EmbedNavigationRequest(
     val documentUrl: String,
     val allowedMainFrameHost: String?,
     val resumePositionMs: Long,
+    val resumeDesiredPlaying: Boolean,
 )
 
 /**
