@@ -147,6 +147,155 @@ class EmbedResumeCoordinatorTest {
     }
 
     @Test
+    fun `paused quality handoff seeks replacement and keeps it paused`() {
+        val source = EmbedResumeCoordinator(initialTargetPositionMs = 0L)
+        source.observe(firstVideo, positionMs = 90_000L, isPlaying = false)
+        val handoff = checkNotNull(source.handoffFor(firstVideo))
+
+        assertEquals(90_000L, handoff.positionMs)
+        assertFalse(handoff.desiredPlaying)
+
+        val replacement = EmbedResumeCoordinator(
+            initialTargetPositionMs = handoff.positionMs,
+            initialDesiredPlaying = handoff.desiredPlaying,
+        )
+        replacement.observe(replacementVideo, positionMs = 0L, isPlaying = true)
+        val attempt = checkNotNull(replacement.nextAttempt(replacementVideo))
+
+        assertFalse(attempt.desiredPlaying)
+        assertEquals(90_000L, attempt.targetPositionMs)
+        assertEquals(
+            EmbedResumeAttemptOutcome.COMPLETED,
+            replacement.acknowledge(
+                attempt,
+                succeeded = true,
+                isPlaying = false,
+                positionMs = 90_000L,
+            ),
+        )
+        assertNull(replacement.nextAttempt(replacementVideo))
+    }
+
+    @Test
+    fun `playing quality handoff seeks replacement and resumes it`() {
+        val source = EmbedResumeCoordinator(initialTargetPositionMs = 0L)
+        source.observe(firstVideo, positionMs = 90_000L, isPlaying = true)
+        val handoff = checkNotNull(source.handoffFor(firstVideo))
+
+        assertEquals(90_000L, handoff.positionMs)
+        assertTrue(handoff.desiredPlaying)
+
+        val replacement = EmbedResumeCoordinator(
+            initialTargetPositionMs = handoff.positionMs,
+            initialDesiredPlaying = handoff.desiredPlaying,
+        )
+        replacement.observe(replacementVideo, positionMs = 0L, isPlaying = false)
+        val attempt = checkNotNull(replacement.nextAttempt(replacementVideo))
+
+        assertTrue(attempt.desiredPlaying)
+        assertEquals(
+            EmbedResumeAttemptOutcome.COMPLETED,
+            replacement.acknowledge(
+                attempt,
+                succeeded = true,
+                isPlaying = true,
+                positionMs = 90_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `zero-position paused handoff still requires an exact pause barrier`() {
+        val source = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
+        source.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        val staleRestore = checkNotNull(source.nextAttempt(firstVideo))
+        assertTrue(
+            source.supersedeWithPlaybackIntent(
+                firstVideo,
+                positionMs = 0L,
+                desiredPlaying = false,
+            ),
+        )
+        val handoff = checkNotNull(source.handoffFor(firstVideo))
+
+        val replacement = EmbedResumeCoordinator(
+            initialTargetPositionMs = handoff.positionMs,
+            initialDesiredPlaying = handoff.desiredPlaying,
+        )
+        replacement.observe(replacementVideo, positionMs = 0L, isPlaying = false)
+        assertFalse(replacement.isCompletedForTest(replacementVideo))
+        val pauseBarrier = checkNotNull(replacement.nextAttempt(replacementVideo))
+        assertEquals(0L, pauseBarrier.targetPositionMs)
+        assertFalse(pauseBarrier.desiredPlaying)
+        assertEquals(
+            EmbedResumeAttemptOutcome.COMPLETED,
+            replacement.acknowledge(
+                pauseBarrier,
+                succeeded = true,
+                isPlaying = false,
+                positionMs = 0L,
+            ),
+        )
+        assertEquals(
+            EmbedResumeAttemptOutcome.STALE,
+            source.acknowledge(
+                staleRestore,
+                succeeded = true,
+                isPlaying = true,
+                positionMs = 42_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `quality change before replacement tick inherits current request pause intent`() {
+        val requestForUntickedReplacement = EmbedNavigationRequest(
+            streamUrl = "https://player.example/quality-b",
+            documentUrl = "https://player.example/quality-b",
+            allowedMainFrameHost = "player.example",
+            resumePositionMs = 90_000L,
+            resumeDesiredPlaying = false,
+        )
+        val replacement = EmbedResumeCoordinator(
+            initialTargetPositionMs = requestForUntickedReplacement.resumePositionMs,
+            initialDesiredPlaying = requestForUntickedReplacement.resumeDesiredPlaying,
+        )
+
+        val handoffToQualityC = resolveEmbedQualityHandoff(
+            confirmedHandoff = replacement.handoffFor(null),
+            currentRequest = requestForUntickedReplacement,
+        )
+
+        assertEquals(90_000L, handoffToQualityC.positionMs)
+        assertFalse(handoffToQualityC.desiredPlaying)
+    }
+
+    @Test
+    fun `explicit play after lifecycle pause becomes the next quality intent`() {
+        val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 0L)
+        coordinator.observe(firstVideo, positionMs = 12_000L, isPlaying = false)
+        assertTrue(
+            coordinator.supersedeWithPlaybackIntent(
+                firstVideo,
+                positionMs = 12_000L,
+                desiredPlaying = false,
+            ),
+        )
+        assertTrue(
+            coordinator.supersedeWithPlaybackIntent(
+                firstVideo,
+                positionMs = 12_000L,
+                desiredPlaying = true,
+            ),
+        )
+        coordinator.observe(firstVideo, positionMs = 13_000L, isPlaying = true)
+
+        val handoff = checkNotNull(coordinator.handoffFor(firstVideo))
+        assertEquals(13_000L, handoff.positionMs)
+        assertTrue(handoff.desiredPlaying)
+    }
+
+    @Test
     fun `automatic intro seek cannot replace a farther pending saved target`() {
         val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 600_000L)
         coordinator.observe(firstVideo, positionMs = 10_000L, isPlaying = true)
@@ -221,14 +370,26 @@ class EmbedResumeCoordinatorTest {
     fun `lifecycle pause cancels in flight and queued retries without resume resurrection`() {
         val initialCoordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
         initialCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
-        assertTrue(initialCoordinator.supersedeWithPlaybackIntent(firstVideo, positionMs = 0L))
+        assertTrue(
+            initialCoordinator.supersedeWithPlaybackIntent(
+                firstVideo,
+                positionMs = 0L,
+                desiredPlaying = false,
+            ),
+        )
         initialCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
         assertNull(initialCoordinator.nextAttempt(firstVideo))
 
         val inFlightCoordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
         inFlightCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
         val inFlight = checkNotNull(inFlightCoordinator.nextAttempt(firstVideo))
-        assertTrue(inFlightCoordinator.supersedeWithPlaybackIntent(firstVideo, positionMs = 0L))
+        assertTrue(
+            inFlightCoordinator.supersedeWithPlaybackIntent(
+                firstVideo,
+                positionMs = 0L,
+                desiredPlaying = false,
+            ),
+        )
         assertEquals(
             EmbedResumeAttemptOutcome.STALE,
             inFlightCoordinator.acknowledge(
@@ -245,7 +406,13 @@ class EmbedResumeCoordinatorTest {
         retryCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
         val failed = checkNotNull(retryCoordinator.nextAttempt(firstVideo))
         assertEquals(EmbedResumeAttemptOutcome.RETRY, retryCoordinator.fail(failed))
-        assertTrue(retryCoordinator.supersedeWithPlaybackIntent(firstVideo, positionMs = 0L))
+        assertTrue(
+            retryCoordinator.supersedeWithPlaybackIntent(
+                firstVideo,
+                positionMs = 0L,
+                desiredPlaying = false,
+            ),
+        )
         retryCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
         assertNull(retryCoordinator.nextAttempt(firstVideo))
     }

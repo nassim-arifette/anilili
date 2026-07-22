@@ -35,6 +35,7 @@ class EmbedCommandScriptTest {
         assertTrue(
             script.contains("__aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch)"),
         )
+        assertTrue(script.contains("var forwardOnly = false"))
     }
 
     @Test
@@ -55,6 +56,29 @@ class EmbedCommandScriptTest {
         assertTrue(
             script.contains("__aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch)"),
         )
+    }
+
+    @Test
+    fun `automatic forward-only seek acknowledges a crossed target without rewinding`() {
+        val script = seekVideoCommandJs(
+            targetSec = 90.0,
+            navigationGeneration = 17,
+            capabilityToken = "capability",
+            commandId = 10,
+            expectedMediaIdentity = "episode|1440000",
+            expectedMediaGeneration = 3,
+            forwardOnly = true,
+        )
+
+        val crossedTargetGuard = script.indexOf(
+            "if (forwardOnly && isFinite(video.currentTime) && video.currentTime >= bounded)",
+        )
+        val positionMutation = script.indexOf("video.currentTime = bounded")
+        assertTrue(script.contains("var forwardOnly = true"))
+        assertTrue(script.contains("? video.currentTime + 1.5 >= bounded"))
+        assertTrue(crossedTargetGuard >= 0)
+        assertTrue(positionMutation > crossedTargetGuard)
+        assertTrue(script.substring(crossedTargetGuard, positionMutation).contains("confirmSeek();"))
     }
 
     @Test

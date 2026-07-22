@@ -11,6 +11,7 @@ internal fun resumeVideoCommandJs(
     commandId: Long,
     expectedMediaIdentity: String,
     expectedMediaGeneration: Long,
+    desiredPlaying: Boolean = true,
 ): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
@@ -18,6 +19,7 @@ internal fun resumeVideoCommandJs(
       ${embedPlaybackMutationEpochJs()}
       var expectedMediaIdentity = ${expectedMediaIdentity.toJsStringLiteral()};
       var expectedMediaGeneration = $expectedMediaGeneration;
+      var desiredPlaying = $desiredPlaying;
       var reported = false;
       var seekConfirmed = false;
       var bounded = null;
@@ -35,13 +37,18 @@ internal fun resumeVideoCommandJs(
         return playbackMutationEpoch !== null &&
           __aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch);
       }
+      function matchesDesiredPlaybackState(video) {
+        return !!video && (desiredPlaying
+          ? (!video.paused && !video.ended)
+          : (video.paused || video.ended));
+      }
       function report(success, video) {
         if (reported) return;
         reported = true;
         var position = video && isFinite(video.currentTime) ? video.currentTime : 0;
         var playing = !!video && !video.paused && !video.ended;
-        success = success && matches(video) && stillOwnsPlaybackMutation(video) && playing &&
-          remainsAtOrBeyondTarget(video);
+        success = success && matches(video) && stillOwnsPlaybackMutation(video) &&
+          matchesDesiredPlaybackState(video) && remainsAtOrBeyondTarget(video);
         try {
           AniliProgress.onCommandResult(
             '$capabilityToken', '$navigationGeneration', '$commandId', success, position, playing,
@@ -73,6 +80,20 @@ internal fun resumeVideoCommandJs(
           }
         } catch (e) { report(false, video); }
       }
+      function ensurePaused(video) {
+        if (reported || !matches(video) || !stillOwnsPlaybackMutation(video)) {
+          report(false, video); return;
+        }
+        try {
+          __aniliPauseAllMedia();
+          setTimeout(function() {
+            report(video.paused || video.ended, video);
+          }, 0);
+        } catch (e) { report(false, video); }
+      }
+      function ensureDesiredPlaybackState(video) {
+        if (desiredPlaying) ensurePlaying(video); else ensurePaused(video);
+      }
       try {
         var video = findContentVideo();
         if (!matches(video)) { report(false, video); return; }
@@ -80,7 +101,8 @@ internal fun resumeVideoCommandJs(
         bounded = isFinite(video.duration) && video.duration > 0
           ? Math.min(Math.max(0, target), video.duration)
           : Math.max(0, target);
-        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, true);
+        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, desiredPlaying);
+        if (!desiredPlaying) __aniliPauseAllMedia();
         function resumeAfterSeek() {
           if (reported || seekConfirmed) return;
           if (!matches(video) || !stillOwnsPlaybackMutation(video)) {
@@ -88,12 +110,12 @@ internal fun resumeVideoCommandJs(
           }
           if (remainsAtOrBeyondTarget(video)) {
             seekConfirmed = true;
-            ensurePlaying(video);
+            ensureDesiredPlaybackState(video);
           }
         }
         if (remainsAtOrBeyondTarget(video)) {
           seekConfirmed = true;
-          ensurePlaying(video);
+          ensureDesiredPlaybackState(video);
         } else {
           video.addEventListener('seeked', resumeAfterSeek, { once: true });
           video.currentTime = bounded;

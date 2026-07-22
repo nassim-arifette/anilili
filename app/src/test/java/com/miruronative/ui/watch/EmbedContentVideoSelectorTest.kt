@@ -199,4 +199,28 @@ class EmbedContentVideoSelectorTest {
         assertFalse(script.contains("muted"))
         assertFalse(script.contains("volume"))
     }
+
+    @Test
+    fun `paused page setup runs pause-all epoch barrier before authenticated polling`() {
+        val pausedSetup = authenticatedProgressSetupJs(
+            navigationGeneration = 8L,
+            capabilityToken = "capability",
+            resumeDesiredPlaying = false,
+        )
+        val playingSetup = authenticatedProgressSetupJs(
+            navigationGeneration = 9L,
+            capabilityToken = "capability",
+            resumeDesiredPlaying = true,
+        )
+
+        val pauseBarrier = pausedSetup.indexOf("function pauseMedia(root)")
+        val progressHook = pausedSetup.indexOf("window.__aniliNavigationToken = navigationToken")
+        assertTrue(pausedSetup.contains("querySelectorAll('video,audio')"))
+        assertTrue(pausedSetup.contains("desiredPlaying: false"))
+        assertTrue(pausedSetup.contains("var capabilityToken = 'capability'"))
+        assertTrue(pauseBarrier >= 0)
+        assertTrue(progressHook > pauseBarrier)
+        assertFalse(playingSetup.contains("function pauseMedia(root)"))
+        assertTrue(playingSetup.contains("window.__aniliNavigationToken = navigationToken"))
+    }
 }
