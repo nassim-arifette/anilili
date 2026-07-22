@@ -74,7 +74,6 @@ internal class EmbedResumeCoordinator(
                 // A durable pause intent also owns unexpected same-document replacements. Adopt
                 // neither their autoplay nor their identity as permission to start playback.
                 if (desiredPlaying) {
-                    desiredPlaying = isPlaying
                     activeIdentityCompleted = true
                 } else {
                     activeIdentityCompleted = !isPlaying
@@ -82,7 +81,6 @@ internal class EmbedResumeCoordinator(
                 restorationExhausted = false
             } else if (targetPositionMs <= 0L && desiredPlaying) {
                 targetPositionMs = safePositionMs
-                desiredPlaying = isPlaying
                 activeIdentityCompleted = true
                 restorationExhausted = false
             } else {
@@ -106,8 +104,6 @@ internal class EmbedResumeCoordinator(
                 activeIdentityCompleted = false
                 restorationExhausted = false
                 inFlightAttempt = null
-            } else if (desiredPlaying) {
-                desiredPlaying = isPlaying
             }
         } else if (hasReachedTarget(safePositionMs)) {
             // Never pull a paused video backwards just to prove that it can play. Bank its current
@@ -154,6 +150,11 @@ internal class EmbedResumeCoordinator(
         lastObservedPositionMs = safePositionMs
         bankForwardPosition(safePositionMs)
         if (desiredPlaying) {
+            // A lifecycle pause cancels, rather than consumes, an in-flight Play attempt. Reclaim
+            // that exact slot so even attempt #max can be replaced by seek+pause at the same target.
+            if (inFlightAttempt?.desiredPlaying == true) {
+                totalAttempts = (totalAttempts - 1).coerceAtLeast(0)
+            }
             desiredPlaying = false
             activeIdentityCompleted = false
             restorationExhausted = false

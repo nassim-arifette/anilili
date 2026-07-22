@@ -1629,8 +1629,16 @@ fun EmbedWebView(
                                         authenticatedProgressSetupJs(
                                             navigationGeneration = navigationSession.generation,
                                             capabilityToken = progressBridgeToken,
-                                            resumeDesiredPlaying = navigationSession.request
-                                                .resumeDesiredPlaying,
+                                            resumeDesiredPlaying = effectiveEmbedSetupDesiredPlaying(
+                                                pendingDesiredPlaying =
+                                                    pendingResumeDesiredPlaying,
+                                                lifecyclePlaybackAllowed =
+                                                    lifecyclePlaybackAllowed,
+                                                lifecycleState =
+                                                    lifecycleOwner?.lifecycle?.currentState,
+                                                automaticResumeSuppressed =
+                                                    lifecycleSupersededAutomaticResume,
+                                            ),
                                         ),
                                         null,
                                     )
@@ -2678,6 +2686,18 @@ internal fun isEmbedPlaybackPermitted(
 ): Boolean = lifecyclePlaybackAllowed &&
     shouldResumeEmbedForLifecycleState(lifecycleState) &&
     !automaticResumeSuppressed
+
+/** Uses live intent/lifecycle state; a page-finish callback must not replay its stale request. */
+internal fun effectiveEmbedSetupDesiredPlaying(
+    pendingDesiredPlaying: Boolean,
+    lifecyclePlaybackAllowed: Boolean,
+    lifecycleState: Lifecycle.State?,
+    automaticResumeSuppressed: Boolean,
+): Boolean = pendingDesiredPlaying && isEmbedPlaybackPermitted(
+    lifecyclePlaybackAllowed = lifecyclePlaybackAllowed,
+    lifecycleState = lifecycleState,
+    automaticResumeSuppressed = automaticResumeSuppressed,
+)
 
 /** Completion is still persisted while background/suppressed; only navigation is withheld. */
 internal fun canNavigateAfterEmbedEnd(

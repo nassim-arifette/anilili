@@ -241,4 +241,27 @@ class EmbedContentVideoSelectorTest {
         assertTrue(playingSetup.contains("root.addEventListener('play'"))
         assertTrue(playingSetup.contains("window.__aniliNavigationToken = navigationToken"))
     }
+
+    @Test
+    fun `page finish setup uses live suppressed intent instead of stale request Play`() {
+        val effectiveDesiredPlaying = effectiveEmbedSetupDesiredPlaying(
+            pendingDesiredPlaying = false,
+            lifecyclePlaybackAllowed = true,
+            lifecycleState = androidx.lifecycle.Lifecycle.State.RESUMED,
+            automaticResumeSuppressed = true,
+        )
+        val script = authenticatedProgressSetupJs(
+            navigationGeneration = 10L,
+            capabilityToken = "capability",
+            resumeDesiredPlaying = effectiveDesiredPlaying,
+        )
+
+        assertFalse(effectiveDesiredPlaying)
+        assertTrue(script.contains("window.__aniliPlaybackDesiredPlaying = false"))
+        assertTrue(script.contains("supersedePendingPlay();"))
+        assertTrue(
+            script.indexOf("window.__aniliPlaybackDesiredPlaying = false") <
+                script.indexOf("window.__aniliNavigationToken = navigationToken"),
+        )
+    }
 }

@@ -150,6 +150,13 @@ class EmbedResumeCoordinatorTest {
     fun `paused quality handoff seeks replacement and keeps it paused`() {
         val source = EmbedResumeCoordinator(initialTargetPositionMs = 0L)
         source.observe(firstVideo, positionMs = 90_000L, isPlaying = false)
+        assertTrue(
+            source.supersedeWithPlaybackIntent(
+                firstVideo,
+                positionMs = 90_000L,
+                desiredPlaying = false,
+            ),
+        )
         val handoff = checkNotNull(source.handoffFor(firstVideo))
 
         assertEquals(90_000L, handoff.positionMs)
@@ -201,6 +208,35 @@ class EmbedResumeCoordinatorTest {
                 isPlaying = true,
                 positionMs = 90_000L,
             ),
+        )
+    }
+
+    @Test
+    fun `transient paused telemetry never overwrites fresh Play intent`() {
+        val coordinator = EmbedResumeCoordinator(
+            initialTargetPositionMs = 0L,
+            initialDesiredPlaying = true,
+        )
+
+        coordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        assertTrue(checkNotNull(coordinator.handoffFor(firstVideo)).desiredPlaying)
+
+        coordinator.observe(firstVideo, positionMs = 1_000L, isPlaying = true)
+        val handoff = checkNotNull(coordinator.handoffFor(firstVideo))
+        assertEquals(1_000L, handoff.positionMs)
+        assertTrue(handoff.desiredPlaying)
+        assertTrue(
+            resolveEmbedQualityHandoff(
+                confirmedHandoff = handoff,
+                currentRequest = EmbedNavigationRequest(
+                    streamUrl = "https://player.example/quality-a",
+                    documentUrl = "https://player.example/quality-a",
+                    allowedMainFrameHost = "player.example",
+                    resumePositionMs = 0L,
+                    resumeDesiredPlaying = true,
+                ),
+                allowPlaying = true,
+            ).desiredPlaying,
         )
     }
 
@@ -380,6 +416,37 @@ class EmbedResumeCoordinatorTest {
         assertTrue(coordinator.suppressAutomaticPlayback(firstVideo, positionMs = 1_000L))
         assertTrue(coordinator.shouldDispatch(pausedRestore))
         assertEquals(90_000L, coordinator.targetForTest())
+    }
+
+    @Test
+    fun `suppression reuses canceled final Play attempt for seek and pause`() {
+        val coordinator = EmbedResumeCoordinator(
+            initialTargetPositionMs = 90_000L,
+            initialDesiredPlaying = true,
+            maxAttempts = 3,
+        )
+        coordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        assertEquals(EmbedResumeAttemptOutcome.RETRY, coordinator.fail(checkNotNull(coordinator.nextAttempt(firstVideo))))
+        assertEquals(EmbedResumeAttemptOutcome.RETRY, coordinator.fail(checkNotNull(coordinator.nextAttempt(firstVideo))))
+        val finalPlayAttempt = checkNotNull(coordinator.nextAttempt(firstVideo))
+        assertEquals(3, finalPlayAttempt.number)
+
+        assertTrue(coordinator.suppressAutomaticPlayback(firstVideo, positionMs = 0L))
+        assertEquals(
+            EmbedResumeAttemptOutcome.STALE,
+            coordinator.acknowledge(
+                finalPlayAttempt,
+                succeeded = true,
+                isPlaying = true,
+                positionMs = 90_000L,
+            ),
+        )
+        val pauseAttempt = checkNotNull(
+            coordinator.nextAttempt(firstVideo, allowPlaying = false),
+        )
+        assertEquals(3, pauseAttempt.number)
+        assertEquals(90_000L, pauseAttempt.targetPositionMs)
+        assertFalse(pauseAttempt.desiredPlaying)
     }
 
     @Test
