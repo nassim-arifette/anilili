@@ -223,7 +223,10 @@ fun EmbedWebView(
     }
     var lifecycleSupersededAutomaticResume by remember(navigationSession.generation) {
         mutableStateOf(
-            !shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState),
+            shouldSuppressEmbedAutomaticResume(
+                requestDesiredPlaying = navigationSession.request.resumeDesiredPlaying,
+                lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+            ),
         )
     }
     val currentLifecyclePlaybackAllowed by rememberUpdatedState(lifecyclePlaybackAllowed)
@@ -234,13 +237,13 @@ fun EmbedWebView(
         newValue = {
             lifecyclePlaybackAllowed = false
             lifecycleSupersededAutomaticResume = true
+            pendingResumeDesiredPlaying = false
             webIsPlaying = false
             resumeRetryMediaIdentity = null
             webMediaIdentity?.takeIf { it.isValid }?.let { mediaIdentity ->
-                resumeCoordinator.supersedeWithPlaybackIntent(
+                resumeCoordinator.suppressAutomaticPlayback(
                     mediaIdentity,
                     positionMs,
-                    desiredPlaying = false,
                 )
             }
         },
@@ -402,14 +405,22 @@ fun EmbedWebView(
                     !lifecyclePlaybackAllowed ||
                     lifecycleSupersededAutomaticResume
                 ) {
-                    resumeCoordinator.supersedeWithPlaybackIntent(
-                        checkNotNull(concreteIdentity.videoIdentity),
+                    val observedIdentity = checkNotNull(concreteIdentity.videoIdentity)
+                    resumeCoordinator.suppressAutomaticPlayback(
+                        observedIdentity,
                         nextPositionMs,
-                        desiredPlaying = false,
                     )
                 }
                 if (lifecycleTickPolicy.reassertPause) {
                     runCatching { webView?.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
+                    val observedIdentity = checkNotNull(concreteIdentity.videoIdentity)
+                    if (
+                        lifecyclePlaybackAllowed &&
+                        shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState) &&
+                        resumeCoordinator.canSchedulePausedRestore(observedIdentity)
+                    ) {
+                        resumeRetrySignal += 1
+                    }
                 }
                 positionMs = nextPositionMs
                 durationMs = nextDurationMs
@@ -479,13 +490,24 @@ fun EmbedWebView(
                         durationMs = sample.durationMs,
                         observedPlayingSamples = sample.observedPlayingSamples,
                     )
+                    val lifecycleAllowsNavigation = canNavigateAfterEmbedEnd(
+                        lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+                        automaticResumeSuppressed = lifecycleSupersededAutomaticResume,
+                    )
                     val committed = finalizeEmbedCompletionThenNavigate(
                         completion = completion,
                         shouldNavigate =
-                            autoplay && currentHasNextEpisode && currentOnNextEpisode != null,
+                            autoplay &&
+                                currentHasNextEpisode &&
+                                currentOnNextEpisode != null &&
+                                lifecycleAllowsNavigation,
                         commit = currentOnPlaybackEnded ?: { false },
                         navigate = {
                             if (
+                                canNavigateAfterEmbedEnd(
+                                    lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+                                    automaticResumeSuppressed = lifecycleSupersededAutomaticResume,
+                                ) &&
                                 autoAdvanceGate.tryAdvance(
                                     navigationToken = navigationToken,
                                     autoplay = true,
@@ -563,8 +585,8 @@ fun EmbedWebView(
             reportedMediaIdentity = webMediaIdentity,
         )
     }
-    val dispatchSeek: (Long?, Boolean, ((Boolean) -> Unit)?) -> Boolean =
-        { target, forwardOnly, onResult ->
+    val dispatchSeek: (Long?, Boolean, Boolean, ((Boolean) -> Unit)?) -> Boolean =
+        { target, forwardOnly, desiredPlaying, onResult ->
             if (target == null || !managedControlsReady()) {
                 onResult?.invoke(false)
                 false
@@ -592,6 +614,7 @@ fun EmbedWebView(
                                 expectedMediaIdentity = expectedMedia.mediaId,
                                 expectedMediaGeneration = expectedMedia.generation,
                                 forwardOnly = forwardOnly,
+                                desiredPlaying = desiredPlaying,
                             )
                         },
                         onResolved = { resolution ->
@@ -615,18 +638,23 @@ fun EmbedWebView(
     val requestUserSeek: (Long) -> Boolean = userSeek@{ target ->
         if (!currentLifecyclePlaybackAllowed || !managedControlsReady()) return@userSeek false
         val expectedMedia = webMediaIdentity?.takeIf { it.isValid } ?: return@userSeek false
-        // Explicit user control is the only action allowed to release a lifecycle suppression
-        // latch. Automated skip/resume work must never resurrect playback after backgrounding.
-        lifecycleSupersededAutomaticResume = false
+        // Seeking preserves the current play/pause intent and must never release a pause latch.
+        val desiredPlaying = webIsPlaying && !lifecycleSupersededAutomaticResume
+        pendingResumeDesiredPlaying = desiredPlaying
         resumeCoordinator.supersedeWithPlaybackIntent(
             expectedMedia,
             target,
-            desiredPlaying = webIsPlaying,
+            desiredPlaying = desiredPlaying,
         )
-        dispatchSeek(target, false, null)
+        dispatchSeek(target, false, desiredPlaying, null)
     }
     val requestAutomatedSeek: (Long?, ((Boolean) -> Unit)?) -> Boolean = automatedSeek@{ target, onResult ->
-        if (target == null || !currentLifecyclePlaybackAllowed || !managedControlsReady()) {
+        if (
+            target == null ||
+            !currentLifecyclePlaybackAllowed ||
+            currentLifecycleSupersededAutomaticResume ||
+            !managedControlsReady()
+        ) {
             return@automatedSeek false
         }
         val expectedMedia = webMediaIdentity?.takeIf { it.isValid }
@@ -648,18 +676,20 @@ fun EmbedWebView(
                     target,
                     desiredPlaying = webIsPlaying,
                 )
-                dispatchSeek(target, true, onResult)
+                dispatchSeek(target, true, webIsPlaying, onResult)
             }
         }
     }
     val requestTogglePlayback: () -> Boolean = requestToggle@{
         if (!currentLifecyclePlaybackAllowed || !managedControlsReady()) return@requestToggle false
         val expectedMedia = webMediaIdentity?.takeIf { it.isValid } ?: return@requestToggle false
-        lifecycleSupersededAutomaticResume = false
+        val desiredPlaying = !webIsPlaying
+        lifecycleSupersededAutomaticResume = !desiredPlaying
+        pendingResumeDesiredPlaying = desiredPlaying
         resumeCoordinator.supersedeWithPlaybackIntent(
             expectedMedia,
             positionMs,
-            desiredPlaying = !webIsPlaying,
+            desiredPlaying = desiredPlaying,
         )
         dispatchWebCommand(
             webView = webView,
@@ -685,6 +715,8 @@ fun EmbedWebView(
                 if (acknowledgement?.succeeded == true) {
                     webIsPlaying = acknowledgement.isPlaying
                     positionMs = acknowledgement.positionMs
+                    lifecycleSupersededAutomaticResume = !acknowledgement.isPlaying
+                    pendingResumeDesiredPlaying = acknowledgement.isPlaying
                     resumeCoordinator.supersedeWithPlaybackIntent(
                         expectedMedia,
                         acknowledgement.positionMs,
@@ -922,7 +954,6 @@ fun EmbedWebView(
         if (
             !canDispatchEmbedResume(
                 lifecyclePlaybackAllowed = lifecyclePlaybackAllowed &&
-                    !lifecycleSupersededAutomaticResume &&
                     shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState),
                 controlsReady = canControlPlayback,
                 navigationCurrent = navigationGuard.isCurrent(navigationSession),
@@ -936,7 +967,6 @@ fun EmbedWebView(
         if (
             !canDispatchEmbedResume(
                 lifecyclePlaybackAllowed = lifecyclePlaybackAllowed &&
-                    !lifecycleSupersededAutomaticResume &&
                     shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState),
                 controlsReady = canControlPlayback,
                 navigationCurrent = navigationGuard.isCurrent(navigationSession),
@@ -944,11 +974,15 @@ fun EmbedWebView(
         ) {
             return@LaunchedEffect
         }
-        val attempt = resumeCoordinator.nextAttempt(expectedMedia) ?: return@LaunchedEffect
+        val attempt = resumeCoordinator.nextAttempt(
+            mediaIdentity = expectedMedia,
+            allowPlaying = !lifecycleSupersededAutomaticResume,
+        ) ?: return@LaunchedEffect
         if (
             !resumeCoordinator.shouldDispatch(attempt) ||
             !lifecyclePlaybackAllowed ||
-            lifecycleSupersededAutomaticResume ||
+            !shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState) ||
+            (attempt.desiredPlaying && lifecycleSupersededAutomaticResume) ||
             !navigationGuard.isCurrent(navigationSession)
         ) {
             return@LaunchedEffect
@@ -1076,15 +1110,21 @@ fun EmbedWebView(
             onDispose {}
         } else {
             val initiallyAllowed = shouldResumeEmbedForLifecycleState(owner.lifecycle.currentState)
+            val generationRequestedPaused = !navigationSession.request.resumeDesiredPlaying
             lifecyclePlaybackAllowed = initiallyAllowed
+            if (generationRequestedPaused) {
+                pendingResumeDesiredPlaying = false
+                webIsPlaying = false
+                runCatching { web.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
+            }
             if (!initiallyAllowed) {
+                pendingResumeDesiredPlaying = false
                 webIsPlaying = false
                 resumeRetryMediaIdentity = null
                 webMediaIdentity?.takeIf { it.isValid }?.let { mediaIdentity ->
-                    resumeCoordinator.supersedeWithPlaybackIntent(
+                    resumeCoordinator.suppressAutomaticPlayback(
                         mediaIdentity,
                         positionMs,
-                        desiredPlaying = false,
                     )
                 }
                 runCatching { web.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
@@ -1816,6 +1856,12 @@ fun EmbedWebView(
                                 val handoff = resolveEmbedQualityHandoff(
                                     confirmedHandoff = resumeCoordinator.handoffFor(webMediaIdentity),
                                     currentRequest = navigationSession.request,
+                                    allowPlaying = isEmbedPlaybackPermitted(
+                                        lifecyclePlaybackAllowed = lifecyclePlaybackAllowed,
+                                        lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+                                        automaticResumeSuppressed =
+                                            lifecycleSupersededAutomaticResume,
+                                    ),
                                 )
                                 // Revoke A synchronously in the click that requests B; the WebView
                                 // itself is replaced later by AndroidView.update.
@@ -2115,10 +2161,16 @@ internal fun authenticatedProgressSetupJs(
     capabilityToken: String,
     resumeDesiredPlaying: Boolean,
 ): String = buildString {
-    if (!resumeDesiredPlaying) {
-        append(pauseEmbedMediaForLifecycleJs())
-        append('\n')
-    }
+    append(
+        "(function() { window.__aniliPlaybackDesiredPlaying = " +
+            "$resumeDesiredPlaying; })();\n",
+    )
+    append(
+        pauseEmbedMediaForLifecycleJs(
+            supersedePlaybackMutation = !resumeDesiredPlaying,
+        ),
+    )
+    append('\n')
     append(authenticatedProgressPollJs(navigationGeneration, capabilityToken))
 }
 
@@ -2324,6 +2376,7 @@ internal fun togglePlaybackCommandJs(
             setTimeout(function() { report(!video.paused, video); }, 0);
           }
         } else {
+          ${pauseEmbedMediaForLifecycleJs(supersedePlaybackMutation = false)}
           __aniliPauseAllMedia();
           setTimeout(function() { report(video.paused, video); }, 0);
         }
@@ -2340,6 +2393,7 @@ internal fun seekVideoCommandJs(
     expectedMediaIdentity: String? = null,
     expectedMediaGeneration: Long? = null,
     forwardOnly: Boolean = false,
+    desiredPlaying: Boolean,
 ): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
@@ -2348,6 +2402,7 @@ internal fun seekVideoCommandJs(
       var expectedMediaIdentity = ${expectedMediaIdentity?.toJsStringLiteral() ?: "null"};
       var expectedMediaGeneration = ${expectedMediaGeneration ?: "null"};
       var forwardOnly = $forwardOnly;
+      var desiredPlaying = $desiredPlaying;
       var reported = false;
       var playbackMutationEpoch = null;
       function report(success, video) {
@@ -2361,7 +2416,8 @@ internal fun seekVideoCommandJs(
           __aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch) &&
           findContentVideo() === video &&
           (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity) &&
-          (expectedMediaGeneration === null || mediaGeneration === expectedMediaGeneration);
+          (expectedMediaGeneration === null || mediaGeneration === expectedMediaGeneration) &&
+          (desiredPlaying ? playing : !playing);
         try {
           AniliProgress.onCommandResult(
             '$capabilityToken', '$navigationGeneration', '$commandId', success, position, playing,
@@ -2377,8 +2433,8 @@ internal fun seekVideoCommandJs(
               __aniliMediaGeneration(video) !== expectedMediaGeneration)) {
           report(false, video); return;
         }
-        var shouldRemainPlaying = !video.paused && !video.ended;
-        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, shouldRemainPlaying);
+        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, desiredPlaying);
+        if (!desiredPlaying) __aniliPauseAllMedia();
         var target = $targetSec;
         var bounded = isFinite(video.duration) && video.duration > 0
           ? Math.min(Math.max(0, target), video.duration)
@@ -2615,6 +2671,21 @@ internal data class EmbedLifecycleTickPolicy(
     val reassertPause: Boolean,
 )
 
+internal fun isEmbedPlaybackPermitted(
+    lifecyclePlaybackAllowed: Boolean,
+    lifecycleState: Lifecycle.State?,
+    automaticResumeSuppressed: Boolean,
+): Boolean = lifecyclePlaybackAllowed &&
+    shouldResumeEmbedForLifecycleState(lifecycleState) &&
+    !automaticResumeSuppressed
+
+/** Completion is still persisted while background/suppressed; only navigation is withheld. */
+internal fun canNavigateAfterEmbedEnd(
+    lifecycleState: Lifecycle.State?,
+    automaticResumeSuppressed: Boolean,
+): Boolean = shouldResumeEmbedForLifecycleState(lifecycleState) &&
+    !automaticResumeSuppressed
+
 /** Fail closed on any playing tick while this navigation is lifecycle-suppressed. */
 internal fun planEmbedLifecycleTick(
     reportedPlaying: Boolean,
@@ -2631,6 +2702,11 @@ internal fun planEmbedLifecycleTick(
 internal fun shouldResumeEmbedForLifecycleState(state: Lifecycle.State?): Boolean =
     state == null || state.isAtLeast(Lifecycle.State.RESUMED)
 
+internal fun shouldSuppressEmbedAutomaticResume(
+    requestDesiredPlaying: Boolean,
+    lifecycleState: Lifecycle.State?,
+): Boolean = !requestDesiredPlaying || !shouldResumeEmbedForLifecycleState(lifecycleState)
+
 /** A navigation created while its owner is paused must carry a paused intent in the request. */
 internal fun embedNavigationDesiredPlaying(
     pendingDesiredPlaying: Boolean,
@@ -2641,11 +2717,14 @@ internal fun shouldResumeEmbedForLifecycleEvent(event: Lifecycle.Event): Boolean
     event == Lifecycle.Event.ON_RESUME
 
 /** Reversible lifecycle pause: never changes mute or volume state. */
-internal fun pauseEmbedMediaForLifecycleJs(): String = """
+internal fun pauseEmbedMediaForLifecycleJs(
+    supersedePlaybackMutation: Boolean = true,
+): String = """
     (function() {
       function supersedePendingPlay() {
         var previous = window.__aniliPlaybackMutationState;
         var nextEpoch = previous && isFinite(previous.epoch) ? previous.epoch + 1 : 1;
+        window.__aniliPlaybackDesiredPlaying = false;
         window.__aniliPlaybackMutationState = {
           epoch: nextEpoch,
           mediaIdentity: previous ? previous.mediaIdentity : '',
@@ -2653,21 +2732,56 @@ internal fun pauseEmbedMediaForLifecycleJs(): String = """
           desiredPlaying: false
         };
       }
+      function playbackMustStayPaused() {
+        return window.__aniliPlaybackDesiredPlaying !== true;
+      }
+      function pauseElement(media) {
+        if (!playbackMustStayPaused() || !media) return;
+        try { media.pause(); } catch (e) { /* detached media */ }
+      }
       function pauseMedia(root) {
         var media = root.querySelectorAll('video,audio');
         for (var i = 0; i < media.length; i++) {
-          try { media[i].pause(); } catch (e) { /* detached media */ }
+          pauseElement(media[i]);
         }
         var frames = root.querySelectorAll('iframe');
         for (var j = 0; j < frames.length; j++) {
           try {
             var child = frames[j].contentDocument;
-            if (child) pauseMedia(child);
+            if (child) {
+              installPlayGuard(child);
+              pauseMedia(child);
+            }
           } catch (e) { /* cross-origin */ }
         }
       }
-      supersedePendingPlay();
-      try { pauseMedia(document); } catch (e) { /* ignored */ }
+      function installPlayGuard(root) {
+        if (!root || root.__aniliPauseGuardInstalled) return;
+        root.__aniliPauseGuardInstalled = true;
+        root.addEventListener('play', function(event) {
+          var target = event && event.target;
+          if (target && (target.tagName === 'VIDEO' || target.tagName === 'AUDIO')) {
+            pauseElement(target);
+          }
+        }, true);
+        var view = root.defaultView;
+        var Observer = view && view.MutationObserver;
+        if (Observer) {
+          try {
+            var observer = new Observer(function() { pauseMedia(root); });
+            observer.observe(root.documentElement || root, { childList: true, subtree: true });
+            root.__aniliPauseGuardObserver = observer;
+          } catch (e) { /* detached document */ }
+        }
+        if (view && typeof view.setInterval === 'function') {
+          root.__aniliPauseGuardTimer = view.setInterval(function() { pauseMedia(root); }, 1000);
+        }
+      }
+      ${if (supersedePlaybackMutation) "supersedePendingPlay();" else ""}
+      try {
+        installPlayGuard(document);
+        pauseMedia(document);
+      } catch (e) { /* ignored */ }
     })();
 """.trimIndent()
 
@@ -2677,6 +2791,7 @@ internal fun silenceEmbedMediaForTeardownJs(): String = """
       function supersedePendingPlay() {
         var previous = window.__aniliPlaybackMutationState;
         var nextEpoch = previous && isFinite(previous.epoch) ? previous.epoch + 1 : 1;
+        window.__aniliPlaybackDesiredPlaying = false;
         window.__aniliPlaybackMutationState = {
           epoch: nextEpoch,
           mediaIdentity: previous ? previous.mediaIdentity : '',

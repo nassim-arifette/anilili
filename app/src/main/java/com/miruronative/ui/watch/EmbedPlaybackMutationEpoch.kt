@@ -11,6 +11,7 @@ internal fun embedPlaybackMutationEpochJs(): String = """
     function __aniliBeginPlaybackMutation(video, desiredPlaying) {
       var previous = window.__aniliPlaybackMutationState;
       var nextEpoch = previous && isFinite(previous.epoch) ? previous.epoch + 1 : 1;
+      window.__aniliPlaybackDesiredPlaying = desiredPlaying === true;
       window.__aniliPlaybackMutationState = {
         epoch: nextEpoch,
         mediaIdentity: __aniliMediaIdentity(video),

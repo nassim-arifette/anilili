@@ -1,5 +1,6 @@
 package com.miruronative.ui.watch
 
+import androidx.lifecycle.Lifecycle
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -137,6 +138,45 @@ class EmbedEndPolicyTest {
             ),
         )
         assertEquals(0, advances)
+    }
+
+    @Test
+    fun `suppressed resumed end still commits completion without navigating`() {
+        val calls = mutableListOf<String>()
+        val completion = EmbedPlaybackCompletion(
+            playbackKey = playbackKey,
+            reportedPositionMs = 1_440_000L,
+            durationMs = 1_440_000L,
+            observedPlayingSamples = 20,
+        )
+
+        val committed = finalizeEmbedCompletionThenNavigate(
+            completion = completion,
+            shouldNavigate = canNavigateAfterEmbedEnd(
+                lifecycleState = Lifecycle.State.RESUMED,
+                automaticResumeSuppressed = true,
+            ),
+            commit = {
+                calls += "commit"
+                true
+            },
+            navigate = { calls += "next" },
+        )
+
+        assertTrue(committed)
+        assertEquals(listOf("commit"), calls)
+        assertFalse(
+            canNavigateAfterEmbedEnd(
+                lifecycleState = Lifecycle.State.STARTED,
+                automaticResumeSuppressed = false,
+            ),
+        )
+        assertTrue(
+            canNavigateAfterEmbedEnd(
+                lifecycleState = Lifecycle.State.RESUMED,
+                automaticResumeSuppressed = false,
+            ),
+        )
     }
 
     @Test

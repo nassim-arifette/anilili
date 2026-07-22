@@ -71,8 +71,14 @@ internal class EmbedResumeCoordinator(
                 // Never infer that an arbitrary replacement is the same episode. Quality changes
                 // initiated by the app create a fresh navigation/coordinator with their own target.
                 targetPositionMs = safePositionMs
-                desiredPlaying = isPlaying
-                activeIdentityCompleted = true
+                // A durable pause intent also owns unexpected same-document replacements. Adopt
+                // neither their autoplay nor their identity as permission to start playback.
+                if (desiredPlaying) {
+                    desiredPlaying = isPlaying
+                    activeIdentityCompleted = true
+                } else {
+                    activeIdentityCompleted = !isPlaying
+                }
                 restorationExhausted = false
             } else if (targetPositionMs <= 0L && desiredPlaying) {
                 targetPositionMs = safePositionMs
@@ -94,7 +100,15 @@ internal class EmbedResumeCoordinator(
         if (activeIdentityCompleted) {
             // Keep the latest confirmed position for diagnostics and explicit playback intent.
             targetPositionMs = safePositionMs
-            desiredPlaying = isPlaying
+            if (!desiredPlaying && isPlaying) {
+                // Provider autoplay after a confirmed pause is not a new user intent. Re-open the
+                // pause barrier; only supersedeWithPlaybackIntent(..., true) may release it.
+                activeIdentityCompleted = false
+                restorationExhausted = false
+                inFlightAttempt = null
+            } else if (desiredPlaying) {
+                desiredPlaying = isPlaying
+            }
         } else if (hasReachedTarget(safePositionMs)) {
             // Never pull a paused video backwards just to prove that it can play. Bank its current
             // position for the pending start attempt, while still requiring a matching playing
@@ -122,6 +136,29 @@ internal class EmbedResumeCoordinator(
         lastObservedPositionMs = safePositionMs
         targetPositionMs = safePositionMs
         this.desiredPlaying = desiredPlaying
+        return true
+    }
+
+    /**
+     * Lifecycle/provider suppression is not a seek. It converts a pending Play into seek+pause
+     * without discarding the farther saved target, and repeated suppressed ticks leave an existing
+     * pause attempt intact.
+     */
+    @Synchronized
+    fun suppressAutomaticPlayback(
+        mediaIdentity: EmbedVideoIdentity,
+        positionMs: Long,
+    ): Boolean {
+        if (!mediaIdentity.isValid || mediaIdentity != activeMediaIdentity) return false
+        val safePositionMs = positionMs.coerceAtLeast(0L)
+        lastObservedPositionMs = safePositionMs
+        bankForwardPosition(safePositionMs)
+        if (desiredPlaying) {
+            desiredPlaying = false
+            activeIdentityCompleted = false
+            restorationExhausted = false
+            inFlightAttempt = null
+        }
         return true
     }
 
@@ -164,11 +201,31 @@ internal class EmbedResumeCoordinator(
         }
 
     @Synchronized
-    fun nextAttempt(mediaIdentity: EmbedVideoIdentity): EmbedResumeAttempt? {
+    fun hasPendingPausedRestore(mediaIdentity: EmbedVideoIdentity): Boolean =
+        mediaIdentity == activeMediaIdentity &&
+            !desiredPlaying &&
+            !activeIdentityCompleted &&
+            !restorationExhausted
+
+    @Synchronized
+    fun canSchedulePausedRestore(mediaIdentity: EmbedVideoIdentity): Boolean =
+        mediaIdentity == activeMediaIdentity &&
+            !desiredPlaying &&
+            !activeIdentityCompleted &&
+            !restorationExhausted &&
+            inFlightAttempt == null &&
+            totalAttempts < maxAttempts
+
+    @Synchronized
+    fun nextAttempt(
+        mediaIdentity: EmbedVideoIdentity,
+        allowPlaying: Boolean = true,
+    ): EmbedResumeAttempt? {
         if (
             mediaIdentity != activeMediaIdentity ||
             activeIdentityCompleted ||
             restorationExhausted ||
+            (desiredPlaying && !allowPlaying) ||
             (targetPositionMs <= 0L && desiredPlaying) ||
             inFlightAttempt != null ||
             totalAttempts >= maxAttempts
@@ -254,7 +311,11 @@ internal class EmbedResumeCoordinator(
 internal fun resolveEmbedQualityHandoff(
     confirmedHandoff: EmbedResumeHandoff?,
     currentRequest: EmbedNavigationRequest,
-): EmbedResumeHandoff = confirmedHandoff ?: EmbedResumeHandoff(
-    positionMs = currentRequest.resumePositionMs,
-    desiredPlaying = currentRequest.resumeDesiredPlaying,
-)
+    allowPlaying: Boolean = true,
+): EmbedResumeHandoff {
+    val resolved = confirmedHandoff ?: EmbedResumeHandoff(
+        positionMs = currentRequest.resumePositionMs,
+        desiredPlaying = currentRequest.resumeDesiredPlaying,
+    )
+    return resolved.copy(desiredPlaying = resolved.desiredPlaying && allowPlaying)
+}

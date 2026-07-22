@@ -271,6 +271,118 @@ class EmbedResumeCoordinatorTest {
     }
 
     @Test
+    fun `suppressed quality fallback cannot turn an unticked playing request into Play`() {
+        val requestForUntickedReplacement = EmbedNavigationRequest(
+            streamUrl = "https://player.example/quality-b",
+            documentUrl = "https://player.example/quality-b",
+            allowedMainFrameHost = "player.example",
+            resumePositionMs = 90_000L,
+            resumeDesiredPlaying = true,
+        )
+        val replacement = EmbedResumeCoordinator(
+            initialTargetPositionMs = requestForUntickedReplacement.resumePositionMs,
+            initialDesiredPlaying = requestForUntickedReplacement.resumeDesiredPlaying,
+        )
+
+        val handoffToQualityC = resolveEmbedQualityHandoff(
+            confirmedHandoff = replacement.handoffFor(null),
+            currentRequest = requestForUntickedReplacement,
+            allowPlaying = false,
+        )
+
+        assertEquals(90_000L, handoffToQualityC.positionMs)
+        assertFalse(handoffToQualityC.desiredPlaying)
+    }
+
+    @Test
+    fun `suppression blocks playing restore but permits paused seek and pause`() {
+        val paused = EmbedResumeCoordinator(
+            initialTargetPositionMs = 42_000L,
+            initialDesiredPlaying = false,
+        )
+        paused.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        val pausedAttempt = checkNotNull(paused.nextAttempt(firstVideo, allowPlaying = false))
+        assertFalse(pausedAttempt.desiredPlaying)
+
+        val playing = EmbedResumeCoordinator(
+            initialTargetPositionMs = 42_000L,
+            initialDesiredPlaying = true,
+        )
+        playing.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        assertNull(playing.nextAttempt(firstVideo, allowPlaying = false))
+        assertTrue(checkNotNull(playing.nextAttempt(firstVideo, allowPlaying = true)).desiredPlaying)
+    }
+
+    @Test
+    fun `confirmed pause intent rejects later autoplay from same or replacement video`() {
+        val coordinator = EmbedResumeCoordinator(
+            initialTargetPositionMs = 0L,
+            initialDesiredPlaying = false,
+        )
+        coordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        val initialPause = checkNotNull(coordinator.nextAttempt(firstVideo, allowPlaying = false))
+        assertEquals(
+            EmbedResumeAttemptOutcome.COMPLETED,
+            coordinator.acknowledge(
+                initialPause,
+                succeeded = true,
+                isPlaying = false,
+                positionMs = 0L,
+            ),
+        )
+
+        coordinator.observe(firstVideo, positionMs = 1_000L, isPlaying = true)
+        assertFalse(checkNotNull(coordinator.handoffFor(firstVideo)).desiredPlaying)
+        assertTrue(coordinator.canSchedulePausedRestore(firstVideo))
+        val sameVideoPause = checkNotNull(coordinator.nextAttempt(firstVideo, allowPlaying = false))
+        coordinator.acknowledge(
+            sameVideoPause,
+            succeeded = true,
+            isPlaying = false,
+            positionMs = 1_000L,
+        )
+
+        coordinator.observe(replacementVideo, positionMs = 0L, isPlaying = true)
+        assertFalse(checkNotNull(coordinator.handoffFor(replacementVideo)).desiredPlaying)
+        assertTrue(coordinator.hasPendingPausedRestore(replacementVideo))
+        assertFalse(
+            checkNotNull(coordinator.nextAttempt(replacementVideo, allowPlaying = false))
+                .desiredPlaying,
+        )
+    }
+
+    @Test
+    fun `lifecycle suppression converts pending Play without losing farther restore target`() {
+        val coordinator = EmbedResumeCoordinator(
+            initialTargetPositionMs = 90_000L,
+            initialDesiredPlaying = true,
+        )
+        coordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        val stalePlayingAttempt = checkNotNull(coordinator.nextAttempt(firstVideo))
+
+        assertTrue(coordinator.suppressAutomaticPlayback(firstVideo, positionMs = 0L))
+        assertEquals(
+            EmbedResumeAttemptOutcome.STALE,
+            coordinator.acknowledge(
+                stalePlayingAttempt,
+                succeeded = true,
+                isPlaying = true,
+                positionMs = 90_000L,
+            ),
+        )
+        val pausedRestore = checkNotNull(
+            coordinator.nextAttempt(firstVideo, allowPlaying = false),
+        )
+        assertEquals(90_000L, pausedRestore.targetPositionMs)
+        assertFalse(pausedRestore.desiredPlaying)
+
+        // Repeated suppressed telemetry may advance the target but must not cancel this attempt.
+        assertTrue(coordinator.suppressAutomaticPlayback(firstVideo, positionMs = 1_000L))
+        assertTrue(coordinator.shouldDispatch(pausedRestore))
+        assertEquals(90_000L, coordinator.targetForTest())
+    }
+
+    @Test
     fun `explicit play after lifecycle pause becomes the next quality intent`() {
         val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 0L)
         coordinator.observe(firstVideo, positionMs = 12_000L, isPlaying = false)

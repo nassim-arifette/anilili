@@ -190,7 +190,7 @@ class EmbedContentVideoSelectorTest {
         val script = pauseEmbedMediaForLifecycleJs()
 
         assertTrue(script.contains("querySelectorAll('video,audio')"))
-        assertTrue(script.contains("media[i].pause()"))
+        assertTrue(script.contains("pauseElement(media[i])"))
         assertTrue(script.contains("pauseMedia(child)"))
         assertTrue(script.contains("desiredPlaying: false"))
         assertTrue(
@@ -198,6 +198,21 @@ class EmbedContentVideoSelectorTest {
         )
         assertFalse(script.contains("muted"))
         assertFalse(script.contains("volume"))
+    }
+
+    @Test
+    fun `paused lifecycle installs durable guard for future same-origin media`() {
+        val script = pauseEmbedMediaForLifecycleJs()
+
+        assertTrue(script.contains("window.__aniliPlaybackDesiredPlaying = false"))
+        assertTrue(script.contains("window.__aniliPlaybackDesiredPlaying !== true"))
+        assertTrue(script.contains("root.addEventListener('play'"))
+        assertTrue(script.contains("}, true)"))
+        assertTrue(script.contains("new Observer(function() { pauseMedia(root); })"))
+        assertTrue(script.contains("observer.observe(root.documentElement || root"))
+        assertTrue(script.contains("view.setInterval(function() { pauseMedia(root); }, 1000)"))
+        assertTrue(script.contains("installPlayGuard(child)"))
+        assertTrue(script.indexOf("installPlayGuard(document)") < script.indexOf("pauseMedia(document)"))
     }
 
     @Test
@@ -217,10 +232,13 @@ class EmbedContentVideoSelectorTest {
         val progressHook = pausedSetup.indexOf("window.__aniliNavigationToken = navigationToken")
         assertTrue(pausedSetup.contains("querySelectorAll('video,audio')"))
         assertTrue(pausedSetup.contains("desiredPlaying: false"))
+        assertTrue(pausedSetup.contains("window.__aniliPlaybackDesiredPlaying = false"))
         assertTrue(pausedSetup.contains("var capabilityToken = 'capability'"))
         assertTrue(pauseBarrier >= 0)
         assertTrue(progressHook > pauseBarrier)
-        assertFalse(playingSetup.contains("function pauseMedia(root)"))
+        assertTrue(playingSetup.contains("function pauseMedia(root)"))
+        assertTrue(playingSetup.contains("window.__aniliPlaybackDesiredPlaying = true"))
+        assertTrue(playingSetup.contains("root.addEventListener('play'"))
         assertTrue(playingSetup.contains("window.__aniliNavigationToken = navigationToken"))
     }
 }

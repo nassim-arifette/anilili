@@ -110,4 +110,26 @@ class EmbedLifecyclePolicyTest {
         assertTrue(tickAfterExplicitPlay.acceptPlaying)
         assertFalse(tickAfterExplicitPlay.reassertPause)
     }
+
+    @Test
+    fun `paused navigation request suppresses automatic Play even while owner is resumed`() {
+        assertTrue(
+            shouldSuppressEmbedAutomaticResume(
+                requestDesiredPlaying = false,
+                lifecycleState = Lifecycle.State.RESUMED,
+            ),
+        )
+        assertFalse(
+            shouldSuppressEmbedAutomaticResume(
+                requestDesiredPlaying = true,
+                lifecycleState = Lifecycle.State.RESUMED,
+            ),
+        )
+        assertTrue(
+            shouldSuppressEmbedAutomaticResume(
+                requestDesiredPlaying = true,
+                lifecycleState = Lifecycle.State.STARTED,
+            ),
+        )
+    }
 }
