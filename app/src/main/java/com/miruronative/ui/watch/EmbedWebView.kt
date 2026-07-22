@@ -196,6 +196,9 @@ fun EmbedWebView(
     val currentPlayerOwnsRemote by rememberUpdatedState(focusPlayerOnStart)
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val commandCoordinator = remember { EmbedCommandCoordinator() }
+    val resumeCoordinator = remember(navigationSession.generation) {
+        EmbedResumeCoordinator(navigationSession.request.resumePositionMs)
+    }
     val pendingCommandCallbacks = remember {
         mutableMapOf<Long, (EmbedCommandResolution) -> Unit>()
     }
@@ -203,7 +206,10 @@ fun EmbedWebView(
     var durationMs by remember(playbackKey, url) { mutableLongStateOf(0L) }
     var webIsPlaying by remember(playbackKey, url) { mutableStateOf(false) }
     var webMediaIdentity by remember(playbackKey, url) { mutableStateOf<EmbedVideoIdentity?>(null) }
-    var resumeDispatched by remember(navigationSession.generation) { mutableStateOf(false) }
+    var resumeRetrySignal by remember(navigationSession.generation) { mutableIntStateOf(0) }
+    var resumeRetryMediaIdentity by remember(navigationSession.generation) {
+        mutableStateOf<EmbedVideoIdentity?>(null)
+    }
     var webVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     var lastAudibleVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     // Cross-origin embeds (some Kiwi mirrors) put the video out of the injected JS's reach, so
@@ -345,6 +351,11 @@ fun EmbedWebView(
                 }
                 val nextPositionMs = (positionSec * 1000).toLong()
                 val nextDurationMs = (durationSec * 1000).toLong()
+                resumeCoordinator.observe(
+                    mediaIdentity = checkNotNull(concreteIdentity.videoIdentity),
+                    positionMs = nextPositionMs,
+                    isPlaying = isPlaying,
+                )
                 positionMs = nextPositionMs
                 durationMs = nextDurationMs
                 webIsPlaying = isPlaying
@@ -773,29 +784,80 @@ fun EmbedWebView(
     LaunchedEffect(
         canControlPlayback,
         controlledMediaInstanceId,
+        resumeRetrySignal,
         webView,
         navigationSession.generation,
     ) {
+        if (!canControlPlayback || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
+        val web = webView ?: return@LaunchedEffect
+        val expectedMedia = webMediaIdentity ?: return@LaunchedEffect
+        if (resumeRetryMediaIdentity == expectedMedia) delay(EMBED_RESUME_RETRY_DELAY_MS)
+        if (!navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
+        val attempt = resumeCoordinator.nextAttempt(expectedMedia) ?: return@LaunchedEffect
         if (
-            resumeDispatched ||
-            !canControlPlayback ||
-            navigationSession.request.resumePositionMs <= 0L ||
+            !resumeCoordinator.shouldDispatch(attempt) ||
             !navigationGuard.isCurrent(navigationSession)
         ) {
             return@LaunchedEffect
         }
-        val web = webView ?: return@LaunchedEffect
-        val expectedMedia = webMediaIdentity ?: return@LaunchedEffect
-        resumeDispatched = true
-        web.evaluateJavascript(
-            embedResumeWhenReadyJs(
-                targetSec = navigationSession.request.resumePositionMs / 1_000.0,
-                navigationGeneration = navigationSession.generation,
-                expectedMediaIdentity = expectedMedia.mediaId,
-                expectedMediaGeneration = expectedMedia.generation,
-            ),
-            null,
+
+        fun handleOutcome(
+            outcome: EmbedResumeAttemptOutcome,
+            acknowledgement: EmbedCommandAcknowledgement? = null,
+        ) {
+            when (outcome) {
+                EmbedResumeAttemptOutcome.COMPLETED -> acknowledgement?.let { confirmed ->
+                    resumeRetryMediaIdentity = null
+                    positionMs = confirmed.positionMs
+                    webIsPlaying = confirmed.isPlaying
+                }
+                EmbedResumeAttemptOutcome.RETRY -> {
+                    resumeRetryMediaIdentity = attempt.mediaIdentity
+                    resumeRetrySignal += 1
+                }
+                EmbedResumeAttemptOutcome.EXHAUSTED -> {
+                    resumeRetryMediaIdentity = null
+                }
+                EmbedResumeAttemptOutcome.STALE -> Unit
+            }
+        }
+
+        val queued = dispatchWebCommand(
+            webView = web,
+            session = navigationSession,
+            guard = navigationGuard,
+            coordinator = commandCoordinator,
+            callbacks = pendingCommandCallbacks,
+            handler = mainHandler,
+            kind = EmbedCommandKind.RESUME_PLAYBACK,
+            mediaIdentity = expectedMedia,
+            script = { commandId ->
+                resumeVideoCommandJs(
+                    targetSec = attempt.targetPositionMs / 1_000.0,
+                    navigationGeneration = navigationSession.generation,
+                    capabilityToken = progressBridgeToken,
+                    commandId = commandId,
+                    expectedMediaIdentity = expectedMedia.mediaId,
+                    expectedMediaGeneration = expectedMedia.generation,
+                )
+            },
+            onResolved = { resolution ->
+                val acknowledgement = (resolution as? EmbedCommandResolution.Confirmed)
+                    ?.acknowledgement
+                val outcome = if (acknowledgement != null) {
+                    resumeCoordinator.acknowledge(
+                        attempt = attempt,
+                        succeeded = acknowledgement.succeeded,
+                        isPlaying = acknowledgement.isPlaying,
+                        positionMs = acknowledgement.positionMs,
+                    )
+                } else {
+                    resumeCoordinator.fail(attempt)
+                }
+                handleOutcome(outcome, acknowledgement)
+            },
         )
+        if (!queued) handleOutcome(resumeCoordinator.fail(attempt))
     }
 
     LaunchedEffect(

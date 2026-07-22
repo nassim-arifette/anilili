@@ -2,7 +2,7 @@ package com.miruronative.ui.watch
 
 internal const val EMBED_COMMAND_TIMEOUT_MS = 2_500L
 
-internal enum class EmbedCommandKind { SEEK, TOGGLE_PLAYBACK }
+internal enum class EmbedCommandKind { SEEK, TOGGLE_PLAYBACK, RESUME_PLAYBACK }
 
 internal data class EmbedCommand(
     val id: Long,
