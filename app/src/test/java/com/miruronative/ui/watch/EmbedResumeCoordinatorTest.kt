@@ -11,7 +11,7 @@ class EmbedResumeCoordinatorTest {
     private val replacementVideo = EmbedVideoIdentity("episode-b", generation = 2L)
 
     @Test
-    fun `stale mismatch and matching failure retry until matching success latches`() {
+    fun `pending restore becomes stale and never transfers to replacement video`() {
         val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
         coordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
         val staleAttempt = checkNotNull(coordinator.nextAttempt(firstVideo))
@@ -20,21 +20,6 @@ class EmbedResumeCoordinatorTest {
         assertEquals(
             EmbedResumeAttemptOutcome.STALE,
             coordinator.acknowledge(staleAttempt, succeeded = true, isPlaying = true, positionMs = 42_000L),
-        )
-
-        val failedAttempt = checkNotNull(coordinator.nextAttempt(replacementVideo))
-        assertEquals(
-            EmbedResumeAttemptOutcome.RETRY,
-            coordinator.acknowledge(failedAttempt, succeeded = false, isPlaying = false, positionMs = 0L),
-        )
-        coordinator.observe(replacementVideo, positionMs = 55_000L, isPlaying = true)
-        assertFalse(coordinator.isCompletedForTest(replacementVideo))
-        val successfulAttempt = checkNotNull(coordinator.nextAttempt(replacementVideo))
-        assertEquals(3, successfulAttempt.number)
-        assertEquals(55_000L, successfulAttempt.targetPositionMs)
-        assertEquals(
-            EmbedResumeAttemptOutcome.COMPLETED,
-            coordinator.acknowledge(successfulAttempt, succeeded = true, isPlaying = true, positionMs = 55_000L),
         )
         assertTrue(coordinator.isCompletedForTest(replacementVideo))
         assertNull(coordinator.nextAttempt(replacementVideo))
@@ -162,23 +147,107 @@ class EmbedResumeCoordinatorTest {
     }
 
     @Test
-    fun `replacement churn consumes one navigation wide attempt budget`() {
-        val thirdVideo = EmbedVideoIdentity("episode-c", generation = 3L)
-        val fourthVideo = EmbedVideoIdentity("episode-d", generation = 4L)
-        val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L, maxAttempts = 3)
+    fun `automatic intro seek cannot replace a farther pending saved target`() {
+        val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 600_000L)
+        coordinator.observe(firstVideo, positionMs = 10_000L, isPlaying = true)
+        val pending = checkNotNull(coordinator.nextAttempt(firstVideo))
 
+        assertEquals(
+            EmbedAutomatedSeekDecision.DEFER_TO_PENDING_RESUME,
+            coordinator.planAutomatedSeek(firstVideo, positionMs = 90_000L),
+        )
+        assertEquals(600_000L, coordinator.targetForTest())
+        assertTrue(coordinator.shouldDispatch(pending))
+    }
+
+    @Test
+    fun `automatic intro seek only advances a nearer pending restore target`() {
+        val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
+        coordinator.observe(firstVideo, positionMs = 10_000L, isPlaying = true)
+        val pending = checkNotNull(coordinator.nextAttempt(firstVideo))
+
+        assertEquals(
+            EmbedAutomatedSeekDecision.DEFER_TO_PENDING_RESUME,
+            coordinator.planAutomatedSeek(firstVideo, positionMs = 90_000L),
+        )
+        assertEquals(90_000L, coordinator.targetForTest())
+        assertEquals(
+            EmbedResumeAttemptOutcome.RETRY,
+            coordinator.acknowledge(
+                pending,
+                succeeded = true,
+                isPlaying = true,
+                positionMs = 42_000L,
+            ),
+        )
+        assertEquals(90_000L, checkNotNull(coordinator.nextAttempt(firstVideo)).targetPositionMs)
+    }
+
+    @Test
+    fun `automatic seek dispatches only after restoration completed for exact video`() {
+        val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
         coordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
-        assertEquals(1, checkNotNull(coordinator.nextAttempt(firstVideo)).number)
-        coordinator.observe(replacementVideo, positionMs = 0L, isPlaying = false)
-        assertEquals(2, checkNotNull(coordinator.nextAttempt(replacementVideo)).number)
-        coordinator.observe(thirdVideo, positionMs = 0L, isPlaying = false)
-        assertEquals(3, checkNotNull(coordinator.nextAttempt(thirdVideo)).number)
-        coordinator.observe(fourthVideo, positionMs = 0L, isPlaying = false)
-        assertNull(coordinator.nextAttempt(fourthVideo))
+        val pending = checkNotNull(coordinator.nextAttempt(firstVideo))
+        coordinator.acknowledge(pending, succeeded = true, isPlaying = true, positionMs = 42_000L)
 
-        val freshNavigation = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L, maxAttempts = 3)
-        freshNavigation.observe(fourthVideo, positionMs = 0L, isPlaying = false)
-        assertEquals(1, checkNotNull(freshNavigation.nextAttempt(fourthVideo)).number)
+        assertEquals(
+            EmbedAutomatedSeekDecision.DISPATCH,
+            coordinator.planAutomatedSeek(firstVideo, positionMs = 90_000L),
+        )
+        assertEquals(
+            EmbedAutomatedSeekDecision.REJECT,
+            coordinator.planAutomatedSeek(replacementVideo, positionMs = 90_000L),
+        )
+    }
+
+    @Test
+    fun `automatic seek can safely take over after restore attempts exhaust`() {
+        val coordinator = EmbedResumeCoordinator(initialTargetPositionMs = 600_000L, maxAttempts = 1)
+        coordinator.observe(firstVideo, positionMs = 10_000L, isPlaying = true)
+        val onlyAttempt = checkNotNull(coordinator.nextAttempt(firstVideo))
+        assertEquals(EmbedResumeAttemptOutcome.EXHAUSTED, coordinator.fail(onlyAttempt))
+
+        assertEquals(
+            EmbedAutomatedSeekDecision.REJECT,
+            coordinator.planAutomatedSeek(firstVideo, positionMs = 5_000L),
+        )
+        assertEquals(
+            EmbedAutomatedSeekDecision.DISPATCH,
+            coordinator.planAutomatedSeek(firstVideo, positionMs = 90_000L),
+        )
+    }
+
+    @Test
+    fun `lifecycle pause cancels in flight and queued retries without resume resurrection`() {
+        val initialCoordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
+        initialCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        assertTrue(initialCoordinator.supersedeWithPlaybackIntent(firstVideo, positionMs = 0L))
+        initialCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        assertNull(initialCoordinator.nextAttempt(firstVideo))
+
+        val inFlightCoordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
+        inFlightCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        val inFlight = checkNotNull(inFlightCoordinator.nextAttempt(firstVideo))
+        assertTrue(inFlightCoordinator.supersedeWithPlaybackIntent(firstVideo, positionMs = 0L))
+        assertEquals(
+            EmbedResumeAttemptOutcome.STALE,
+            inFlightCoordinator.acknowledge(
+                inFlight,
+                succeeded = false,
+                isPlaying = false,
+                positionMs = 0L,
+            ),
+        )
+        inFlightCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        assertNull(inFlightCoordinator.nextAttempt(firstVideo))
+
+        val retryCoordinator = EmbedResumeCoordinator(initialTargetPositionMs = 42_000L)
+        retryCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        val failed = checkNotNull(retryCoordinator.nextAttempt(firstVideo))
+        assertEquals(EmbedResumeAttemptOutcome.RETRY, retryCoordinator.fail(failed))
+        assertTrue(retryCoordinator.supersedeWithPlaybackIntent(firstVideo, positionMs = 0L))
+        retryCoordinator.observe(firstVideo, positionMs = 0L, isPlaying = false)
+        assertNull(retryCoordinator.nextAttempt(firstVideo))
     }
 
     @Test
