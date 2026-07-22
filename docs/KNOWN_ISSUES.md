@@ -1,6 +1,6 @@
 # Known Issues and Fix Tracker
 
-Last updated: July 21, 2026.
+Last updated: July 22, 2026.
 
 This is the canonical audit tracker for the current repository tree. A checked item is implemented
 and merged into the integration history. An unchecked item is still open, even when the limitation
@@ -45,23 +45,33 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | HISTORY-006 | [x] | Require a known series episode total and an exact final-episode match before marking a title completed. The latest released episode of an airing series remains resumable. | `fix/final-episode-completion-evidence` |
 | HISTORY-007 | [x] | Key Watch Next throttling by episode/source context, use a monotonic clock, and remove completed titles. | `fix/watch-next-content-aware-throttle` |
 | HISTORY-008 | [x] | Persist sparse per-episode device progress and render only episodes actually played. Opening episode 90 no longer marks episodes 1-89 complete or fills their thumbnail bars. | `fix/per-episode-watch-progress` |
+| HISTORY-009 | [x] | Keep the selected embed document URL as the in-memory persistence identity while using a separate opaque AniSkip cache identity. Manual Next, source changes, fullscreen/TV exit, and player close now flush the latest concrete embed position. A quality/document handoff also carries that verified position into the live resume state before invalidating the outgoing instance, so closing before the replacement's first tick cannot reopen behind it. Signed document and video URLs remain redacted from diagnostics. | `fix/embed-progress-save-identity` |
+| HISTORY-010 | [x] | Publish an identity-checked seek acknowledgement as progress after that exact embed video has already produced real playing samples. Seeking while paused and immediately closing now preserves the acknowledged position without allowing an unplayed scrub to create history. | `fix/embed-paused-seek-persistence` |
 
 ### Intro, outro, embed, and autoplay
 
 | ID | Status | Fix | Topic branch |
 | --- | --- | --- | --- |
-| SKIP-001 | [x] | Merge provider and AniSkip intro/outro fields independently; a provider marker always wins for the field it supplied. | `fix/skip-marker-field-merge` |
-| SKIP-002 | [x] | Keep a slow AniSkip lookup alive after the 2.5-second startup budget and publish it only into the still-matching playback generation. | `fix/late-aniskip-publication` |
+| SKIP-001 | [x] | Merge provider and AniSkip intro/outro fields independently. Its original provider-first precedence is superseded by the typed, duration-bound family policy in SKIP-006 and SKIP-007. | `fix/skip-marker-field-merge` |
+| SKIP-002 | [x] | Keep a slow AniSkip lookup alive after the 2.5-second startup budget and publish it only into the still-matching playback generation. Superseded by the duration-bound typed policy in SKIP-006. | `fix/late-aniskip-publication` |
 | SKIP-003 | [x] | Keep Skip Outro independent from autoplay, and never auto-skip while playback is paused. | `fix/outro-skip-policy` |
 | SKIP-004 | [x] | Mark an embed auto-skip handled only after JavaScript confirms the seek; failed seeks are retried under the current navigation generation. | `fix/embed-seek-result-ack` |
+| SKIP-005 | [x] | Query AniSkip v2 with the measured media duration, decimal episode number, all five segment types, and MAL relation rules; retain typed intervals, reference durations, and contribution IDs. | `feature/aniskip-segments` |
+| SKIP-006 | [x] | Bind duration-adjusted AniSkip results to the exact request, episode, provider, category, generation, duration-bearing media identity, and stable duration. Provider markers remain manual-only while the typed lookup is pending, then act as fallback only for families AniSkip did not identify. | `feature/aniskip-segments` |
+| SKIP-007 | [x] | Auto-skip only pure openings/endings. Mixed openings, mixed endings, and recaps have explicit manual actions; mixed typed markers suppress untyped provider auto-skip for the same family, including late responses. | `feature/aniskip-segments` |
+| SKIP-008 | [x] | Retain the last measured duration across transient zero-duration callbacks for the exact same media identity, so an in-flight AniSkip response cannot strand the player in `LOADING`. Default skip policy inputs now fail safe and keep provider auto-skip disabled until the typed lookup completes. | `fix/aniskip-zero-duration-loading` |
+| SKIP-009 | [x] | Hand the exact active embed navigation and quality URL to the ViewModel. A quality change immediately clears duration-adjusted markers, rejects callbacks from the replaced document, and reloads AniSkip only after the replacement reports its own duration. Signed URLs remain absent from logs and are SHA-256 scoped in cache keys. | `fix/aniskip-embed-media-identity` |
+| SKIP-010 | [x] | Bind same-origin embed progress to the actual selected video as well as its document and navigation. A same-document CDN/track replacement synchronously clears AniSkip, rejects callbacks and command acknowledgements from the former video, and waits for the replacement's own duration-bearing sample even when both videos round to the same duration. Raw document/video identities are redacted from diagnostics and combined into an opaque SHA-256 source fingerprint before the repository's SHA-256-scoped persistent cache. | `fix/embed-active-video-identity` |
 | EMBED-001 | [x] | Authenticate bridge callbacks and isolate every embed navigation so an old page cannot update the new episode. | `fix/webview-bridge-capabilities`, `fix/embed-navigation-generation` |
 | EMBED-002 | [x] | Retry resume until a same-origin video is ready, including accessible iframes, and preserve pause state during seeks. | `fix/embed-resume-readiness`, `fix/embed-seek-preserves-pause` |
 | EMBED-003 | [x] | Accept natural embed completion only after content-like playback samples, commit it before autoplay, and advance at most once. | `fix/embed-safe-natural-end-autoplay`, `fix/embed-terminal-progress-commit` |
+| EMBED-004 | [x] | Keep managed embed controls and their video mutations unavailable until the authenticated bridge and the active concrete video report the exact same media identity. Resume now latches only after an identity-matched seek, exact play/pause state, and final-position acknowledgement; makes at most three attempts across the entire navigation; never rewinds a paused video already past the target; and carries both position and play/pause intent through explicit quality navigations, including repeated changes before the replacement's first tick. A paused handoff runs a same-origin pause-all epoch barrier before polling, even at position zero, while a playing handoff may resume. Any same-document replacement B is fail-closed and cannot inherit A's position or be auto-played, even while A's restore is unresolved; unexpected same/replacement-video autoplay cannot overwrite a confirmed pause intent. Every later exact-video manual intent invalidates pending native and in-page resume work; manual seeks preserve the exact native play/pause intent, while automatic AniSkip seeks defer to the farther pending restore target and are forward-only, so neither path can resurrect or rewind playback. Lifecycle pause/stop is recorded in each new navigation request, preserves any farther restore target as seek+pause, gates Play/skip/auto-next dispatch without withholding terminal progress, and reconciles stale page play promises so ON_RESUME cannot resurrect playback. A durable same-origin capture/observer/poll guard covers media created after the initial pause; only an explicit Play mutation releases it, while Pause activates it and seek never releases it. The pre-tick window retains the honest provider handoff; seek, play/pause, speed, caption, and web-volume paths cannot act on an unidentified video. | `fix/embed-concrete-control-readiness` |
 
 ### Pipe, account, synchronization, and update safety
 
 | ID | Status | Fix | Topic branch |
 | --- | --- | --- | --- |
+| DIAG-001 | [x] | Redact signed playback and WebView URLs from user-shareable diagnostics and debug logs. URL-bearing lifecycle, resolver, navigation, native-player, and process-wide playback-service entries retain only a bounded normalized host and stable SHA-256 fingerprint. Remote page titles, WebView error text, HTTP reason phrases, pipe response bodies, and player exception messages are excluded from logs while user-facing errors remain available in the UI. | `fix/embed-diagnostic-url-redaction` |
 | PIPE-001 | [x] | Bind Pipe requests/readiness to a WebView and document generation; cancel displaced requests and reject stale callbacks. | `fix/pipe-request-lifecycle` |
 | PIPE-002 | [x] | Let requests wait for delayed WebView attachment and restart readiness safely after navigation or renderer replacement. | `fix/pipe-request-lifecycle-reviewed` |
 | AUTH-001 | [x] | Bind MAL authorization codes and verifier snapshots to the correct login attempt. | `fix/mal-auth-session-race`, `fix/mal-auth-code-snapshot` |
@@ -76,6 +86,16 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
 | UPDATE-006 | [x] | Keep the repository-administration immutability check as an operator preflight because `GITHUB_TOKEN` cannot read it; require `immutable: true` from the published release and roll back a mutable publication and its generated tag. | `fix/release-immutability-token-scope` |
 | BRAND-001 | [x] | Replace the inherited anime-head launcher artwork, monochrome icon, and TV banner mark with a fork-specific AniLili+ orbit-and-plus identity. | `fix/distinct-rebrand-artwork` |
 
+### Player interface and accessibility
+
+| ID | Status | Fix | Topic branch |
+| --- | --- | --- | --- |
+| UI-001 | [x] | Make adaptive player chrome selection aware of Android font scale. Short inline players now omit metadata before enlarged two-line titles can overlap transport controls, while layouts with enough room retain their compact or cinema presentation. | `fix/player-large-font-overlap` |
+| UI-002 | [x] | Select cinema chrome only when its measured transport clears the footer. Wide players between 280 and 293 dp high now keep the compact layout instead of overlapping the timeline and controls. | `fix/cinema-footer-clearance` |
+| UI-003 | [x] | Gate Android TV embed transport, seeking, automation, and D-pad interception on authenticated bridge availability. Cross-origin providers now get an explicit focus handoff, receive D-pad/Select directly, and return to the app action bar on the first Back press without synthetic taps. | `fix/cross-origin-tv-handoff` |
+| UI-004 | [x] | Reserve one shared, chrome-aware skip/next action slot for native and managed-embed players, including an action-only state while transport chrome auto-hides. Minimal 320 x 180 chrome uses a 48 dp icon target with the full accessible label; compact and cinema chrome retain the full visible pure, mixed, recap, or next-episode label without covering metadata, transport, timeline, or footer controls. | `fix/player-skip-action-layout` |
+| UI-005 | [x] | Describe the global auto-skip preference accurately: pure AniSkip opening/ending markers are preferred, provider times are fallback data, and mixed themes/recaps stay manual. | `fix/aniskip-settings-copy` |
+
 ## Follow-up issue checklist
 
 ### High priority: playback limitations
@@ -84,8 +104,13 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   from reading the actual `<video>` inside many provider iframes. Progress, resume, intro/outro,
   natural end, speed, and caption control remain unavailable there. A reliable solution needs a
   provider `postMessage` contract, a native stream, or an app-controlled player page. The app also
-  cannot enumerate or pause two independent media elements inside an active cross-origin iframe;
-  only whole-WebView pause and blanking during transitions are guaranteed.
+  cannot enumerate or pause two independent media elements inside an active cross-origin iframe.
+  During transitions it can only request an instance-level WebView pause and replace the outgoing
+  document with `about:blank`; it cannot confirm that inaccessible iframe media stopped before the
+  blank document commits. AniSkip is intentionally not queried without a real duration on these
+  embeds. Provider markers are retained, but without observable telemetry they cannot drive
+  app-controlled manual or automatic seeking. Android TV now hands D-pad/Select to the provider
+  explicitly, but the quality of that provider-owned remote interface remains server-dependent.
 
 - [x] **OPEN-002 - Generic web fallback identity.** Generic fallback pages are now explicitly
   unmanaged: they cannot write route-owned progress/history, and cross-origin controls expose only
@@ -117,6 +142,16 @@ comes from a provider, browser security boundary, Cast receiver, or missing devi
   standalone `<audio>` element alongside its video. Generic competing-media protection can classify
   that track as background media and pause it; reliable pairing requires provider metadata or a
   player messaging contract.
+
+- [ ] **OPEN-027 - Community skip-marker coverage.** AniSkip timestamps, segment classifications,
+  and MAL relation rules are community-maintained and may be missing or inaccurate for a particular
+  episode or encode. The app validates duration drift and ranges and preserves provider fallback,
+  but it cannot infer a trustworthy missing opening, ending, mixed segment, or recap locally.
+
+- [ ] **OPEN-028 - Explicit rewind-to-start persistence.** A confirmed managed-embed seek to exactly
+  `0 ms` followed by an immediate exit can retain the previous resume point because zero positions
+  are intentionally excluded from generic final-save paths. Preserving an intentional reset needs a
+  distinct, identity-checked user-seek intent so an unplayed zero sample cannot create history.
 
 - [x] **OPEN-006 - Optimistic manual embed controls.** Seek, play/pause, speed, volume, resume, and
   skip commands now carry a generation, command ID, and media identity. UI state changes only after
@@ -232,6 +267,19 @@ replacements:
   `com.nassimarifette.anililiplus`, `versionCode 31`, 16 KiB ZIP alignment, one signer, and the
   pinned release certificate. Local SHA-256:
   `a131a746387f21bc722930d807fd0063e919e79abef9511ce908675abaf24f44`.
+- [x] Compile the duration-bound AniSkip integration and run 53 focused JVM tests covering API
+  parsing and URLs, relation mapping, duration correction and cache scope, mixed/recap policy,
+  pending and stale publication, and source-policy regressions (July 21, 2026).
+- [x] Compile the transient-duration safety fix and run 15 focused JVM tests covering the exact
+  valid-duration -> `LOADING` -> zero-duration -> publication interleaving, fail-safe defaults, and
+  stale media/generation rejection (July 21, 2026).
+- [x] Compile the active-embed media handoff and run 31 focused JVM tests covering quality URL
+  activation, stale navigation rejection, marker reset/reload, duration-bound publication, mixed
+  segment policy, and hashed cache scope (July 21, 2026).
+- [x] Compile the concrete embed-video handoff and run 62 focused JVM tests covering first-video
+  activation, same-document replacement at equal rounded duration, stale former-video callbacks,
+  navigation/quality changes, command acknowledgement identity, AniSkip publication scope, and raw
+  identity redaction (July 22, 2026).
 - [x] Publish and download GitHub Release `v0.2.0`, then independently verify its sidecar and API
   SHA-256 (`3c0897f11fb5763cf5eb71d51043321fb56b11835d8a5a719ed7e9fd9b45f6ad`),
   package metadata, 16 KiB alignment, and pinned signer (July 21, 2026).
@@ -239,6 +287,11 @@ replacements:
   their release attestation, API digests, sidecar, package metadata, 16 KiB alignment, and pinned
   signer. Published APK SHA-256:
   `a426088687a4c70ddbeb791cd051ae808426aa76e155e6c9a385c0ef7a36bfd5` (July 21, 2026).
+- [x] Publish immutable GitHub Release `v0.2.2`, download both assets, and independently verify the
+  exact `e19b2e8d30a07ce40f3e95512f99f6bb3dc40f44` target, GitHub asset digest, checksum sidecar,
+  package `com.nassimarifette.anililiplus`, version code 31, 16 KiB alignment, and pinned signer.
+  Published APK SHA-256:
+  `a0c639fc93eb6d5baefb040321bb89fd68fd3af051032b151df975f8811b89b2` (July 21, 2026).
 - [ ] Validate rapid Watch A -> B transitions, embed/native handoff, pause/seek/exit resume,
   intro/outro, an airing show's latest episode, the actual series finale, Cast, renderer loss,
   account replacement, and provider exhaustion on a real device or emulator.

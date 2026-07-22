@@ -235,7 +235,14 @@ fun SettingsScreen(
         ) {
             item { SettingsSectionTitle("Playback") }
             item { SettingSwitch("Autoplay next episode", "Continue automatically", autoplay, SettingsStore::setAutoplay) }
-            item { SettingSwitch("Auto-skip intro and outro", "Use provider skip times when available", autoSkip, SettingsStore::setAutoSkipIntroOutro) }
+            item {
+                SettingSwitch(
+                    "Auto-skip intro and outro",
+                    "Use pure AniSkip markers, with provider times as fallback",
+                    autoSkip,
+                    SettingsStore::setAutoSkipIntroOutro,
+                )
+            }
             item {
                 DefaultQualitySetting(
                     selected = defaultQuality,

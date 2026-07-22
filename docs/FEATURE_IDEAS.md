@@ -41,6 +41,10 @@ impact, with playback reliability and continuity first. Bugs and technical defec
 
 ## P1 - Player experience
 
+- [ ] Split the current safe auto-skip preference into independent opening and ending toggles while
+  keeping mixed themes and recaps manual by default.
+- [ ] Add optional AnimeThemes credits and previews to episode/theme discovery without using
+  theme media as episode-specific skip timing.
 - [ ] Add real Picture-in-Picture entry with media actions and automatic aspect-ratio updates.
 - [ ] Add per-series defaults for sub/dub, audio language, subtitle language, playback speed, and
   preferred provider.

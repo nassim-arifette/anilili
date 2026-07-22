@@ -20,29 +20,18 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Fullscreen
-import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.TouchApp
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -59,7 +48,6 @@ import androidx.compose.runtime.key as compositionKey
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -67,13 +55,13 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import com.miruronative.data.model.AniSkipPlaybackSegment
 import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.settings.CaptionEdgeStyle
@@ -81,6 +69,7 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.CrashReporter
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
@@ -109,6 +98,10 @@ fun EmbedWebView(
     qualityStreams: List<StreamItem> = emptyList(),
     startPositionMs: Long = 0L,
     skip: SkipTimes? = null,
+    aniSkipSegments: List<AniSkipPlaybackSegment> = emptyList(),
+    aniSkipLookupStatus: AniSkipLookupStatus = AniSkipLookupStatus.AWAITING_DURATION,
+    seriesTitle: String? = null,
+    episodeTitle: String? = null,
     onPreviousEpisode: ((EmbedPlaybackKey) -> Unit)? = null,
     onNextEpisode: ((EmbedPlaybackKey) -> Unit)? = null,
     hasPreviousEpisode: Boolean = false,
@@ -117,7 +110,8 @@ fun EmbedWebView(
     isFullscreen: Boolean = false,
     onToggleFullscreen: (() -> Unit)? = null,
     onFullscreenChanged: (Boolean) -> Unit = {},
-    onProgress: ((EmbedPlaybackKey, Long, Long) -> Unit)? = null,
+    onActiveMediaChanged: ((EmbedMediaIdentity) -> Unit)? = null,
+    onProgress: ((EmbedMediaIdentity, Long, Long) -> Unit)? = null,
     onPlaybackEnded: ((EmbedPlaybackCompletion) -> Boolean)? = null,
     onPlaybackError: ((EmbedPlaybackKey, String, String, Long) -> Unit)? = null,
     onPlaybackStopperChanged: (((() -> Unit)?) -> Unit)? = null,
@@ -142,6 +136,7 @@ fun EmbedWebView(
     // The speed to restore once a hold-for-2x gesture ends (the user's chosen playback speed).
     var preHoldSpeed by remember(playbackKey, url) { mutableStateOf(1f) }
     var pendingSeekMs by remember(playbackKey, url, startPositionMs) { mutableLongStateOf(startPositionMs) }
+    var pendingResumeDesiredPlaying by remember(playbackKey, url) { mutableStateOf(true) }
     val allowedHost = remember(activeUrl) {
         runCatching { Uri.parse(activeUrl).host }.getOrNull()?.lowercase()?.removePrefix("www.")
     }
@@ -166,8 +161,22 @@ fun EmbedWebView(
                 documentUrl = requestedDocumentUrl,
                 allowedMainFrameHost = allowedHost,
                 resumePositionMs = if (playbackMode.restoresPosition) pendingSeekMs else 0L,
+                resumeDesiredPlaying = embedNavigationDesiredPlaying(
+                    pendingDesiredPlaying = pendingResumeDesiredPlaying,
+                    lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+                ),
             ),
         )
+    }
+    val activeDocumentMediaIdentity = remember(navigationIdentity, navigationSession.generation) {
+        EmbedMediaIdentity(
+            playbackKey = playbackKey,
+            navigationGeneration = navigationSession.generation,
+            documentMediaId = activeUrl,
+        )
+    }
+    var activeConcreteMediaIdentity by remember(navigationSession.generation) {
+        mutableStateOf<EmbedMediaIdentity?>(null)
     }
     var webPlaybackAvailable by remember(navigationSession.generation) { mutableStateOf(false) }
     var loadError by remember(navigationSession.generation) { mutableStateOf<String?>(null) }
@@ -175,6 +184,7 @@ fun EmbedWebView(
     var finishedUrl by remember(navigationSession.generation) { mutableStateOf<String?>(null) }
     val currentOnPlaybackStopperChanged by rememberUpdatedState(onPlaybackStopperChanged)
     val currentOnFullscreenChanged by rememberUpdatedState(onFullscreenChanged)
+    val currentOnActiveMediaChanged by rememberUpdatedState(onActiveMediaChanged)
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnPlaybackEnded by rememberUpdatedState(onPlaybackEnded)
     val currentOnPreviousEpisode by rememberUpdatedState(onPreviousEpisode)
@@ -186,18 +196,62 @@ fun EmbedWebView(
     // third-party iframe from forging callbacks; the navigation token rejects superseded pages.
     val progressBridgeToken = remember { UUID.randomUUID().toString() }
     val currentNavigationSession by rememberUpdatedState(navigationSession)
+    val currentDocumentMediaIdentity by rememberUpdatedState(activeDocumentMediaIdentity)
     // The WebView is built once, so the remote handler below has to read this live rather than
     // capture the value it was created with.
     val currentPlayerOwnsRemote by rememberUpdatedState(focusPlayerOnStart)
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val commandCoordinator = remember { EmbedCommandCoordinator() }
+    val resumeCoordinator = remember(navigationSession.generation) {
+        EmbedResumeCoordinator(
+            initialTargetPositionMs = navigationSession.request.resumePositionMs,
+            initialDesiredPlaying = navigationSession.request.resumeDesiredPlaying,
+        )
+    }
     val pendingCommandCallbacks = remember {
         mutableMapOf<Long, (EmbedCommandResolution) -> Unit>()
     }
     var positionMs by remember(playbackKey, url) { mutableLongStateOf(startPositionMs) }
     var durationMs by remember(playbackKey, url) { mutableLongStateOf(0L) }
     var webIsPlaying by remember(playbackKey, url) { mutableStateOf(false) }
-    var webMediaIdentity by remember(playbackKey, url) { mutableStateOf<String?>(null) }
+    var webMediaIdentity by remember(playbackKey, url) { mutableStateOf<EmbedVideoIdentity?>(null) }
+    var confirmedMediaInstanceId by remember(navigationSession.generation) {
+        mutableStateOf<String?>(null)
+    }
+    var resumeRetrySignal by remember(navigationSession.generation) { mutableIntStateOf(0) }
+    var resumeRetryMediaIdentity by remember(navigationSession.generation) {
+        mutableStateOf<EmbedVideoIdentity?>(null)
+    }
+    var lifecyclePlaybackAllowed by remember(lifecycleOwner) {
+        mutableStateOf(shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState))
+    }
+    var lifecycleSupersededAutomaticResume by remember(navigationSession.generation) {
+        mutableStateOf(
+            shouldSuppressEmbedAutomaticResume(
+                requestDesiredPlaying = navigationSession.request.resumeDesiredPlaying,
+                lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+            ),
+        )
+    }
+    val currentLifecyclePlaybackAllowed by rememberUpdatedState(lifecyclePlaybackAllowed)
+    val currentLifecycleSupersededAutomaticResume by rememberUpdatedState(
+        lifecycleSupersededAutomaticResume,
+    )
+    val currentSuspendAutomaticResume by rememberUpdatedState<() -> Unit>(
+        newValue = {
+            lifecyclePlaybackAllowed = false
+            lifecycleSupersededAutomaticResume = true
+            pendingResumeDesiredPlaying = false
+            webIsPlaying = false
+            resumeRetryMediaIdentity = null
+            webMediaIdentity?.takeIf { it.isValid }?.let { mediaIdentity ->
+                resumeCoordinator.suppressAutomaticPlayback(
+                    mediaIdentity,
+                    positionMs,
+                )
+            }
+        },
+    )
     var webVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     var lastAudibleVolume by remember(playbackKey, url) { mutableStateOf(1f) }
     // Cross-origin embeds (some Kiwi mirrors) put the video out of the injected JS's reach, so
@@ -216,55 +270,178 @@ fun EmbedWebView(
     // While set, the page owns touches again: our overlay steps aside so the provider's own bar —
     // the only scrubber those servers give us — is reachable, then we take the screen back.
     var providerControlsMode by remember(playbackKey, url) { mutableStateOf(false) }
+    var tvProviderHandoffReady by remember(navigationSession.generation) { mutableStateOf(false) }
     val tvPlayPauseFocus = remember { FocusRequester() }
+    val tvProviderHandoffFocus = remember { FocusRequester() }
     val currentPositionMs by rememberUpdatedState(positionMs)
     val currentOnPlaybackError by rememberUpdatedState(onPlaybackError)
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
     val autoplay by SettingsStore.autoplay.collectAsState()
     val captionStyle by SettingsStore.captionStyle.collectAsState()
-    val introStartMs = skip?.introStart?.times(1000)?.toLong() ?: 0L
-    val introEndMs = skip?.introEnd?.times(1000)?.toLong()
-    val outroStartMs = skip?.outroStart?.times(1000)?.toLong()
-    val outroEndMs = skip?.outroEnd?.times(1000)?.toLong()
-    var introAutoSkipped by remember(navigationSession.generation, introStartMs, introEndMs) {
+    LaunchedEffect(activeDocumentMediaIdentity, playbackMode.exposesNativeBridge) {
+        if (playbackMode.exposesNativeBridge) {
+            currentOnActiveMediaChanged?.invoke(activeDocumentMediaIdentity)
+        }
+    }
+    val skipPlan = remember(skip, aniSkipSegments, aniSkipLookupStatus) {
+        buildPlaybackSkipPlan(skip, aniSkipSegments, aniSkipLookupStatus)
+    }
+    val automaticOpening = skipPlan.automaticOpening
+    val automaticEnding = skipPlan.automaticEnding
+    val introStartMs = automaticOpening?.startMs ?: 0L
+    val introEndMs = automaticOpening?.endMs
+    val outroStartMs = automaticEnding?.startMs
+    val outroEndMs = automaticEnding?.endMs
+    val concreteVideoGeneration = activeConcreteMediaIdentity?.videoIdentity?.generation ?: 0L
+    var introAutoSkipped by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        introStartMs,
+        introEndMs,
+    ) {
         mutableStateOf(false)
     }
-    var introAutoSkipPending by remember(navigationSession.generation, introStartMs, introEndMs) {
+    var introAutoSkipPending by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        introStartMs,
+        introEndMs,
+    ) {
         mutableStateOf(false)
     }
-    var introAutoSkipAttempt by remember(navigationSession.generation, introStartMs, introEndMs) {
+    var introAutoSkipAttempt by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        introStartMs,
+        introEndMs,
+    ) {
         mutableIntStateOf(0)
     }
-    var outroAutoHandled by remember(navigationSession.generation, outroStartMs, outroEndMs) {
+    var outroAutoHandled by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        outroStartMs,
+        outroEndMs,
+    ) {
         mutableStateOf(false)
     }
-    var outroAutoSkipPending by remember(navigationSession.generation, outroStartMs, outroEndMs) {
+    var outroAutoSkipPending by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        outroStartMs,
+        outroEndMs,
+    ) {
         mutableStateOf(false)
     }
-    var outroAutoSkipAttempt by remember(navigationSession.generation, outroStartMs, outroEndMs) {
+    var outroAutoSkipAttempt by remember(
+        navigationSession.generation,
+        concreteVideoGeneration,
+        outroStartMs,
+        outroEndMs,
+    ) {
         mutableIntStateOf(0)
     }
     val autoAdvanceGate = remember { EmbedAutoAdvanceGate() }
     // The concrete WebView and Java bridge live across URL changes. Updated handlers make their
     // callbacks target the current navigation's state, while the bridge token rejects old pages.
     val currentWebTickHandler by rememberUpdatedState<(
-        String, Double, Double, Boolean, Boolean, Double, String,
+        String, Double, Double, Boolean, Boolean, Double, String, Long,
     ) -> Unit>(
-        newValue = { navigationToken, positionSec, durationSec, isPlaying, muted, volume, mediaIdentity ->
+        newValue = tick@{
+                navigationToken,
+                positionSec,
+                durationSec,
+                isPlaying,
+                muted,
+                volume,
+                mediaIdentity,
+                mediaGeneration,
+            ->
             if (
                 navigationGuard.acceptsBridgeToken(navigationToken) &&
                 positionSec >= 0 &&
                 durationSec > 0
             ) {
+                val concreteIdentity = currentDocumentMediaIdentity.copy(
+                    videoIdentity = EmbedVideoIdentity(mediaIdentity, mediaGeneration),
+                )
+                when (
+                    planEmbedMediaHandoff(
+                        active = activeConcreteMediaIdentity,
+                        reported = concreteIdentity,
+                        currentPlaybackKey = currentPlaybackKey,
+                    )
+                ) {
+                    EmbedMediaHandoffDecision.REJECT -> {
+                        DiagnosticsLog.event(
+                            "EmbedWebView ignored stale video tick " +
+                                "navigation=$navigationToken videoGeneration=$mediaGeneration",
+                        )
+                        return@tick
+                    }
+                    EmbedMediaHandoffDecision.KEEP -> Unit
+                    EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP -> {
+                        // The ViewModel handoff is deliberately synchronous and precedes every
+                        // state/progress write. This clears markers and cancels the former lookup
+                        // before the replacement video's first duration can schedule another one.
+                        activeConcreteMediaIdentity = concreteIdentity
+                        webMediaIdentity = concreteIdentity.videoIdentity
+                        if (playbackMode.exposesNativeBridge) {
+                            currentOnActiveMediaChanged?.invoke(concreteIdentity)
+                        }
+                    }
+                }
                 val nextPositionMs = (positionSec * 1000).toLong()
                 val nextDurationMs = (durationSec * 1000).toLong()
+                resumeCoordinator.observe(
+                    mediaIdentity = checkNotNull(concreteIdentity.videoIdentity),
+                    positionMs = nextPositionMs,
+                    isPlaying = isPlaying,
+                )
+                // Read the Compose state directly so an explicit user command releases the latch
+                // immediately, even if its JavaScript acknowledgement beats recomposition.
+                val lifecycleTickPolicy = planEmbedLifecycleTick(
+                    reportedPlaying = isPlaying,
+                    lifecyclePlaybackAllowed = lifecyclePlaybackAllowed,
+                    automaticResumeSuppressed = lifecycleSupersededAutomaticResume,
+                )
+                if (
+                    !lifecyclePlaybackAllowed ||
+                    lifecycleSupersededAutomaticResume
+                ) {
+                    val observedIdentity = checkNotNull(concreteIdentity.videoIdentity)
+                    resumeCoordinator.suppressAutomaticPlayback(
+                        observedIdentity,
+                        nextPositionMs,
+                    )
+                }
+                if (lifecycleTickPolicy.reassertPause) {
+                    runCatching { webView?.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
+                    val observedIdentity = checkNotNull(concreteIdentity.videoIdentity)
+                    if (
+                        lifecyclePlaybackAllowed &&
+                        shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState) &&
+                        resumeCoordinator.canSchedulePausedRestore(observedIdentity)
+                    ) {
+                        resumeRetrySignal += 1
+                    }
+                }
                 positionMs = nextPositionMs
                 durationMs = nextDurationMs
-                webIsPlaying = isPlaying
-                webMediaIdentity = mediaIdentity.takeIf(String::isNotBlank)
+                webIsPlaying = lifecycleTickPolicy.acceptPlaying
+                webMediaIdentity = concreteIdentity.videoIdentity
                 webVolume = if (muted) 0f else volume.toFloat().coerceIn(0f, 1f)
-                if (playbackMode.exposesNativeBridge && isPlaying && nextPositionMs > 0L) {
-                    currentOnProgress?.invoke(playbackKey, nextPositionMs, nextDurationMs)
+                if (
+                    playbackMode.exposesNativeBridge &&
+                    lifecycleTickPolicy.acceptPlaying &&
+                    nextPositionMs > 0L
+                ) {
+                    confirmedMediaInstanceId = concreteIdentity.mediaInstanceId
+                    currentOnProgress?.invoke(
+                        concreteIdentity,
+                        nextPositionMs,
+                        nextDurationMs,
+                    )
                 }
             }
         },
@@ -272,11 +449,36 @@ fun EmbedWebView(
     val currentWebVideoAvailableHandler by rememberUpdatedState<(String) -> Unit> { navigationToken ->
         if (navigationGuard.acceptsBridgeToken(navigationToken)) webPlaybackAvailable = true
     }
-    val currentWebEndedHandler by rememberUpdatedState<(String, Double, Double, Int) -> Unit>(
-        newValue = { navigationToken, positionSec, durationSec, observedPlayingSamples ->
+    val currentWebEndedHandler by rememberUpdatedState<(
+        String, Double, Double, Int, String, Long,
+    ) -> Unit>(
+        newValue = ended@{
+                navigationToken,
+                positionSec,
+                durationSec,
+                observedPlayingSamples,
+                mediaIdentity,
+                mediaGeneration,
+            ->
             if (!navigationGuard.acceptsBridgeToken(navigationToken)) {
                 DiagnosticsLog.event("EmbedWebView ignored stale ended token=$navigationToken")
             } else {
+                val reportedIdentity = currentDocumentMediaIdentity.copy(
+                    videoIdentity = EmbedVideoIdentity(mediaIdentity, mediaGeneration),
+                )
+                if (
+                    !acceptsEmbedMediaCallback(
+                        reported = reportedIdentity,
+                        active = activeConcreteMediaIdentity,
+                        currentPlaybackKey = currentPlaybackKey,
+                    )
+                ) {
+                    DiagnosticsLog.event(
+                        "EmbedWebView ignored stale video end token=$navigationToken " +
+                            "videoGeneration=$mediaGeneration",
+                    )
+                    return@ended
+                }
                 val sample = embedEndSampleFromSeconds(positionSec, durationSec, observedPlayingSamples)
                 if (sample == null || !isLikelyEmbedContentEnd(sample)) {
                     DiagnosticsLog.event(
@@ -293,13 +495,24 @@ fun EmbedWebView(
                         durationMs = sample.durationMs,
                         observedPlayingSamples = sample.observedPlayingSamples,
                     )
+                    val lifecycleAllowsNavigation = canNavigateAfterEmbedEnd(
+                        lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+                        automaticResumeSuppressed = lifecycleSupersededAutomaticResume,
+                    )
                     val committed = finalizeEmbedCompletionThenNavigate(
                         completion = completion,
                         shouldNavigate =
-                            autoplay && currentHasNextEpisode && currentOnNextEpisode != null,
+                            autoplay &&
+                                currentHasNextEpisode &&
+                                currentOnNextEpisode != null &&
+                                lifecycleAllowsNavigation,
                         commit = currentOnPlaybackEnded ?: { false },
                         navigate = {
                             if (
+                                canNavigateAfterEmbedEnd(
+                                    lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+                                    automaticResumeSuppressed = lifecycleSupersededAutomaticResume,
+                                ) &&
                                 autoAdvanceGate.tryAdvance(
                                     navigationToken = navigationToken,
                                     autoplay = true,
@@ -329,14 +542,27 @@ fun EmbedWebView(
         Double,
         Boolean,
         String,
+        Long,
     ) -> Unit>(
-        newValue = { navigationToken, commandId, succeeded, positionSec, isPlaying, mediaIdentity ->
+        newValue = {
+                navigationToken,
+                commandId,
+                succeeded,
+                positionSec,
+                isPlaying,
+                mediaIdentity,
+                mediaGeneration,
+            ->
             if (!navigationGuard.acceptsBridgeToken(navigationToken)) {
                 DiagnosticsLog.event("EmbedWebView ignored stale command ack token=$navigationToken")
             } else {
                 val id = commandId.toLongOrNull()
                 val generation = navigationToken.toLongOrNull()
                 if (id != null && generation != null) {
+                    val acknowledgedMediaIdentity = EmbedVideoIdentity(
+                        mediaId = mediaIdentity,
+                        generation = mediaGeneration,
+                    ).takeIf { it.isValid }
                     val resolution = commandCoordinator.acknowledge(
                         EmbedCommandAcknowledgement(
                             commandId = id,
@@ -344,9 +570,10 @@ fun EmbedWebView(
                             succeeded = succeeded,
                             positionMs = (positionSec * 1_000.0).toLong().coerceAtLeast(0L),
                             isPlaying = isPlaying,
-                            mediaIdentity = mediaIdentity,
+                            mediaIdentity = acknowledgedMediaIdentity,
                         ),
                         nowMs = SystemClock.uptimeMillis(),
+                        activeMediaIdentity = webMediaIdentity,
                     )
                     if (resolution !is EmbedCommandResolution.Ignored) {
                         pendingCommandCallbacks.remove(id)?.invoke(resolution)
@@ -355,35 +582,135 @@ fun EmbedWebView(
             }
         },
     )
-    val requestSeek: (Long?, ((Boolean) -> Unit)?) -> Boolean = { target, onResult ->
-        if (target == null) false else dispatchWebCommand(
-            webView = webView,
-            session = navigationSession,
-            guard = navigationGuard,
-            coordinator = commandCoordinator,
-            callbacks = pendingCommandCallbacks,
-            handler = mainHandler,
-            kind = EmbedCommandKind.SEEK,
-            mediaIdentity = webMediaIdentity,
-            script = { commandId ->
-                seekVideoCommandJs(
-                    targetSec = target / 1_000.0,
-                    navigationGeneration = navigationSession.generation,
-                    capabilityToken = progressBridgeToken,
-                    commandId = commandId,
-                    expectedMediaIdentity = webMediaIdentity,
-                )
-            },
-            onResolved = { resolution ->
-                val acknowledgement = (resolution as? EmbedCommandResolution.Confirmed)
-                    ?.acknowledgement
-                val confirmed = acknowledgement?.succeeded == true
-                if (confirmed) positionMs = acknowledgement.positionMs
-                onResult?.invoke(confirmed)
-            },
+    val managedControlsReady: () -> Boolean = {
+        canUseManagedEmbedControls(
+            managedControlsDeclared = playbackMode.controlsPlayback,
+            bridgePlaybackAvailable = webPlaybackAvailable,
+            activeMediaIdentity = activeConcreteMediaIdentity,
+            reportedMediaIdentity = webMediaIdentity,
         )
     }
-    val requestTogglePlayback: () -> Boolean = {
+    val dispatchSeek: (Long?, Boolean, Boolean, ((Boolean) -> Unit)?) -> Boolean =
+        { target, forwardOnly, desiredPlaying, onResult ->
+            if (target == null || !managedControlsReady()) {
+                onResult?.invoke(false)
+                false
+            } else {
+                val expectedMedia = webMediaIdentity?.takeIf { it.isValid }
+                if (expectedMedia == null) {
+                    onResult?.invoke(false)
+                    false
+                } else {
+                    dispatchWebCommand(
+                        webView = webView,
+                        session = navigationSession,
+                        guard = navigationGuard,
+                        coordinator = commandCoordinator,
+                        callbacks = pendingCommandCallbacks,
+                        handler = mainHandler,
+                        kind = EmbedCommandKind.SEEK,
+                        mediaIdentity = expectedMedia,
+                        script = { commandId ->
+                            seekVideoCommandJs(
+                                targetSec = target / 1_000.0,
+                                navigationGeneration = navigationSession.generation,
+                                capabilityToken = progressBridgeToken,
+                                commandId = commandId,
+                                expectedMediaIdentity = expectedMedia.mediaId,
+                                 expectedMediaGeneration = expectedMedia.generation,
+                                 forwardOnly = forwardOnly,
+                                 desiredPlaying = desiredPlaying,
+                            )
+                        },
+                        onResolved = { resolution ->
+                            val acknowledgement = (resolution as? EmbedCommandResolution.Confirmed)
+                                ?.acknowledgement
+                            val confirmed = acknowledgement?.succeeded == true
+                            if (confirmed) {
+                                positionMs = acknowledgement.positionMs
+                                resumeCoordinator.supersedeWithPlaybackIntent(
+                                    expectedMedia,
+                                    acknowledgement.positionMs,
+                                    desiredPlaying = acknowledgement.isPlaying,
+                                )
+                            }
+                            if (playbackMode.exposesNativeBridge) {
+                                confirmedProgressAfterEmbedSeek(
+                                    resolution = resolution,
+                                    activeMediaIdentity = activeConcreteMediaIdentity,
+                                    currentPlaybackKey = currentPlaybackKey,
+                                    confirmedMediaInstanceId = confirmedMediaInstanceId,
+                                    durationMs = durationMs,
+                                )?.let { progress ->
+                                    currentOnProgress?.invoke(
+                                        progress.identity,
+                                        progress.positionMs,
+                                        progress.durationMs,
+                                    )
+                                }
+                            }
+                            onResult?.invoke(confirmed)
+                        },
+                    )
+                }
+            }
+        }
+    val requestUserSeek: (Long) -> Boolean = userSeek@{ target ->
+        if (!currentLifecyclePlaybackAllowed || !managedControlsReady()) return@userSeek false
+        val expectedMedia = webMediaIdentity?.takeIf { it.isValid } ?: return@userSeek false
+        // Seeking preserves the current play/pause intent and must never release a pause latch.
+        val desiredPlaying = webIsPlaying && !lifecycleSupersededAutomaticResume
+        pendingResumeDesiredPlaying = desiredPlaying
+        resumeCoordinator.supersedeWithPlaybackIntent(
+            expectedMedia,
+            target,
+            desiredPlaying = desiredPlaying,
+        )
+        dispatchSeek(target, false, desiredPlaying, null)
+    }
+    val requestAutomatedSeek: (Long?, ((Boolean) -> Unit)?) -> Boolean = automatedSeek@{ target, onResult ->
+        if (
+            target == null ||
+            !currentLifecyclePlaybackAllowed ||
+            currentLifecycleSupersededAutomaticResume ||
+            !managedControlsReady()
+        ) {
+            return@automatedSeek false
+        }
+        val expectedMedia = webMediaIdentity?.takeIf { it.isValid }
+        if (expectedMedia == null) {
+            return@automatedSeek false
+        }
+        when (resumeCoordinator.planAutomatedSeek(expectedMedia, target)) {
+            EmbedAutomatedSeekDecision.REJECT -> false
+            EmbedAutomatedSeekDecision.DEFER_TO_PENDING_RESUME -> {
+                // The pending resume now owns the farther of its saved target and this skip end.
+                // Keep retrying the marker until resume proves that target or exhausts; never mark
+                // the skip handled optimistically when no page mutation was acknowledged.
+                onResult?.invoke(false)
+                true
+            }
+            EmbedAutomatedSeekDecision.DISPATCH -> {
+                resumeCoordinator.supersedeWithPlaybackIntent(
+                    expectedMedia,
+                    target,
+                    desiredPlaying = webIsPlaying,
+                )
+                dispatchSeek(target, true, webIsPlaying, onResult)
+            }
+        }
+    }
+    val requestTogglePlayback: () -> Boolean = requestToggle@{
+        if (!currentLifecyclePlaybackAllowed || !managedControlsReady()) return@requestToggle false
+        val expectedMedia = webMediaIdentity?.takeIf { it.isValid } ?: return@requestToggle false
+        val desiredPlaying = !webIsPlaying
+        lifecycleSupersededAutomaticResume = !desiredPlaying
+        pendingResumeDesiredPlaying = desiredPlaying
+        resumeCoordinator.supersedeWithPlaybackIntent(
+            expectedMedia,
+            positionMs,
+            desiredPlaying = desiredPlaying,
+        )
         dispatchWebCommand(
             webView = webView,
             session = navigationSession,
@@ -392,13 +719,14 @@ fun EmbedWebView(
             callbacks = pendingCommandCallbacks,
             handler = mainHandler,
             kind = EmbedCommandKind.TOGGLE_PLAYBACK,
-            mediaIdentity = webMediaIdentity,
+            mediaIdentity = expectedMedia,
             script = { commandId ->
                 togglePlaybackCommandJs(
                     navigationGeneration = navigationSession.generation,
                     capabilityToken = progressBridgeToken,
                     commandId = commandId,
-                    expectedMediaIdentity = webMediaIdentity,
+                    expectedMediaIdentity = expectedMedia.mediaId,
+                    expectedMediaGeneration = expectedMedia.generation,
                 )
             },
             onResolved = { resolution ->
@@ -407,6 +735,13 @@ fun EmbedWebView(
                 if (acknowledgement?.succeeded == true) {
                     webIsPlaying = acknowledgement.isPlaying
                     positionMs = acknowledgement.positionMs
+                    lifecycleSupersededAutomaticResume = !acknowledgement.isPlaying
+                    pendingResumeDesiredPlaying = acknowledgement.isPlaying
+                    resumeCoordinator.supersedeWithPlaybackIntent(
+                        expectedMedia,
+                        acknowledgement.positionMs,
+                        desiredPlaying = acknowledgement.isPlaying,
+                    )
                 }
             },
         )
@@ -420,6 +755,21 @@ fun EmbedWebView(
     val currentToggleWebPlayback by rememberUpdatedState<(String) -> Unit> { navigationToken ->
         if (navigationGuard.acceptsBridgeToken(navigationToken)) requestTogglePlayback()
     }
+    val currentRevealProviderHandoff by rememberUpdatedState<(String) -> Unit> { navigationToken ->
+        if (navigationGuard.acceptsBridgeToken(navigationToken)) {
+            providerControlsMode = false
+            tvProviderHandoffReady = true
+            fallbackInteraction++
+        }
+    }
+    val currentRecoverFromProviderControls by rememberUpdatedState<(String) -> Unit> { navigationToken ->
+        if (navigationGuard.acceptsBridgeToken(navigationToken)) {
+            DiagnosticsLog.event("EmbedWebView TV provider controls returned to app")
+            providerControlsMode = false
+            tvProviderHandoffReady = true
+            fallbackInteraction++
+        }
+    }
 
     DisposableEffect(webView) {
         val web = webView
@@ -427,13 +777,25 @@ fun EmbedWebView(
         onDispose { currentOnPlaybackStopperChanged?.invoke(null) }
     }
 
+    val canControlPlayback = managedControlsReady()
+    val controlledMediaInstanceId = activeConcreteMediaIdentity?.mediaInstanceId
+    val canAutomatePlayback = canControlPlayback && playbackMode.automatesEpisode
     // Full touch controls — seek bar and all — whenever the injected JS can reach the <video>.
-    val touchControlsActive =
-        playbackMode.controlsPlayback && !device.isTv && webPlaybackAvailable && loadError == null
+    val touchControlsActive = canControlPlayback && !device.isTv && loadError == null
     // Everything else: the page is out of reach, so this bar carries only what the app itself can
-    // answer — episode moves, settings, fullscreen — plus a play/pause relayed as a real touch.
+    // answer — episode moves, device-volume settings, fullscreen, and an honest provider hand-off.
     val fallbackControlsActive =
-        playbackMode.controlsPlayback && !device.isTv && !webPlaybackAvailable && loadError == null
+        playbackMode.controlsPlayback && !device.isTv && !canControlPlayback && loadError == null
+    val tvControlPolicy = embedTvControlPolicy(
+        playerOwnsRemote = device.isTv && focusPlayerOnStart,
+        managedControlsDeclared = playbackMode.controlsPlayback,
+        bridgeAvailable = canControlPlayback,
+        providerControlsMode = providerControlsMode,
+        automationSupported = canAutomatePlayback,
+        settingsSupported = playbackMode.controlsPlayback,
+        fullscreenSupported = onToggleFullscreen != null,
+    )
+    val currentTvControlPolicy by rememberUpdatedState(tvControlPolicy)
 
     LaunchedEffect(
         navigationSession.generation,
@@ -465,20 +827,79 @@ fun EmbedWebView(
     // the screen back on roughly that beat.
     LaunchedEffect(navigationSession.generation, providerControlsMode) {
         if (!providerControlsMode) return@LaunchedEffect
+        // Touch providers hide their chrome after a short idle period. TV providers keep the D-pad
+        // until Back explicitly returns focus to the app handoff; a timer would steal the remote.
+        if (device.isTv) return@LaunchedEffect
         delay(8_000)
         providerControlsMode = false
     }
 
-    LaunchedEffect(navigationSession.generation, tvControlsVisible, focusPlayerOnStart) {
-        if (!tvControlsVisible || !focusPlayerOnStart) return@LaunchedEffect
+    // Avoid flashing the handoff over a quickly discovered same-origin video. A remote key reveals
+    // it immediately, and this bounded delay still makes a slow or never-finished cross-origin page
+    // reachable. If a controllable video appears later, native TV transport takes over.
+    LaunchedEffect(navigationSession.generation, webView, device.isTv) {
+        if (!device.isTv || webView == null) return@LaunchedEffect
+        delay(1_200)
+        tvProviderHandoffReady = true
+    }
+
+    val tvProviderHandoffVisible = tvProviderHandoffReady &&
+        loadError == null &&
+        tvControlPolicy.showsProviderHandoff
+
+    LaunchedEffect(
+        navigationSession.generation,
+        tvProviderHandoffVisible,
+        fallbackInteraction,
+        settingsSheetVisible,
+        captionAppearanceVisible,
+    ) {
+        if (
+            !tvProviderHandoffVisible ||
+            settingsSheetVisible ||
+            captionAppearanceVisible
+        ) {
+            return@LaunchedEffect
+        }
+        delay(32)
+        runCatching { tvProviderHandoffFocus.requestFocus() }
+    }
+
+    LaunchedEffect(tvControlPolicy.showsAppTransport) {
+        if (!tvControlPolicy.showsAppTransport) tvControlsVisible = false
+    }
+
+    LaunchedEffect(
+        navigationSession.generation,
+        tvControlsVisible,
+        focusPlayerOnStart,
+        tvControlPolicy.showsAppTransport,
+    ) {
+        if (
+            !tvControlsVisible ||
+            !focusPlayerOnStart ||
+            !tvControlPolicy.showsAppTransport
+        ) {
+            return@LaunchedEffect
+        }
         delay(32)
         runCatching { tvPlayPauseFocus.requestFocus() }
     }
     val screenReaderActive = rememberScreenReaderActive()
     // TalkBack users can't discover the hidden control row through a key press, so present it
     // as soon as the fullscreen player opens instead of waiting for the semantic reveal action.
-    LaunchedEffect(screenReaderActive, focusPlayerOnStart, navigationSession.generation) {
-        if (device.isTv && screenReaderActive && focusPlayerOnStart) {
+    LaunchedEffect(
+        screenReaderActive,
+        focusPlayerOnStart,
+        navigationSession.generation,
+        tvControlPolicy.showsAppTransport,
+    ) {
+        if (
+            device.isTv &&
+            screenReaderActive &&
+            focusPlayerOnStart &&
+            tvControlPolicy.showsAppTransport
+        ) {
             tvControlsVisible = true
         }
     }
@@ -527,12 +948,16 @@ fun EmbedWebView(
 
     LaunchedEffect(navigationSession.generation) {
         DiagnosticsLog.event(
-            "EmbedWebView composed urlHost=${allowedHost ?: "unknown"} " +
-                "generation=${navigationSession.generation} refererHost=${activeReferer.hostOrNone()}",
+            "EmbedWebView composed document=${privacySafeUrlDiagnosticLabel(activeUrl)} " +
+                "generation=${navigationSession.generation} " +
+                "referer=${privacySafeUrlDiagnosticLabel(activeReferer)}",
         )
         delay(10_000)
         if (finishedUrl == null && loadError == null) {
-            DiagnosticsLog.event("EmbedWebView still loading after 10000ms urlHost=${allowedHost ?: "unknown"}")
+            DiagnosticsLog.event(
+                "EmbedWebView still loading after 10000ms " +
+                    privacySafeUrlDiagnosticLabel(activeUrl),
+            )
         }
     }
     // The navigation session locks its main frame after the accepted finish callback: later
@@ -541,11 +966,129 @@ fun EmbedWebView(
     // (history.replaceState), which must not re-trigger the explicit app navigation.
     val lastRequestedGeneration = remember { object { var value: Long = 0L } }
 
-    LaunchedEffect(webPlaybackAvailable, playbackSpeed, webView, navigationSession.generation) {
+    LaunchedEffect(
+        canControlPlayback,
+        controlledMediaInstanceId,
+        lifecyclePlaybackAllowed,
+        lifecycleSupersededAutomaticResume,
+        resumeRetrySignal,
+        webView,
+        navigationSession.generation,
+    ) {
+        if (
+            !canDispatchEmbedResume(
+                lifecyclePlaybackAllowed = lifecyclePlaybackAllowed &&
+                    shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState),
+                controlsReady = canControlPlayback,
+                navigationCurrent = navigationGuard.isCurrent(navigationSession),
+            )
+        ) {
+            return@LaunchedEffect
+        }
         val web = webView ?: return@LaunchedEffect
-        if (!webPlaybackAvailable || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
+        val expectedMedia = webMediaIdentity ?: return@LaunchedEffect
+        if (resumeRetryMediaIdentity == expectedMedia) delay(EMBED_RESUME_RETRY_DELAY_MS)
+        if (
+            !canDispatchEmbedResume(
+                lifecyclePlaybackAllowed = lifecyclePlaybackAllowed &&
+                    shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState),
+                controlsReady = canControlPlayback,
+                navigationCurrent = navigationGuard.isCurrent(navigationSession),
+            )
+        ) {
+            return@LaunchedEffect
+        }
+        val attempt = resumeCoordinator.nextAttempt(
+            mediaIdentity = expectedMedia,
+            allowPlaying = !lifecycleSupersededAutomaticResume,
+        ) ?: return@LaunchedEffect
+        if (
+            !resumeCoordinator.shouldDispatch(attempt) ||
+            !lifecyclePlaybackAllowed ||
+            !shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState) ||
+            (attempt.desiredPlaying && lifecycleSupersededAutomaticResume) ||
+            !navigationGuard.isCurrent(navigationSession)
+        ) {
+            return@LaunchedEffect
+        }
+
+        fun handleOutcome(
+            outcome: EmbedResumeAttemptOutcome,
+            acknowledgement: EmbedCommandAcknowledgement? = null,
+        ) {
+            when (outcome) {
+                EmbedResumeAttemptOutcome.COMPLETED -> acknowledgement?.let { confirmed ->
+                    resumeRetryMediaIdentity = null
+                    positionMs = confirmed.positionMs
+                    webIsPlaying = confirmed.isPlaying
+                }
+                EmbedResumeAttemptOutcome.RETRY -> {
+                    resumeRetryMediaIdentity = attempt.mediaIdentity
+                    resumeRetrySignal += 1
+                }
+                EmbedResumeAttemptOutcome.EXHAUSTED -> {
+                    resumeRetryMediaIdentity = null
+                }
+                EmbedResumeAttemptOutcome.STALE -> Unit
+            }
+        }
+
+        val queued = dispatchWebCommand(
+            webView = web,
+            session = navigationSession,
+            guard = navigationGuard,
+            coordinator = commandCoordinator,
+            callbacks = pendingCommandCallbacks,
+            handler = mainHandler,
+            kind = EmbedCommandKind.RESUME_PLAYBACK,
+            mediaIdentity = expectedMedia,
+            script = { commandId ->
+                resumeVideoCommandJs(
+                    targetSec = attempt.targetPositionMs / 1_000.0,
+                    navigationGeneration = navigationSession.generation,
+                    capabilityToken = progressBridgeToken,
+                    commandId = commandId,
+                    expectedMediaIdentity = expectedMedia.mediaId,
+                    expectedMediaGeneration = expectedMedia.generation,
+                    desiredPlaying = attempt.desiredPlaying,
+                )
+            },
+            onResolved = { resolution ->
+                val acknowledgement = (resolution as? EmbedCommandResolution.Confirmed)
+                    ?.acknowledgement
+                val outcome = if (acknowledgement != null) {
+                    resumeCoordinator.acknowledge(
+                        attempt = attempt,
+                        succeeded = acknowledgement.succeeded,
+                        isPlaying = acknowledgement.isPlaying,
+                        positionMs = acknowledgement.positionMs,
+                    )
+                } else {
+                    resumeCoordinator.fail(attempt)
+                }
+                handleOutcome(outcome, acknowledgement)
+            },
+        )
+        if (!queued) handleOutcome(resumeCoordinator.fail(attempt))
+    }
+
+    LaunchedEffect(
+        canControlPlayback,
+        controlledMediaInstanceId,
+        playbackSpeed,
+        webView,
+        navigationSession.generation,
+    ) {
+        val web = webView ?: return@LaunchedEffect
+        val expectedMedia = webMediaIdentity ?: return@LaunchedEffect
+        if (!canControlPlayback || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
         web.evaluateJavascript(
-            SET_PLAYBACK_SPEED_JS(playbackSpeed, navigationSession.generation),
+            setPlaybackSpeedJs(
+                speed = playbackSpeed,
+                navigationGeneration = navigationSession.generation,
+                expectedMediaIdentity = expectedMedia.mediaId,
+                expectedMediaGeneration = expectedMedia.generation,
+            ),
             null,
         )
     }
@@ -553,9 +1096,15 @@ fun EmbedWebView(
     // Best-effort: reaches the main document and same-origin iframes only, exactly like the
     // progress poll. A cross-origin embed renders its own captions out of our reach, and some
     // providers burn subtitles into the video, where there is nothing to style at all.
-    LaunchedEffect(webPlaybackAvailable, captionStyle, webView, navigationSession.generation) {
+    LaunchedEffect(
+        canControlPlayback,
+        controlledMediaInstanceId,
+        captionStyle,
+        webView,
+        navigationSession.generation,
+    ) {
         val web = webView ?: return@LaunchedEffect
-        if (!webPlaybackAvailable || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
+        if (!canControlPlayback || !navigationGuard.isCurrent(navigationSession)) return@LaunchedEffect
         web.evaluateJavascript(
             CAPTION_STYLE_JS(captionStyle, navigationSession.generation),
             null,
@@ -578,22 +1127,49 @@ fun EmbedWebView(
         )
     }
 
-    DisposableEffect(lifecycleOwner, webView) {
+    DisposableEffect(lifecycleOwner, webView, navigationSession.generation) {
         val owner = lifecycleOwner
         val web = webView
         if (owner == null || web == null) {
             onDispose {}
         } else {
+            val initiallyAllowed = shouldResumeEmbedForLifecycleState(owner.lifecycle.currentState)
+            val generationRequestedPaused = !navigationSession.request.resumeDesiredPlaying
+            lifecyclePlaybackAllowed = initiallyAllowed
+            if (generationRequestedPaused) {
+                pendingResumeDesiredPlaying = false
+                webIsPlaying = false
+                runCatching { web.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
+            }
+            if (!initiallyAllowed) {
+                pendingResumeDesiredPlaying = false
+                webIsPlaying = false
+                resumeRetryMediaIdentity = null
+                webMediaIdentity?.takeIf { it.isValid }?.let { mediaIdentity ->
+                    resumeCoordinator.suppressAutomaticPlayback(
+                        mediaIdentity,
+                        positionMs,
+                    )
+                }
+                runCatching { web.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
+                web.onPause()
+            }
             val observer = LifecycleEventObserver { _, event ->
                 when (event) {
                     Lifecycle.Event.ON_PAUSE,
                     Lifecycle.Event.ON_STOP -> {
+                        currentSuspendAutomaticResume()
                         runCatching { web.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
                         // Keep lifecycle changes instance-local; timers are global to all WebViews.
                         web.onPause()
                     }
                     else -> if (shouldResumeEmbedForLifecycleEvent(event)) {
+                        lifecyclePlaybackAllowed = true
                         web.onResume()
+                        if (currentLifecycleSupersededAutomaticResume) {
+                            webIsPlaying = false
+                            runCatching { web.evaluateJavascript(PAUSE_EMBED_MEDIA_JS, null) }
+                        }
                     }
                 }
             }
@@ -605,6 +1181,7 @@ fun EmbedWebView(
     LaunchedEffect(
         autoSkipIntroOutro,
         autoplay,
+        lifecyclePlaybackAllowed,
         webIsPlaying,
         webView,
         positionMs,
@@ -613,16 +1190,27 @@ fun EmbedWebView(
         outroStartMs,
         outroEndMs,
         navigationSession.generation,
+        concreteVideoGeneration,
         hasNextEpisode,
         introAutoSkipAttempt,
         outroAutoSkipAttempt,
+        canAutomatePlayback,
     ) {
-        if (!autoSkipIntroOutro || !webIsPlaying || positionMs <= 0L) return@LaunchedEffect
+        if (
+            !canAutomatePlayback ||
+            !lifecyclePlaybackAllowed ||
+            !shouldResumeEmbedForLifecycleState(lifecycleOwner?.lifecycle?.currentState) ||
+            !autoSkipIntroOutro ||
+            !webIsPlaying ||
+            positionMs <= 0L
+        ) {
+            return@LaunchedEffect
+        }
 
         if (!introAutoSkipped && isInSkipWindow(positionMs, introStartMs, introEndMs)) {
             if (!introAutoSkipPending) {
                 introAutoSkipPending = true
-                val queued = requestSeek(
+                val queued = requestAutomatedSeek(
                     introEndMs,
                     seekResult@{ succeeded ->
                         if (!navigationGuard.isCurrent(navigationSession)) return@seekResult
@@ -634,6 +1222,7 @@ fun EmbedWebView(
                                 {
                                     if (
                                         navigationGuard.isCurrent(navigationSession) &&
+                                        currentLifecyclePlaybackAllowed &&
                                         !introAutoSkipped
                                     ) {
                                         introAutoSkipAttempt++
@@ -648,7 +1237,11 @@ fun EmbedWebView(
                     introAutoSkipPending = false
                     mainHandler.postDelayed(
                         {
-                            if (navigationGuard.isCurrent(navigationSession) && !introAutoSkipped) {
+                            if (
+                                navigationGuard.isCurrent(navigationSession) &&
+                                currentLifecyclePlaybackAllowed &&
+                                !introAutoSkipped
+                            ) {
                                 introAutoSkipAttempt++
                             }
                         },
@@ -675,7 +1268,7 @@ fun EmbedWebView(
             OutroSkipAction.SEEK_TO_END -> {
                 if (!outroAutoSkipPending) {
                     outroAutoSkipPending = true
-                    val queued = requestSeek(
+                    val queued = requestAutomatedSeek(
                         outroEndMs,
                         seekResult@{ succeeded ->
                             if (!navigationGuard.isCurrent(navigationSession)) return@seekResult
@@ -687,6 +1280,7 @@ fun EmbedWebView(
                                     {
                                         if (
                                             navigationGuard.isCurrent(navigationSession) &&
+                                            currentLifecyclePlaybackAllowed &&
                                             !outroAutoHandled
                                         ) {
                                             outroAutoSkipAttempt++
@@ -701,7 +1295,11 @@ fun EmbedWebView(
                         outroAutoSkipPending = false
                         mainHandler.postDelayed(
                             {
-                                if (navigationGuard.isCurrent(navigationSession) && !outroAutoHandled) {
+                                if (
+                                    navigationGuard.isCurrent(navigationSession) &&
+                                    currentLifecyclePlaybackAllowed &&
+                                    !outroAutoHandled
+                                ) {
                                     outroAutoSkipAttempt++
                                 }
                             },
@@ -725,7 +1323,24 @@ fun EmbedWebView(
         }
     }
 
-    val remoteModifier = if (playbackMode.controlsPlayback && device.isTv && focusPlayerOnStart) {
+    val primaryAction = if (!canAutomatePlayback) {
+        null
+    } else {
+        skipPlan.actionAt(
+            positionMs = positionMs,
+            hasNextEpisode = currentHasNextEpisode && currentOnNextEpisode != null,
+        )?.let { planned ->
+            PlayerChromeAction(planned.label) {
+                if (planned.advanceToNextEpisode) {
+                    currentOnNextEpisode?.invoke(playbackKey)
+                } else {
+                    planned.seekTargetMs?.let { requestUserSeek(it) }
+                }
+            }
+        }
+    }
+
+    val remoteModifier = if (device.isTv && tvControlPolicy.showsAppTransport) {
         Modifier
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown || !opensTvPlayerControls(event.key)) {
@@ -762,6 +1377,8 @@ fun EmbedWebView(
                     DiagnosticsLog.event("EmbedWebView factory create WebView")
                     DiagnosticsLog.webViewPackage("EmbedWebView factory")
                     object : WebView(ctx) {
+                        private var consumesProviderBackSequence = false
+
                         override fun dispatchKeyEvent(event: KeyEvent): Boolean {
                             // Only claim the remote while the player is the active surface. In the
                             // TV episode grid the list owns the D-pad: handling keys here ate them
@@ -771,37 +1388,89 @@ fun EmbedWebView(
                             // own page act on the remote; unhandled keys let the framework move
                             // focus out of the player and back to the list.
                             if (device.isTv && !currentPlayerOwnsRemote) return false
-                            if (
-                                playbackMode.controlsPlayback &&
-                                event.action == KeyEvent.ACTION_DOWN &&
-                                event.repeatCount == 0
-                            ) {
-                                when {
-                                    device.isTv && (
-                                        event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
-                                            event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
-                                            event.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
-                                        event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN
-                                        ) -> {
+                            if (device.isTv) {
+                                val policy = currentTvControlPolicy
+                                if (
+                                    event.keyCode == KeyEvent.KEYCODE_BACK &&
+                                    (policy.recoversAppUiOnBack || consumesProviderBackSequence)
+                                ) {
+                                    // Consume the complete key pair. The first Back after a handoff
+                                    // restores app focus; a second Back follows the normal screen
+                                    // navigation path because the WebView no longer owns focus.
+                                    if (
+                                        event.action == KeyEvent.ACTION_DOWN &&
+                                        event.repeatCount == 0
+                                    ) {
+                                        consumesProviderBackSequence = true
                                         val navigationToken = currentNavigationSession.bridgeToken
-                                        mainHandler.post { currentRevealTvControls(navigationToken) }
-                                        return true
+                                        mainHandler.post {
+                                            currentRecoverFromProviderControls(navigationToken)
+                                        }
+                                    } else if (event.action == KeyEvent.ACTION_UP) {
+                                        consumesProviderBackSequence = false
                                     }
-                                    event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
-                                        event.keyCode == KeyEvent.KEYCODE_ENTER ||
-                                        event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER -> {
-                                        val navigationToken = currentNavigationSession.bridgeToken
-                                        mainHandler.post { currentToggleWebPlayback(navigationToken) }
-                                        return true
+                                    return true
+                                }
+
+                                when (policy.remoteOwner) {
+                                    EmbedTvRemoteOwner.APP_PROVIDER_HANDOFF -> {
+                                        if (opensTvPlayerControls(event.keyCode)) {
+                                            if (
+                                                event.action == KeyEvent.ACTION_DOWN &&
+                                                event.repeatCount == 0
+                                            ) {
+                                                val navigationToken = currentNavigationSession.bridgeToken
+                                                mainHandler.post {
+                                                    currentRevealProviderHandoff(navigationToken)
+                                                }
+                                            }
+                                            return true
+                                        }
                                     }
-                                    event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT && currentHasNextEpisode -> {
-                                        currentOnNextEpisode?.invoke(currentPlaybackKey)
-                                        return true
+                                    EmbedTvRemoteOwner.APP_TRANSPORT -> {
+                                        if (opensTvPlayerControls(event.keyCode)) {
+                                            if (
+                                                event.action == KeyEvent.ACTION_DOWN &&
+                                                event.repeatCount == 0
+                                            ) {
+                                                val navigationToken = currentNavigationSession.bridgeToken
+                                                val isSelect =
+                                                    event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                                                        event.keyCode == KeyEvent.KEYCODE_ENTER ||
+                                                        event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+                                                mainHandler.post {
+                                                    if (isSelect) {
+                                                        currentToggleWebPlayback(navigationToken)
+                                                    } else {
+                                                        currentRevealTvControls(navigationToken)
+                                                    }
+                                                }
+                                            }
+                                            return true
+                                        }
+                                        if (event.keyCode == KeyEvent.KEYCODE_MEDIA_NEXT) {
+                                            if (
+                                                event.action == KeyEvent.ACTION_DOWN &&
+                                                event.repeatCount == 0 &&
+                                                currentHasNextEpisode
+                                            ) {
+                                                currentOnNextEpisode?.invoke(currentPlaybackKey)
+                                            }
+                                            return currentHasNextEpisode
+                                        }
+                                        if (event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS) {
+                                            if (
+                                                event.action == KeyEvent.ACTION_DOWN &&
+                                                event.repeatCount == 0 &&
+                                                currentHasPreviousEpisode
+                                            ) {
+                                                currentOnPreviousEpisode?.invoke(currentPlaybackKey)
+                                            }
+                                            return currentHasPreviousEpisode
+                                        }
                                     }
-                                    event.keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS && currentHasPreviousEpisode -> {
-                                        currentOnPreviousEpisode?.invoke(currentPlaybackKey)
-                                        return true
-                                    }
+                                    EmbedTvRemoteOwner.PARENT,
+                                    EmbedTvRemoteOwner.PROVIDER -> Unit
                                 }
                             }
                             return super.dispatchKeyEvent(event)
@@ -843,6 +1512,7 @@ fun EmbedWebView(
                                             muted,
                                             volume,
                                             mediaIdentity,
+                                            mediaGeneration,
                                         ->
                                         mainHandler.post {
                                             currentWebTickHandler(
@@ -853,19 +1523,29 @@ fun EmbedWebView(
                                                 muted,
                                                 volume,
                                                 mediaIdentity,
+                                                mediaGeneration,
                                             )
                                         }
                                     },
                                     onVideoAvailableCallback = { navigationToken ->
                                         mainHandler.post { currentWebVideoAvailableHandler(navigationToken) }
                                     },
-                                    onEndedCallback = { navigationToken, positionSec, durationSec, playingSamples ->
+                                    onEndedCallback = {
+                                            navigationToken,
+                                            positionSec,
+                                            durationSec,
+                                            playingSamples,
+                                            mediaIdentity,
+                                            mediaGeneration,
+                                        ->
                                         mainHandler.post {
                                             currentWebEndedHandler(
                                                 navigationToken,
                                                 positionSec,
                                                 durationSec,
                                                 playingSamples,
+                                                mediaIdentity,
+                                                mediaGeneration,
                                             )
                                         }
                                     },
@@ -876,6 +1556,7 @@ fun EmbedWebView(
                                             positionSec,
                                             isPlaying,
                                             mediaIdentity,
+                                            mediaGeneration,
                                         ->
                                         mainHandler.post {
                                             currentWebCommandHandler(
@@ -885,6 +1566,7 @@ fun EmbedWebView(
                                                 positionSec,
                                                 isPlaying,
                                                 mediaIdentity,
+                                                mediaGeneration,
                                             )
                                         }
                                     },
@@ -957,35 +1639,33 @@ fun EmbedWebView(
                                 finishedUrl = null
                                 DiagnosticsLog.event(
                                     "EmbedWebView page started generation=${navigationSession.generation} " +
-                                        "host=${startedUrl.hostOrNone()}",
+                                        privacySafeUrlDiagnosticLabel(startedUrl),
                                 )
                             },
                             onPageFinishedAccepted = { finishedView, loadedUrl ->
                                 finishedUrl = loadedUrl
                                 DiagnosticsLog.event(
                                     "EmbedWebView page finished generation=${navigationSession.generation} " +
-                                        "host=${loadedUrl.hostOrNone()} title=${finishedView.title ?: "none"}",
+                                        privacySafeUrlDiagnosticLabel(loadedUrl),
                                 )
                                 if (playbackMode.exposesNativeBridge) {
-                                    val navigationSetupJs = buildString {
-                                        appendLine(
-                                            authenticatedProgressPollJs(
-                                                navigationSession.generation,
-                                                progressBridgeToken,
+                                    finishedView.evaluateJavascript(
+                                        authenticatedProgressSetupJs(
+                                            navigationGeneration = navigationSession.generation,
+                                            capabilityToken = progressBridgeToken,
+                                            resumeDesiredPlaying = effectiveEmbedSetupDesiredPlaying(
+                                                pendingDesiredPlaying =
+                                                    pendingResumeDesiredPlaying,
+                                                lifecyclePlaybackAllowed =
+                                                    lifecyclePlaybackAllowed,
+                                                lifecycleState =
+                                                    lifecycleOwner?.lifecycle?.currentState,
+                                                automaticResumeSuppressed =
+                                                    lifecycleSupersededAutomaticResume,
                                             ),
-                                        )
-                                        if (navigationSession.request.resumePositionMs > 0L) {
-                                            append(
-                                                embedResumeWhenReadyJs(
-                                                    navigationSession.request.resumePositionMs / 1000.0,
-                                                    navigationSession.generation,
-                                                ),
-                                            )
-                                        }
-                                    }
-                                    // One evaluation preserves setup order: the document receives
-                                    // its capability before the capability-scoped resume timer.
-                                    finishedView.evaluateJavascript(navigationSetupJs, null)
+                                        ),
+                                        null,
+                                    )
                                 }
                             },
                             onMainFrameErrorAccepted = { message ->
@@ -1007,7 +1687,7 @@ fun EmbedWebView(
                             },
                         )
                         DiagnosticsLog.event(
-                            "EmbedWebView loadUrl after blank host=${activeUrl.hostOrNone()} " +
+                            "EmbedWebView loadUrl after blank ${privacySafeUrlDiagnosticLabel(activeUrl)} " +
                                 "generation=${navigationSession.generation} " +
                                 "headers=${headers.keys.joinToString()}",
                         )
@@ -1063,7 +1743,8 @@ fun EmbedWebView(
                 if (webView === web) webView = null
                 val releasedUrl = runCatching { web.url }.getOrNull()
                 DiagnosticsLog.event(
-                    "EmbedWebView release url=${releasedUrl ?: "none"} size=${web.width}x${web.height}",
+                    "EmbedWebView release ${privacySafeUrlDiagnosticLabel(releasedUrl)} " +
+                        "size=${web.width}x${web.height}",
                 )
                 stopWebPlayback(web)
                 runCatching { web.removeJavascriptInterface("AniliProgress") }
@@ -1110,10 +1791,10 @@ fun EmbedWebView(
             },
             onDoubleTap = { isRightHalf ->
                 if (isRightHalf) {
-                    requestSeek(positionMs + 10_000L, null)
+                    requestUserSeek(positionMs + 10_000L)
                 } else {
                     val target = (positionMs - 10_000L).coerceAtLeast(0L)
-                    requestSeek(target, null)
+                    requestUserSeek(target)
                 }
             },
             onHoldSpeed = { active ->
@@ -1147,7 +1828,13 @@ fun EmbedWebView(
                 },
         )
 
-        if (touchControlsActive && touchControlsVisible) {
+        // Keep the shared contextual action mounted after transport auto-hide. The transparent
+        // scaffold has no surface-wide pointer handler, so taps outside that button still reach
+        // PlayerGestureControls and reveal the complete embed chrome.
+        if (
+            touchControlsActive &&
+            shouldComposePlayerChrome(touchControlsVisible, primaryAction != null)
+        ) {
             EmbedTouchControls(
                 positionMs = positionMs,
                 durationMs = durationMs,
@@ -1156,7 +1843,7 @@ fun EmbedWebView(
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
                 onPrevious = { currentOnPreviousEpisode?.invoke(playbackKey) },
                 onRewind = {
-                    requestSeek((positionMs - 10_000L).coerceAtLeast(0L), null)
+                    requestUserSeek((positionMs - 10_000L).coerceAtLeast(0L))
                     touchControlsInteraction++
                 },
                 onPlayPause = {
@@ -1165,18 +1852,22 @@ fun EmbedWebView(
                     touchControlsInteraction++
                 },
                 onForward = {
-                    requestSeek(positionMs + 10_000L, null)
+                    requestUserSeek(positionMs + 10_000L)
                     touchControlsInteraction++
                 },
                 onNext = { currentOnNextEpisode?.invoke(playbackKey) },
                 onSeek = { targetMs ->
-                    requestSeek(targetMs, null)
+                    requestUserSeek(targetMs)
                     touchControlsInteraction++
                 },
                 onSettings = { settingsSheetVisible = true },
+                seriesTitle = seriesTitle,
+                episodeTitle = episodeTitle,
                 isFullscreen = isFullscreen,
                 onFullscreen = onToggleFullscreen,
                 onInteract = { touchControlsInteraction++ },
+                showChrome = touchControlsVisible,
+                primaryAction = primaryAction,
             )
         }
 
@@ -1185,7 +1876,8 @@ fun EmbedWebView(
                 onDismiss = { settingsSheetVisible = false },
                 autoplay = autoplay,
                 onAutoplayChange = SettingsStore::setAutoplay,
-                speed = if (webPlaybackAvailable) playbackSpeed else null,
+                canAutomatePlayback = canAutomatePlayback,
+                speed = if (canControlPlayback) playbackSpeed else null,
                 onSpeedChange = { playbackSpeed = it },
                 qualityOptions = embedQualityStreams.mapNotNull { option ->
                     val height = option.height ?: declaredVideoHeight(option.quality) ?: return@mapNotNull null
@@ -1194,111 +1886,132 @@ fun EmbedWebView(
                         selected = option.url == activeUrl,
                         onSelect = {
                             if (option.url != activeUrl) {
+                                val handoff = resolveEmbedQualityHandoff(
+                                    confirmedHandoff = resumeCoordinator.handoffFor(webMediaIdentity),
+                                    currentRequest = navigationSession.request,
+                                    allowPlaying = isEmbedPlaybackPermitted(
+                                        lifecyclePlaybackAllowed = lifecyclePlaybackAllowed,
+                                        lifecycleState = lifecycleOwner?.lifecycle?.currentState,
+                                        automaticResumeSuppressed =
+                                            lifecycleSupersededAutomaticResume,
+                                    ),
+                                )
                                 // Revoke A synchronously in the click that requests B; the WebView
                                 // itself is replaced later by AndroidView.update.
                                 navigationGuard.invalidate(navigationSession)
-                                pendingSeekMs = positionMs
+                                pendingSeekMs = handoff.positionMs
+                                pendingResumeDesiredPlaying = handoff.desiredPlaying
                                 activeUrl = option.url
                             }
                         },
                     )
                 },
-                onCaptionAppearance = if (webPlaybackAvailable) {
+                onCaptionAppearance = if (canControlPlayback) {
                     { captionAppearanceVisible = true }
                 } else {
                     null
                 },
-                autoSkip = autoSkipIntroOutro,
+                autoSkip = autoSkipIntroOutro.takeIf { canAutomatePlayback },
                 onAutoSkipChange = SettingsStore::setAutoSkipIntroOutro,
             )
         }
 
-        // One bar for the servers our JS cannot reach, sitting where a player's controls belong:
-        // episode moves and play/pause on the left, settings and fullscreen on the right. There is
-        // no position or duration to build a scrubber from, so seeking stays the provider's.
-        if (fallbackControlsActive && fallbackControlsVisible) Row(
+        // Cross-origin providers keep their own seek/play surface. Present only the controls this
+        // app can honour and an explicit hand-off to the provider; never imply that an inaccessible
+        // media element can be paused or scrubbed by AniLili+.
+        if (fallbackControlsActive && fallbackControlsVisible) EmbedFallbackControls(
+            seriesTitle = seriesTitle,
+            episodeTitle = episodeTitle,
+            hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
+            hasNext = hasNextEpisode && currentOnNextEpisode != null,
+            onPrevious = { currentOnPreviousEpisode?.invoke(playbackKey) },
+            onUseProviderControls = {
+                DiagnosticsLog.event("EmbedWebView exposing cross-origin provider controls")
+                fallbackControlsVisible = false
+                providerControlsMode = true
+                webView?.requestFocus()
+                fallbackInteraction++
+            },
+            onNext = { currentOnNextEpisode?.invoke(playbackKey) },
+            onSettings = {
+                settingsSheetVisible = true
+                fallbackInteraction++
+            },
+            isFullscreen = isFullscreen,
+            onFullscreen = onToggleFullscreen?.let { toggle ->
+                {
+                    toggle()
+                    fallbackInteraction++
+                }
+            },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))),
-                )
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                PlayerControlIconButton(
-                    "Previous episode",
-                    Icons.Default.SkipPrevious,
-                    enabled = hasPreviousEpisode && currentOnPreviousEpisode != null,
-                    onClick = { currentOnPreviousEpisode?.invoke(playbackKey) },
-                )
-                PlayerControlIconButton(
-                    "Use provider controls",
-                    Icons.Default.TouchApp,
-                    onClick = {
-                        DiagnosticsLog.event("EmbedWebView exposing cross-origin provider controls")
-                        fallbackControlsVisible = false
-                        providerControlsMode = true
-                        webView?.requestFocus()
-                        fallbackInteraction++
-                    },
-                )
-                PlayerControlIconButton(
-                    "Next episode",
-                    Icons.Default.SkipNext,
-                    enabled = hasNextEpisode && currentOnNextEpisode != null,
-                    onClick = { currentOnNextEpisode?.invoke(playbackKey) },
-                )
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                PlayerControlIconButton(
-                    "Settings",
-                    Icons.Default.Settings,
-                    onClick = {
+                .fillMaxWidth(),
+        )
+
+        if (tvProviderHandoffVisible) {
+            TvProviderHandoffControls(
+                providerFocusRequester = tvProviderHandoffFocus,
+                onUseProviderControls = {
+                    DiagnosticsLog.event("EmbedWebView TV remote handed to cross-origin provider")
+                    providerControlsMode = true
+                    fallbackInteraction++
+                    webView?.requestFocus()
+                },
+                onSettings = if (tvControlPolicy.showsSettings) {
+                    {
                         settingsSheetVisible = true
                         fallbackInteraction++
-                    },
-                )
-                onToggleFullscreen?.let { toggle ->
-                    PlayerControlIconButton(
-                        if (isFullscreen) "Exit fullscreen" else "Fullscreen",
-                        if (isFullscreen) Icons.Default.FullscreenExit else Icons.Default.Fullscreen,
-                        onClick = {
+                    }
+                } else {
+                    null
+                },
+                isFullscreen = isFullscreen,
+                onFullscreen = if (tvControlPolicy.showsFullscreen) {
+                    onToggleFullscreen?.let { toggle ->
+                        {
                             toggle()
                             fallbackInteraction++
-                        },
-                    )
-                }
-            }
+                        }
+                    }
+                } else {
+                    null
+                },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
 
-        if (playbackMode.controlsPlayback && device.isTv && focusPlayerOnStart && tvControlsVisible) {
+        if (tvControlPolicy.showsAppTransport && tvControlsVisible) {
             TvPlayerControls(
                 positionMs = positionMs,
                 durationMs = durationMs,
                 isPlaying = webIsPlaying,
-                isMuted = (if (webPlaybackAvailable) webVolume else deviceVolume) <= 0.001f,
+                isMuted = (if (canControlPlayback) webVolume else deviceVolume) <= 0.001f,
                 hasPrevious = hasPreviousEpisode && currentOnPreviousEpisode != null,
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
                 playPauseFocusRequester = tvPlayPauseFocus,
                 onPrevious = { currentOnPreviousEpisode?.invoke(playbackKey) },
                 onRewind = {
-                    requestSeek((positionMs - 10_000L).coerceAtLeast(0L), null)
+                    requestUserSeek((positionMs - 10_000L).coerceAtLeast(0L))
                 },
                 onPlayPause = {
                     DiagnosticsLog.event("EmbedWebView TV control playPause")
                     requestTogglePlayback()
                 },
                 onForward = {
-                    requestSeek(positionMs + 10_000L, null)
+                    requestUserSeek(positionMs + 10_000L)
                 },
                 onNext = { currentOnNextEpisode?.invoke(playbackKey) },
                 onVolumeDown = {
-                    DiagnosticsLog.event("EmbedWebView TV control volumeDown available=$webPlaybackAvailable")
-                    if (webPlaybackAvailable) {
-                        adjustWebVolume(webView, -0.1f, navigationSession, navigationGuard) { volume ->
+                    DiagnosticsLog.event("EmbedWebView TV control volumeDown available=$canControlPlayback")
+                    if (canControlPlayback) {
+                        adjustWebVolume(
+                            webView = webView,
+                            delta = -0.1f,
+                            session = navigationSession,
+                            guard = navigationGuard,
+                            mediaIdentity = webMediaIdentity,
+                        ) { volume ->
                             webVolume = volume
                             if (volume > 0f) lastAudibleVolume = volume
                         }
@@ -1309,11 +2022,17 @@ fun EmbedWebView(
                     }
                 },
                 onToggleMute = {
-                    DiagnosticsLog.event("EmbedWebView TV control toggleMute available=$webPlaybackAvailable")
-                    if (webPlaybackAvailable) {
+                    DiagnosticsLog.event("EmbedWebView TV control toggleMute available=$canControlPlayback")
+                    if (canControlPlayback) {
                         if (webVolume > 0.001f) lastAudibleVolume = webVolume
                         val target = if (webVolume > 0.001f) 0f else lastAudibleVolume.coerceAtLeast(0.1f)
-                        setWebVolume(webView, target, navigationSession, navigationGuard) { webVolume = it }
+                        setWebVolume(
+                            webView = webView,
+                            volume = target,
+                            session = navigationSession,
+                            guard = navigationGuard,
+                            mediaIdentity = webMediaIdentity,
+                        ) { webVolume = it }
                     } else {
                         val current = readDeviceVolume(embedAudioManager)
                         if (current > 0.001f) lastAudibleVolume = current
@@ -1322,9 +2041,15 @@ fun EmbedWebView(
                     }
                 },
                 onVolumeUp = {
-                    DiagnosticsLog.event("EmbedWebView TV control volumeUp available=$webPlaybackAvailable")
-                    if (webPlaybackAvailable) {
-                        adjustWebVolume(webView, 0.1f, navigationSession, navigationGuard) { volume ->
+                    DiagnosticsLog.event("EmbedWebView TV control volumeUp available=$canControlPlayback")
+                    if (canControlPlayback) {
+                        adjustWebVolume(
+                            webView = webView,
+                            delta = 0.1f,
+                            session = navigationSession,
+                            guard = navigationGuard,
+                            mediaIdentity = webMediaIdentity,
+                        ) { volume ->
                             webVolume = volume
                             lastAudibleVolume = volume
                         }
@@ -1342,33 +2067,8 @@ fun EmbedWebView(
                     settingsSheetVisible = true
                 },
                 onFullscreen = onToggleFullscreen,
+                primaryAction = primaryAction,
                 modifier = Modifier.align(Alignment.BottomCenter),
-            )
-        }
-
-        val action: Pair<String, () -> Unit>? = when {
-            !playbackMode.automatesEpisode -> null
-            introEndMs != null && isInSkipWindow(positionMs, introStartMs, introEndMs) ->
-                "Skip Intro" to {
-                    requestSeek(introEndMs, null)
-                }
-            outroStartMs != null &&
-                outroEndMs != null &&
-                isInSkipWindow(positionMs, outroStartMs, outroEndMs) ->
-                if (currentHasNextEpisode && currentOnNextEpisode != null) {
-                    "Next Episode" to { currentOnNextEpisode?.invoke(playbackKey) }
-                } else {
-                    "Skip Outro" to {
-                        requestSeek(outroEndMs, null)
-                    }
-                }
-            else -> null
-        }
-        action?.let { (label, onClick) ->
-            WebSkipButton(
-                label = label,
-                onClick = onClick,
-                modifier = Modifier.align(Alignment.BottomStart),
             )
         }
     }
@@ -1387,28 +2087,6 @@ private fun allAnimeIframeShell(url: String): String {
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     return """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;background:#000;overflow:hidden"><iframe src="$escaped" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer-when-downgrade" style="position:fixed;inset:0;width:100%;height:100%;border:0"></iframe></body></html>"""
-}
-
-@Composable
-private fun WebSkipButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    OutlinedButton(
-        onClick = onClick,
-        shape = RoundedCornerShape(3.dp),
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.55f)),
-        colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = Color.Black.copy(alpha = 0.5f),
-            contentColor = Color.White,
-        ),
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-        modifier = modifier
-            .padding(start = 24.dp, bottom = 24.dp),
-    ) {
-        Text(
-            label.uppercase(),
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Bold,
-        )
-    }
 }
 
 /**
@@ -1431,6 +2109,7 @@ private fun authenticatedProgressPollJs(
       ${embedContentVideoSelectorJs()}
       var observedVideo = null;
       var observedMediaKey = null;
+      var observedMediaGeneration = 0;
       var observedPlayingSamples = 0;
       var endedHandler = null;
       var endedReportedMediaKey = null;
@@ -1448,7 +2127,9 @@ private fun authenticatedProgressPollJs(
             navigationToken,
             video.currentTime,
             video.duration,
-            observedPlayingSamples
+            observedPlayingSamples,
+            key,
+            observedMediaGeneration
           );
         } catch (e) { /* bridge detached */ }
       }
@@ -1464,6 +2145,7 @@ private fun authenticatedProgressPollJs(
         }
         observedVideo = video;
         observedMediaKey = key;
+        observedMediaGeneration = __aniliBindMediaGeneration(video);
         observedPlayingSamples = 0;
         endedReportedMediaKey = null;
       }
@@ -1492,7 +2174,8 @@ private fun authenticatedProgressPollJs(
               !v.paused,
               v.muted,
               v.volume,
-              mediaKey(v)
+              mediaKey(v),
+              observedMediaGeneration
             );
             if (v.ended) reportEnded(v);
           }
@@ -1501,14 +2184,46 @@ private fun authenticatedProgressPollJs(
     })();
 """.trimIndent()
 
-/** Capability-scoped command; same-origin iframe limitations are unchanged. */
-private fun SET_PLAYBACK_SPEED_JS(speed: Float, navigationGeneration: Long): String = """
+/**
+ * A paused handoff fails closed before telemetry discovers the selected video. The pause-all epoch
+ * barrier and authenticated polling are injected in one evaluation, with the barrier first so a
+ * same-origin provider cannot autoplay during the pre-tick window.
+ */
+internal fun authenticatedProgressSetupJs(
+    navigationGeneration: Long,
+    capabilityToken: String,
+    resumeDesiredPlaying: Boolean,
+): String = buildString {
+    append(
+        "(function() { window.__aniliPlaybackDesiredPlaying = " +
+            "$resumeDesiredPlaying; })();\n",
+    )
+    append(
+        pauseEmbedMediaForLifecycleJs(
+            supersedePlaybackMutation = !resumeDesiredPlaying,
+        ),
+    )
+    append('\n')
+    append(authenticatedProgressPollJs(navigationGeneration, capabilityToken))
+}
+
+/** Identity-scoped command; same-origin iframe limitations are unchanged. */
+internal fun setPlaybackSpeedJs(
+    speed: Float,
+    navigationGeneration: Long,
+    expectedMediaIdentity: String,
+    expectedMediaGeneration: Long,
+): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
       ${embedContentVideoSelectorJs()}
+      var expectedMediaIdentity = ${expectedMediaIdentity.toJsStringLiteral()};
+      var expectedMediaGeneration = $expectedMediaGeneration;
       try {
         var v = findContentVideo();
         if (!v) return false;
+        if (__aniliMediaIdentity(v) !== expectedMediaIdentity ||
+            __aniliMediaGeneration(v) !== expectedMediaGeneration) return false;
         v.defaultPlaybackRate = $speed;
         v.playbackRate = $speed;
         return Math.abs(v.playbackRate - $speed) < 0.01;
@@ -1632,42 +2347,59 @@ private fun CaptionEdgeStyle.toCssTextShadow(): String = when (this) {
     CaptionEdgeStyle.DROP_SHADOW -> "2px 2px 3px rgba(0, 0, 0, 0.9)"
 }
 
-private fun String.toJsStringLiteral(): String =
-    "'" + replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+internal fun String.toJsStringLiteral(): String =
+    "'" + replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029") + "'"
 
 internal fun togglePlaybackCommandJs(
     navigationGeneration: Long,
     capabilityToken: String,
     commandId: Long,
     expectedMediaIdentity: String? = null,
+    expectedMediaGeneration: Long? = null,
 ): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
       ${embedContentVideoSelectorJs()}
+      ${embedPlaybackMutationEpochJs()}
       var expectedMediaIdentity = ${expectedMediaIdentity?.toJsStringLiteral() ?: "null"};
+      var expectedMediaGeneration = ${expectedMediaGeneration ?: "null"};
       var reported = false;
+      var playbackMutationEpoch = null;
       function report(success, video) {
         if (reported) return;
         reported = true;
         var position = video && isFinite(video.currentTime) ? video.currentTime : 0;
         var playing = !!video && !video.paused && !video.ended;
         var mediaIdentity = __aniliMediaIdentity(video);
-        success = success && !!video && findContentVideo() === video &&
-          (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity);
+        var mediaGeneration = __aniliMediaGeneration(video);
+        success = success && !!video &&
+          __aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch) &&
+          findContentVideo() === video &&
+          (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity) &&
+          (expectedMediaGeneration === null || mediaGeneration === expectedMediaGeneration);
         try {
           AniliProgress.onCommandResult(
             '$capabilityToken', '$navigationGeneration', '$commandId', success, position, playing,
-            mediaIdentity
+            mediaIdentity, mediaGeneration
           );
         } catch (e) { /* bridge detached */ }
       }
       try {
         var video = findContentVideo();
         if (!video) { report(false, null); return; }
-        if (expectedMediaIdentity && __aniliMediaIdentity(video) !== expectedMediaIdentity) {
+        if ((expectedMediaIdentity && __aniliMediaIdentity(video) !== expectedMediaIdentity) ||
+            (expectedMediaGeneration !== null &&
+              __aniliMediaGeneration(video) !== expectedMediaGeneration)) {
           report(false, video); return;
         }
-        if (video.paused || video.ended) {
+        var shouldPlay = video.paused || video.ended;
+        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, shouldPlay);
+        if (shouldPlay) {
           __aniliPauseCompetingMedia(video);
           var playResult = video.play();
           if (playResult && typeof playResult.then === 'function') {
@@ -1677,6 +2409,7 @@ internal fun togglePlaybackCommandJs(
             setTimeout(function() { report(!video.paused, video); }, 0);
           }
         } else {
+          ${pauseEmbedMediaForLifecycleJs(supersedePlaybackMutation = false)}
           __aniliPauseAllMedia();
           setTimeout(function() { report(video.paused, video); }, 0);
         }
@@ -1691,43 +2424,67 @@ internal fun seekVideoCommandJs(
     capabilityToken: String,
     commandId: Long,
     expectedMediaIdentity: String? = null,
+    expectedMediaGeneration: Long? = null,
+    forwardOnly: Boolean = false,
+    desiredPlaying: Boolean,
 ): String = """
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
       ${embedContentVideoSelectorJs()}
+      ${embedPlaybackMutationEpochJs()}
       var expectedMediaIdentity = ${expectedMediaIdentity?.toJsStringLiteral() ?: "null"};
+      var expectedMediaGeneration = ${expectedMediaGeneration ?: "null"};
+      var forwardOnly = $forwardOnly;
+      var desiredPlaying = $desiredPlaying;
       var reported = false;
+      var playbackMutationEpoch = null;
       function report(success, video) {
         if (reported) return;
         reported = true;
         var position = video && isFinite(video.currentTime) ? video.currentTime : 0;
         var playing = !!video && !video.paused && !video.ended;
         var mediaIdentity = __aniliMediaIdentity(video);
-        success = success && !!video && findContentVideo() === video &&
-          (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity);
+        var mediaGeneration = __aniliMediaGeneration(video);
+        success = success && !!video &&
+          __aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch) &&
+          findContentVideo() === video &&
+          (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity) &&
+          (expectedMediaGeneration === null || mediaGeneration === expectedMediaGeneration) &&
+          (desiredPlaying ? playing : !playing);
         try {
           AniliProgress.onCommandResult(
             '$capabilityToken', '$navigationGeneration', '$commandId', success, position, playing,
-            mediaIdentity
+            mediaIdentity, mediaGeneration
           );
         } catch (e) { /* bridge detached */ }
       }
       try {
         var video = findContentVideo();
         if (!video) { report(false, null); return; }
-        if (expectedMediaIdentity && __aniliMediaIdentity(video) !== expectedMediaIdentity) {
+        if ((expectedMediaIdentity && __aniliMediaIdentity(video) !== expectedMediaIdentity) ||
+            (expectedMediaGeneration !== null &&
+              __aniliMediaGeneration(video) !== expectedMediaGeneration)) {
           report(false, video); return;
         }
+        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, desiredPlaying);
+        if (!desiredPlaying) __aniliPauseAllMedia();
         var target = $targetSec;
         var bounded = isFinite(video.duration) && video.duration > 0
           ? Math.min(Math.max(0, target), video.duration)
           : Math.max(0, target);
         function confirmSeek() {
-          report(Math.abs(video.currentTime - bounded) <= 1.5, video);
+          var reached = forwardOnly
+            ? video.currentTime + 1.5 >= bounded
+            : Math.abs(video.currentTime - bounded) <= 1.5;
+          report(reached, video);
         }
-        video.addEventListener('seeked', confirmSeek, { once: true });
-        video.currentTime = bounded;
-        setTimeout(confirmSeek, 150);
+        if (forwardOnly && isFinite(video.currentTime) && video.currentTime >= bounded) {
+          confirmSeek();
+        } else {
+          video.addEventListener('seeked', confirmSeek, { once: true });
+          video.currentTime = bounded;
+          setTimeout(confirmSeek, 150);
+        }
         setTimeout(function() { report(false, video); }, 1200);
       } catch (e) { report(false, null); }
     })();
@@ -1741,17 +2498,18 @@ private fun dispatchWebCommand(
     callbacks: MutableMap<Long, (EmbedCommandResolution) -> Unit>,
     handler: Handler,
     kind: EmbedCommandKind,
-    mediaIdentity: String?,
+    mediaIdentity: EmbedVideoIdentity?,
     script: (Long) -> String,
     onResolved: (EmbedCommandResolution) -> Unit,
 ): Boolean {
     val web = webView ?: return false
+    val expectedMedia = mediaIdentity?.takeIf { it.isValid } ?: return false
     if (!guard.isCurrent(session)) return false
     val command = coordinator.issue(
         navigationGeneration = session.generation,
         kind = kind,
         nowMs = SystemClock.uptimeMillis(),
-        mediaIdentity = mediaIdentity,
+        mediaIdentity = expectedMedia,
     )
     callbacks[command.id] = onResolved
     val dispatched = runCatching {
@@ -1778,20 +2536,24 @@ private fun adjustWebVolume(
     delta: Float,
     session: EmbedNavigationSession,
     guard: EmbedNavigationGuard,
+    mediaIdentity: EmbedVideoIdentity?,
     onChanged: (Float) -> Unit,
 ) {
     val web = webView ?: return
+    val expectedMedia = mediaIdentity?.takeIf { it.isValid } ?: return
     if (!guard.isCurrent(session)) return
     runCatching {
         web.evaluateJavascript(
-            WEB_VOLUME_JS(
+            webVolumeJs(
                 delta = delta,
                 absolute = null,
                 navigationGeneration = session.generation,
+                expectedMediaIdentity = expectedMedia.mediaId,
+                expectedMediaGeneration = expectedMedia.generation,
             ),
         ) { result ->
             if (guard.isCurrent(session)) {
-                result.toFloatOrNull()?.coerceIn(0f, 1f)?.let(onChanged)
+                result.toFloatOrNull()?.takeIf { it in 0f..1f }?.let(onChanged)
             }
         }
     }
@@ -1802,35 +2564,49 @@ private fun setWebVolume(
     volume: Float,
     session: EmbedNavigationSession,
     guard: EmbedNavigationGuard,
+    mediaIdentity: EmbedVideoIdentity?,
     onChanged: (Float) -> Unit,
 ) {
     val web = webView ?: return
+    val expectedMedia = mediaIdentity?.takeIf { it.isValid } ?: return
     if (!guard.isCurrent(session)) return
     runCatching {
         web.evaluateJavascript(
-            WEB_VOLUME_JS(
+            webVolumeJs(
                 delta = null,
                 absolute = volume,
                 navigationGeneration = session.generation,
+                expectedMediaIdentity = expectedMedia.mediaId,
+                expectedMediaGeneration = expectedMedia.generation,
             ),
         ) { result ->
             if (guard.isCurrent(session)) {
-                result.toFloatOrNull()?.coerceIn(0f, 1f)?.let(onChanged)
+                result.toFloatOrNull()?.takeIf { it in 0f..1f }?.let(onChanged)
             }
         }
     }
 }
 
-private fun WEB_VOLUME_JS(delta: Float?, absolute: Float?, navigationGeneration: Long): String {
+internal fun webVolumeJs(
+    delta: Float?,
+    absolute: Float?,
+    navigationGeneration: Long,
+    expectedMediaIdentity: String,
+    expectedMediaGeneration: Long,
+): String {
     val targetExpression = absolute?.coerceIn(0f, 1f)?.toString()
         ?: "Math.max(0, Math.min(1, v.volume + ${delta ?: 0f}))"
     return """
         (function() {
           ${embedNavigationJsGuard(navigationGeneration)}
           ${embedContentVideoSelectorJs()}
+          var expectedMediaIdentity = ${expectedMediaIdentity.toJsStringLiteral()};
+          var expectedMediaGeneration = $expectedMediaGeneration;
           try {
             var v = findContentVideo();
             if (!v) return -1;
+            if (__aniliMediaIdentity(v) !== expectedMediaIdentity ||
+                __aniliMediaGeneration(v) !== expectedMediaGeneration) return -1;
             v.volume = $targetExpression;
             v.muted = v.volume <= 0;
             return v.muted ? 0 : v.volume;
@@ -1899,7 +2675,9 @@ private fun beginEmbedDocumentTeardown(
 }
 
 private fun stopWebPlayback(webView: WebView) {
-    DiagnosticsLog.event("EmbedWebView stop playback url=${webView.url ?: "none"}")
+    DiagnosticsLog.event(
+        "EmbedWebView stop playback ${privacySafeUrlDiagnosticLabel(webView.url)}",
+    )
     // pauseTimers() is process-wide and can freeze OAuth and hidden resolver WebViews.
     runCatching { webView.onPause() }
     var blankRequested = false
@@ -1917,35 +2695,157 @@ private fun stopWebPlayback(webView: WebView) {
 }
 
 /** A paused Activity remains STARTED; WebView media may resume only with a truly resumed owner. */
+internal fun canDispatchEmbedResume(
+    lifecyclePlaybackAllowed: Boolean,
+    controlsReady: Boolean,
+    navigationCurrent: Boolean,
+): Boolean = lifecyclePlaybackAllowed && controlsReady && navigationCurrent
+
+internal data class EmbedLifecycleTickPolicy(
+    val acceptPlaying: Boolean,
+    val reassertPause: Boolean,
+)
+
+internal fun isEmbedPlaybackPermitted(
+    lifecyclePlaybackAllowed: Boolean,
+    lifecycleState: Lifecycle.State?,
+    automaticResumeSuppressed: Boolean,
+): Boolean = lifecyclePlaybackAllowed &&
+    shouldResumeEmbedForLifecycleState(lifecycleState) &&
+    !automaticResumeSuppressed
+
+/** Uses live intent/lifecycle state; a page-finish callback must not replay its stale request. */
+internal fun effectiveEmbedSetupDesiredPlaying(
+    pendingDesiredPlaying: Boolean,
+    lifecyclePlaybackAllowed: Boolean,
+    lifecycleState: Lifecycle.State?,
+    automaticResumeSuppressed: Boolean,
+): Boolean = pendingDesiredPlaying && isEmbedPlaybackPermitted(
+    lifecyclePlaybackAllowed = lifecyclePlaybackAllowed,
+    lifecycleState = lifecycleState,
+    automaticResumeSuppressed = automaticResumeSuppressed,
+)
+
+/** Completion is still persisted while background/suppressed; only navigation is withheld. */
+internal fun canNavigateAfterEmbedEnd(
+    lifecycleState: Lifecycle.State?,
+    automaticResumeSuppressed: Boolean,
+): Boolean = shouldResumeEmbedForLifecycleState(lifecycleState) &&
+    !automaticResumeSuppressed
+
+/** Fail closed on any playing tick while this navigation is lifecycle-suppressed. */
+internal fun planEmbedLifecycleTick(
+    reportedPlaying: Boolean,
+    lifecyclePlaybackAllowed: Boolean,
+    automaticResumeSuppressed: Boolean,
+): EmbedLifecycleTickPolicy {
+    val playbackPermitted = lifecyclePlaybackAllowed && !automaticResumeSuppressed
+    return EmbedLifecycleTickPolicy(
+        acceptPlaying = reportedPlaying && playbackPermitted,
+        reassertPause = reportedPlaying && !playbackPermitted,
+    )
+}
+
 internal fun shouldResumeEmbedForLifecycleState(state: Lifecycle.State?): Boolean =
     state == null || state.isAtLeast(Lifecycle.State.RESUMED)
+
+internal fun shouldSuppressEmbedAutomaticResume(
+    requestDesiredPlaying: Boolean,
+    lifecycleState: Lifecycle.State?,
+): Boolean = !requestDesiredPlaying || !shouldResumeEmbedForLifecycleState(lifecycleState)
+
+/** A navigation created while its owner is paused must carry a paused intent in the request. */
+internal fun embedNavigationDesiredPlaying(
+    pendingDesiredPlaying: Boolean,
+    lifecycleState: Lifecycle.State?,
+): Boolean = pendingDesiredPlaying && shouldResumeEmbedForLifecycleState(lifecycleState)
 
 internal fun shouldResumeEmbedForLifecycleEvent(event: Lifecycle.Event): Boolean =
     event == Lifecycle.Event.ON_RESUME
 
 /** Reversible lifecycle pause: never changes mute or volume state. */
-internal fun pauseEmbedMediaForLifecycleJs(): String = """
+internal fun pauseEmbedMediaForLifecycleJs(
+    supersedePlaybackMutation: Boolean = true,
+): String = """
     (function() {
+      function supersedePendingPlay() {
+        var previous = window.__aniliPlaybackMutationState;
+        var nextEpoch = previous && isFinite(previous.epoch) ? previous.epoch + 1 : 1;
+        window.__aniliPlaybackDesiredPlaying = false;
+        window.__aniliPlaybackMutationState = {
+          epoch: nextEpoch,
+          mediaIdentity: previous ? previous.mediaIdentity : '',
+          mediaGeneration: previous ? previous.mediaGeneration : 0,
+          desiredPlaying: false
+        };
+      }
+      function playbackMustStayPaused() {
+        return window.__aniliPlaybackDesiredPlaying !== true;
+      }
+      function pauseElement(media) {
+        if (!playbackMustStayPaused() || !media) return;
+        try { media.pause(); } catch (e) { /* detached media */ }
+      }
       function pauseMedia(root) {
         var media = root.querySelectorAll('video,audio');
         for (var i = 0; i < media.length; i++) {
-          try { media[i].pause(); } catch (e) { /* detached media */ }
+          pauseElement(media[i]);
         }
         var frames = root.querySelectorAll('iframe');
         for (var j = 0; j < frames.length; j++) {
           try {
             var child = frames[j].contentDocument;
-            if (child) pauseMedia(child);
+            if (child) {
+              installPlayGuard(child);
+              pauseMedia(child);
+            }
           } catch (e) { /* cross-origin */ }
         }
       }
-      try { pauseMedia(document); } catch (e) { /* ignored */ }
+      function installPlayGuard(root) {
+        if (!root || root.__aniliPauseGuardInstalled) return;
+        root.__aniliPauseGuardInstalled = true;
+        root.addEventListener('play', function(event) {
+          var target = event && event.target;
+          if (target && (target.tagName === 'VIDEO' || target.tagName === 'AUDIO')) {
+            pauseElement(target);
+          }
+        }, true);
+        var view = root.defaultView;
+        var Observer = view && view.MutationObserver;
+        if (Observer) {
+          try {
+            var observer = new Observer(function() { pauseMedia(root); });
+            observer.observe(root.documentElement || root, { childList: true, subtree: true });
+            root.__aniliPauseGuardObserver = observer;
+          } catch (e) { /* detached document */ }
+        }
+        if (view && typeof view.setInterval === 'function') {
+          root.__aniliPauseGuardTimer = view.setInterval(function() { pauseMedia(root); }, 1000);
+        }
+      }
+      ${if (supersedePlaybackMutation) "supersedePendingPlay();" else ""}
+      try {
+        installPlayGuard(document);
+        pauseMedia(document);
+      } catch (e) { /* ignored */ }
     })();
 """.trimIndent()
 
 /** Terminal teardown: pause and silence every reachable media element before blanking. */
 internal fun silenceEmbedMediaForTeardownJs(): String = """
     (function() {
+      function supersedePendingPlay() {
+        var previous = window.__aniliPlaybackMutationState;
+        var nextEpoch = previous && isFinite(previous.epoch) ? previous.epoch + 1 : 1;
+        window.__aniliPlaybackDesiredPlaying = false;
+        window.__aniliPlaybackMutationState = {
+          epoch: nextEpoch,
+          mediaIdentity: previous ? previous.mediaIdentity : '',
+          mediaGeneration: previous ? previous.mediaGeneration : 0,
+          desiredPlaying: false
+        };
+      }
       function silenceMedia(root) {
         var media = root.querySelectorAll('video,audio');
         for (var i = 0; i < media.length; i++) {
@@ -1964,6 +2864,7 @@ internal fun silenceEmbedMediaForTeardownJs(): String = """
           } catch (e) { /* cross-origin */ }
         }
       }
+      supersedePendingPlay();
       try { silenceMedia(document); } catch (e) { /* ignored */ }
     })();
 """.trimIndent()
@@ -1984,9 +2885,6 @@ private fun isInSkipWindow(positionMs: Long, startMs: Long?, endMs: Long?): Bool
     val end = endMs ?: return false
     return end > start && positionMs in start until end
 }
-
-private fun String?.hostOrNone(): String =
-    this?.let { runCatching { Uri.parse(it).host }.getOrNull() } ?: "none"
 
 /** Client used only while the outgoing episode is being replaced by `about:blank`. */
 private class EmbedTeardownWebViewClient(
@@ -2015,7 +2913,8 @@ private class EmbedTeardownWebViewClient(
         } else {
             DiagnosticsLog.event(
                 "EmbedWebView ignored stale/non-blank teardown finish " +
-                    "generation=${session.generation} callback=${url.hostOrNone()}",
+                    "generation=${session.generation} " +
+                    "callback=${privacySafeUrlDiagnosticLabel(url)}",
             )
         }
     }
@@ -2088,7 +2987,7 @@ private class EmbedNavigationWebViewClient(
         if (!allowed) {
             DiagnosticsLog.event(
                 "EmbedWebView blocked main-frame nav generation=${session.generation} " +
-                    "targetHost=${target.host.orEmpty()}",
+                    "target=${privacySafeUrlDiagnosticLabel(target.toString())}",
             )
         }
         return !allowed
@@ -2100,7 +2999,8 @@ private class EmbedNavigationWebViewClient(
         } else {
             DiagnosticsLog.event(
                 "EmbedWebView ignored page started generation=${session.generation} " +
-                    "callback=${url.hostOrNone()} current=${view?.url.hostOrNone()}",
+                    "callback=${privacySafeUrlDiagnosticLabel(url)} " +
+                    "current=${privacySafeUrlDiagnosticLabel(view?.url)}",
             )
         }
     }
@@ -2111,7 +3011,8 @@ private class EmbedNavigationWebViewClient(
         } else {
             DiagnosticsLog.event(
                 "EmbedWebView ignored page finished generation=${session.generation} " +
-                    "callback=${url.hostOrNone()} current=${view?.url.hostOrNone()}",
+                    "callback=${privacySafeUrlDiagnosticLabel(url)} " +
+                    "current=${privacySafeUrlDiagnosticLabel(view?.url)}",
             )
         }
     }
@@ -2121,15 +3022,17 @@ private class EmbedNavigationWebViewClient(
         if (!guard.acceptMainFrameError(session, request.url?.toString(), view?.url)) {
             DiagnosticsLog.event(
                 "EmbedWebView ignored main-frame error generation=${session.generation} " +
-                    "host=${request.url?.host ?: "unknown"}",
+                    privacySafeUrlDiagnosticLabel(request.url?.toString()),
             )
             return
         }
+        // Preserve the provider's text for the on-screen error only. Diagnostics below use
+        // controlled fields because a page can place its URL or credentials in this description.
         val message = error?.description?.toString() ?: "The server did not respond"
         DiagnosticsLog.event(
             "EmbedWebView main-frame error generation=${session.generation} " +
-                "code=${error?.errorCode} description=${error?.description} " +
-                "host=${request.url?.host ?: "unknown"}",
+                "category=web-resource code=${error?.errorCode ?: "unknown"} mainFrame=true " +
+                privacySafeUrlDiagnosticLabel(request.url?.toString()),
         )
         onMainFrameErrorAccepted(message)
     }
@@ -2143,15 +3046,15 @@ private class EmbedNavigationWebViewClient(
         if (!guard.acceptMainFrameError(session, request.url?.toString(), view?.url)) {
             DiagnosticsLog.event(
                 "EmbedWebView ignored main-frame HTTP error generation=${session.generation} " +
-                    "host=${request.url?.host ?: "unknown"}",
+                    privacySafeUrlDiagnosticLabel(request.url?.toString()),
             )
             return
         }
         val message = "HTTP ${errorResponse?.statusCode ?: "error"} from the video server"
         DiagnosticsLog.event(
             "EmbedWebView main-frame HTTP error generation=${session.generation} " +
-                "status=${errorResponse?.statusCode} reason=${errorResponse?.reasonPhrase} " +
-                "host=${request.url?.host ?: "unknown"}",
+                "category=http status=${errorResponse?.statusCode ?: "unknown"} mainFrame=true " +
+                privacySafeUrlDiagnosticLabel(request.url?.toString()),
         )
         onMainFrameErrorAccepted(message)
     }
@@ -2170,10 +3073,10 @@ private class EmbedNavigationWebViewClient(
 
 internal class WebProgressBridge(
     private val expectedToken: String,
-    private val onTickCallback: (String, Double, Double, Boolean, Boolean, Double, String) -> Unit,
+    private val onTickCallback: (String, Double, Double, Boolean, Boolean, Double, String, Long) -> Unit,
     private val onVideoAvailableCallback: (String) -> Unit,
-    private val onEndedCallback: (String, Double, Double, Int) -> Unit,
-    private val onCommandResultCallback: (String, String, Boolean, Double, Boolean, String) -> Unit,
+    private val onEndedCallback: (String, Double, Double, Int, String, Long) -> Unit,
+    private val onCommandResultCallback: (String, String, Boolean, Double, Boolean, String, Long) -> Unit,
 ) {
     /** Compatibility constructor for callers that do not need navigation identity. */
     constructor(
@@ -2182,12 +3085,12 @@ internal class WebProgressBridge(
         onVideoAvailableCallback: () -> Unit,
     ) : this(
         expectedToken = expectedToken,
-        onTickCallback = { _, positionSec, durationSec, isPlaying, muted, volume, _ ->
+        onTickCallback = { _, positionSec, durationSec, isPlaying, muted, volume, _, _ ->
             onTickCallback(positionSec, durationSec, isPlaying, muted, volume)
         },
         onVideoAvailableCallback = { onVideoAvailableCallback() },
-        onEndedCallback = { _, _, _, _ -> },
-        onCommandResultCallback = { _, _, _, _, _, _ -> },
+        onEndedCallback = { _, _, _, _, _, _ -> },
+        onCommandResultCallback = { _, _, _, _, _, _, _ -> },
     )
 
     @JavascriptInterface
@@ -2200,9 +3103,19 @@ internal class WebProgressBridge(
         muted: Boolean,
         volume: Double,
         mediaIdentity: String,
+        mediaGeneration: Long,
     ) {
         if (capabilityToken != expectedToken) return
-        onTickCallback(navigationToken, positionSec, durationSec, isPlaying, muted, volume, mediaIdentity)
+        onTickCallback(
+            navigationToken,
+            positionSec,
+            durationSec,
+            isPlaying,
+            muted,
+            volume,
+            mediaIdentity,
+            mediaGeneration,
+        )
     }
 
     fun onTick(
@@ -2221,6 +3134,7 @@ internal class WebProgressBridge(
         muted,
         volume,
         "",
+        0L,
     )
 
     @JavascriptInterface
@@ -2239,9 +3153,18 @@ internal class WebProgressBridge(
         positionSec: Double,
         durationSec: Double,
         observedPlayingSamples: Int,
+        mediaIdentity: String,
+        mediaGeneration: Long,
     ) {
         if (capabilityToken != expectedToken) return
-        onEndedCallback(navigationToken, positionSec, durationSec, observedPlayingSamples)
+        onEndedCallback(
+            navigationToken,
+            positionSec,
+            durationSec,
+            observedPlayingSamples,
+            mediaIdentity,
+            mediaGeneration,
+        )
     }
 
     @JavascriptInterface
@@ -2253,8 +3176,17 @@ internal class WebProgressBridge(
         positionSec: Double,
         isPlaying: Boolean,
         mediaIdentity: String,
+        mediaGeneration: Long,
     ) {
         if (capabilityToken != expectedToken) return
-        onCommandResultCallback(navigationToken, commandId, succeeded, positionSec, isPlaying, mediaIdentity)
+        onCommandResultCallback(
+            navigationToken,
+            commandId,
+            succeeded,
+            positionSec,
+            isPlaying,
+            mediaIdentity,
+            mediaGeneration,
+        )
     }
 }

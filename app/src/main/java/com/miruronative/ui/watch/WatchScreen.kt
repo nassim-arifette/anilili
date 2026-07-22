@@ -313,7 +313,7 @@ fun WatchScreen(
                     DiagnosticsLog.event("WatchScreen still loading after 10000ms id=$animeId provider=$provider")
                 }
             }
-            is UiState.Error -> DiagnosticsLog.event("WatchScreen error visible message=${s.message.take(160)}")
+            is UiState.Error -> DiagnosticsLog.event("WatchScreen error visible category=watch-load")
             is UiState.Success -> {
                 val stream = s.data.chosenStream
                 DiagnosticsLog.event(
@@ -508,6 +508,7 @@ fun WatchScreen(
                     onFullscreenChanged = { fullscreen = it },
                     onNativePlaybackIdentityChanged = vm::onNativePlaybackIdentityChanged,
                     onNativePlaybackEnded = vm::onNativePlaybackEnded,
+                    onEmbedMediaIdentityChanged = vm::onEmbedMediaIdentityChanged,
                     onEmbedProgress = vm::onEmbedProgress,
                     onEmbedPlaybackEnded = vm::onEmbedPlaybackEnded,
                     onNativeProgress = vm::onNativeProgress,
@@ -543,7 +544,8 @@ private fun WatchContent(
     onFullscreenChanged: (Boolean) -> Unit,
     onNativePlaybackIdentityChanged: (NativePlaybackIdentity) -> Unit,
     onNativePlaybackEnded: (NativePlaybackCompletion) -> Boolean,
-    onEmbedProgress: (EmbedPlaybackKey, Long, Long) -> Unit,
+    onEmbedMediaIdentityChanged: (EmbedMediaIdentity) -> Unit,
+    onEmbedProgress: (EmbedMediaIdentity, Long, Long) -> Unit,
     onEmbedPlaybackEnded: (EmbedPlaybackCompletion) -> Boolean,
     onNativeProgress: (PlaybackIdentity, Long, Long, Boolean) -> Unit,
     onPlaybackError: (PlaybackIdentity, String, String, Long, Set<String>) -> Unit,
@@ -731,6 +733,11 @@ private fun WatchContent(
                                 qualityStreams = data.sources.embedStreams,
                                 startPositionMs = data.startPositionMs,
                                 skip = data.sources.skip,
+                                aniSkipSegments = data.aniSkipSegments,
+                                aniSkipLookupStatus = data.aniSkipLookupStatus,
+                                seriesTitle = data.seriesTitle,
+                                episodeTitle = "Episode ${data.current.displayNumber}" +
+                                    (data.current.title?.let { ": $it" } ?: ""),
                                 onPreviousEpisode = onEmbedPrevious,
                                 onNextEpisode = onEmbedNext,
                                 hasPreviousEpisode = data.hasPrev,
@@ -739,6 +746,7 @@ private fun WatchContent(
                                 isFullscreen = fullscreen,
                                 onToggleFullscreen = onToggleFullscreen,
                                 onFullscreenChanged = onFullscreenChanged,
+                                onActiveMediaChanged = onEmbedMediaIdentityChanged,
                                 onProgress = onEmbedProgress,
                                 onPlaybackEnded = onEmbedPlaybackEnded,
                                 onPlaybackError = onEmbedPlaybackError.takeIf { data.provider == "allanime" },
@@ -772,6 +780,8 @@ private fun WatchContent(
                         subtitles = data.sources.subtitles,
                         subtitleOffsetMs = data.sources.subtitleOffsetMs,
                         skip = data.sources.skip,
+                        aniSkipSegments = data.aniSkipSegments,
+                        aniSkipLookupStatus = data.aniSkipLookupStatus,
                         seriesTitle = data.seriesTitle,
                         episodeTitle = "Episode ${data.current.displayNumber}" +
                             (data.current.title?.let { ": $it" } ?: ""),

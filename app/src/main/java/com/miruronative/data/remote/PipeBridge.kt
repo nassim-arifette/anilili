@@ -11,6 +11,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
 
@@ -105,14 +106,15 @@ object PipeBridge {
                     host == originHost || host.endsWith(".$originHost")
                 }
                 if (!allowed) {
-                    DiagnosticsLog.event("PipeBridge blocked nav: $url")
-                    Log.d(TAG, "blocked nav: $url")
+                    val diagnosticUrl = privacySafeUrlDiagnosticLabel(url.toString())
+                    DiagnosticsLog.event("PipeBridge blocked nav $diagnosticUrl")
+                    Log.d(TAG, "blocked nav $diagnosticUrl")
                 }
                 return !allowed
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                DiagnosticsLog.event("PipeBridge page started: ${url ?: "unknown"}")
+                DiagnosticsLog.event("PipeBridge page started ${privacySafeUrlDiagnosticLabel(url)}")
                 if (isCurrent(attached, view)) {
                     lifecycle.beginNavigation(attached.session)?.let { navigation ->
                         attached.readinessGeneration = navigation.readinessGeneration
@@ -122,8 +124,9 @@ object PipeBridge {
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
-                DiagnosticsLog.event("PipeBridge page finished: ${url ?: "unknown"} title=${view?.title ?: "none"}")
-                Log.d(TAG, "onPageFinished: $url  title=${view?.title}")
+                val diagnosticUrl = privacySafeUrlDiagnosticLabel(url)
+                DiagnosticsLog.event("PipeBridge page finished $diagnosticUrl")
+                Log.d(TAG, "onPageFinished $diagnosticUrl")
                 if (!isCurrent(attached, view)) return
                 // Give Cloudflare a moment to settle, then allow fetches.
                 val origin = activeOrigin(attached)
@@ -156,8 +159,9 @@ object PipeBridge {
                 val failedUrl = request.url.toString()
                 if (failedUrl != origin && !failedUrl.startsWith("$origin/")) return
                 DiagnosticsLog.event(
-                    "PipeBridge main-frame error code=${error?.errorCode} " +
-                        "description=${error?.description} origin=$origin",
+                    "PipeBridge main-frame error category=web-resource " +
+                        "code=${error?.errorCode ?: "unknown"} mainFrame=true " +
+                        privacySafeUrlDiagnosticLabel(failedUrl),
                 )
                 // This mirror is unreachable (ISP block, DNS, site down): roll to the next one.
                 // Only once all mirrors fail do waiters unblock into the cache/error path.
@@ -168,7 +172,9 @@ object PipeBridge {
                     }
                     attached.originIndex++
                     val nextOrigin = activeOrigin(attached)
-                    DiagnosticsLog.event("PipeBridge trying mirror $nextOrigin")
+                    DiagnosticsLog.event(
+                        "PipeBridge trying mirror ${privacySafeUrlDiagnosticLabel(nextOrigin)}",
+                    )
                     main.post {
                         if (isCurrent(attached)) attached.view.loadUrl("$nextOrigin/")
                     }
@@ -196,7 +202,7 @@ object PipeBridge {
             }
         }
         val origin = activeOrigin(attached)
-        DiagnosticsLog.event("PipeBridge load origin=$origin")
+        DiagnosticsLog.event("PipeBridge load ${privacySafeUrlDiagnosticLabel(origin)}")
         wv.loadUrl("$origin/")
     }
 
@@ -227,7 +233,8 @@ object PipeBridge {
             DiagnosticsLog.event("PipeBridge fetch timeout e.len=${e.length}")
             errorPayload("timeout")
         }
-        Log.d(TAG, "fetch(e.len=${e.length}) -> ${result.take(180)}")
+        // Pipe responses may contain signed media URLs. Log sizes only, never response contents.
+        Log.d(TAG, "fetch(e.len=${e.length}) result.len=${result.length}")
         return result
     }
 
@@ -296,7 +303,8 @@ object PipeBridge {
                         attached.view.evaluateJavascript(js, null)
                         scheduleIdle()
                     } catch (error: Throwable) {
-                        Log.w(TAG, "evaluateJavascript failed", error)
+                        val errorType = error.javaClass.simpleName.ifBlank { "unknown" }
+                        Log.w(TAG, "evaluateJavascript failed type=$errorType")
                         failRequest(request, "webview request failed")
                     }
                 }

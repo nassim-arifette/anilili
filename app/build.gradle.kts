@@ -53,8 +53,8 @@ android {
         applicationId = forkApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 31
-        versionName = "0.2.2"
+        versionCode = 32
+        versionName = "0.3.0"
         resValue("string", "application_id", forkApplicationId)
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

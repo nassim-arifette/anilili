@@ -66,6 +66,31 @@ class PlaybackIdentityTest {
     }
 
     @Test
+    fun `managed embed target requires its exact concrete media instance`() {
+        val concrete = PlaybackIdentity(
+            animeId = 101,
+            episodeNumber = 6.0,
+            generation = 12,
+            mediaId = "https://cdn.example/episode-6.m3u8",
+            mediaInstanceId = "embed:40:2",
+            aniSkipSourceIdentity = "embed-sha256:current",
+        )
+        val embedTarget = active.copy(allowedMediaInstanceIds = setOf("embed:40:2"))
+
+        assertTrue(acceptsPlaybackProgress(concrete, embedTarget))
+        assertFalse(
+            acceptsPlaybackProgress(
+                concrete.copy(
+                    mediaInstanceId = "embed:40:1",
+                    aniSkipSourceIdentity = "embed-sha256:former",
+                ),
+                embedTarget,
+            ),
+        )
+        assertFalse(acceptsPlaybackProgress(concrete, embedTarget.copy(allowedMediaInstanceIds = emptySet())))
+    }
+
+    @Test
     fun `native error requires matching callback identity and media id`() {
         val current = PlaybackIdentity(101, 6.0, 12, "https://cdn.example/episode-6.m3u8")
 
@@ -114,5 +139,29 @@ class PlaybackIdentityTest {
 
         assertTrue(isNewConfirmedPlayback(current, current.copy(episodeNumber = 7.0)))
         assertTrue(isNewConfirmedPlayback(current, current.copy(generation = 13)))
+    }
+
+    @Test
+    fun `signed media and AniSkip identities are redacted from diagnostics`() {
+        val signedMedia = "https://embed.example/watch?signature=document-secret"
+        val aniSkipIdentity = "embed-sha256:private-cache-scope"
+        val identity = PlaybackIdentity(
+            animeId = 101,
+            episodeNumber = 6.0,
+            generation = 12,
+            mediaId = signedMedia,
+            mediaInstanceId = "embed:40:2",
+            aniSkipSourceIdentity = aniSkipIdentity,
+        )
+        val diagnostic = identity.toString()
+
+        assertFalse(diagnostic.contains(signedMedia))
+        assertFalse(diagnostic.contains("document-secret"))
+        assertFalse(diagnostic.contains(aniSkipIdentity))
+        assertEquals(aniSkipIdentity, identity.sourceIdentityForAniSkipLookup())
+        assertEquals(
+            signedMedia,
+            identity.copy(aniSkipSourceIdentity = null).sourceIdentityForAniSkipLookup(),
+        )
     }
 }

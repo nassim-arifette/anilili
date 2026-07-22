@@ -1,6 +1,9 @@
 package com.miruronative.ui.watch
 
 import java.net.URI
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicLong
 
 /** Stable playback identity supplied by WatchContent independently of provider URL reuse. */
 data class EmbedPlaybackKey(
@@ -17,6 +20,159 @@ internal fun acceptsEmbedPlaybackCallback(
     current: EmbedPlaybackKey,
 ): Boolean = reported == current
 
+/** The video selected inside one embed document, including its monotonic in-document handoff. */
+data class EmbedVideoIdentity(
+    val mediaId: String,
+    val generation: Long,
+) {
+    internal val isValid: Boolean
+        get() = mediaId.isNotBlank() && generation > 0L
+
+    // currentSrc can contain a signed CDN URL. Keep accidental diagnostics and assertion failures
+    // from serializing it while still retaining the exact value in memory for command matching.
+    override fun toString(): String =
+        "EmbedVideoIdentity(mediaId=<redacted>, generation=$generation)"
+}
+
+/**
+ * Identifies both the embed document and, once known, the actual video that owns callbacks.
+ *
+ * [documentMediaId] and [videoIdentity] are kept in memory only and may contain signed URLs.
+ * Callers must not log them or use them verbatim as a persistent key.
+ */
+data class EmbedMediaIdentity(
+    val playbackKey: EmbedPlaybackKey,
+    val navigationGeneration: Long,
+    val documentMediaId: String,
+    val videoIdentity: EmbedVideoIdentity? = null,
+) {
+    internal val isConcrete: Boolean
+        get() = documentMediaId.isNotBlank() && videoIdentity?.isValid == true
+
+    /** Opaque per-process instance key used to reject a former video's late AniSkip response. */
+    internal val mediaInstanceId: String?
+        get() = videoIdentity?.takeIf { it.isValid }?.let { video ->
+            "embed:$navigationGeneration:${video.generation}"
+        }
+
+    /**
+     * Privacy-safe concrete-session fingerprint supplied to the repository cache layer. Including
+     * both handoff generations prevents even a same-URL/same-duration replacement from reusing
+     * markers. The repository SHA-256 scopes this value again in its persistent cache key.
+     */
+    internal fun aniSkipSourceIdentity(): String? {
+        val video = videoIdentity?.takeIf { it.isValid } ?: return null
+        if (documentMediaId.isBlank()) return null
+        val material = buildString {
+            append(navigationGeneration)
+            append('|')
+            append(video.generation)
+            append('|')
+            append(documentMediaId.length)
+            append(':')
+            append(documentMediaId)
+            append('|')
+            append(video.mediaId.length)
+            append(':')
+            append(video.mediaId)
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(material.toByteArray(StandardCharsets.UTF_8))
+            .joinToString(separator = "") { byte ->
+                (byte.toInt() and 0xff).toString(radix = 16).padStart(length = 2, padChar = '0')
+            }
+        return "embed-sha256:$digest"
+    }
+
+    override fun toString(): String =
+        "EmbedMediaIdentity(playbackKey=$playbackKey, navigationGeneration=$navigationGeneration, " +
+            "documentMediaId=<redacted>, videoIdentity=$videoIdentity)"
+}
+
+/**
+ * Separates the two identities needed by managed embed progress. The raw selected document stays
+ * in memory as [PlaybackIdentity.mediaId] so WatchData can validate and persist a final tick, while
+ * AniSkip receives only an opaque concrete-video fingerprint. The instance id remains independent
+ * so a later video selected inside the same document invalidates the former video's progress.
+ */
+internal fun EmbedMediaIdentity.playbackProgressIdentity(): PlaybackIdentity? {
+    val instanceId = mediaInstanceId ?: return null
+    val aniSkipIdentity = aniSkipSourceIdentity() ?: return null
+    if (!isConcrete) return null
+    return PlaybackIdentity(
+        animeId = playbackKey.animeId,
+        episodeNumber = playbackKey.episodeNumber,
+        generation = playbackKey.sourceGeneration,
+        mediaId = documentMediaId,
+        mediaInstanceId = instanceId,
+        aniSkipSourceIdentity = aniSkipIdentity,
+    )
+}
+
+/** A callback must belong to both the current route and its latest concrete embed navigation. */
+internal fun acceptsEmbedMediaCallback(
+    reported: EmbedMediaIdentity,
+    active: EmbedMediaIdentity?,
+    currentPlaybackKey: EmbedPlaybackKey,
+): Boolean = reported.isConcrete &&
+    reported.playbackKey == currentPlaybackKey &&
+    reported == active
+
+/** Require final-save paths to accept only the concrete video currently active in this document. */
+internal fun ActivePlaybackTarget.scopedToActiveEmbedMedia(
+    active: EmbedMediaIdentity?,
+    currentPlaybackKey: EmbedPlaybackKey,
+): ActivePlaybackTarget {
+    val instanceId = active
+        ?.takeIf { candidate ->
+            acceptsEmbedMediaCallback(candidate, candidate, currentPlaybackKey) &&
+                candidate.documentMediaId in mediaIds
+        }
+        ?.mediaInstanceId
+    // An empty set is deliberate: a managed embed without a concrete active video must reject a
+    // queued sample. `null` is reserved for native playback, where no in-document instance exists.
+    return copy(allowedMediaInstanceIds = setOfNotNull(instanceId))
+}
+
+internal enum class EmbedMediaHandoffDecision {
+    REJECT,
+    KEEP,
+    ACTIVATE_AND_RESET_ANISKIP,
+}
+
+/**
+ * A quality URL starts a new concrete media session even though the logical episode key is stable.
+ * The replacement must clear duration-adjusted markers until its own duration-bearing tick arrives.
+ */
+internal fun planEmbedMediaHandoff(
+    active: EmbedMediaIdentity?,
+    reported: EmbedMediaIdentity,
+    currentPlaybackKey: EmbedPlaybackKey,
+): EmbedMediaHandoffDecision = when {
+    reported.documentMediaId.isBlank() ||
+        reported.playbackKey != currentPlaybackKey ||
+        reported.videoIdentity?.isValid == false ->
+        EmbedMediaHandoffDecision.REJECT
+    reported == active -> EmbedMediaHandoffDecision.KEEP
+    active == null || active.playbackKey != reported.playbackKey ->
+        EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP
+    reported.navigationGeneration < active.navigationGeneration ->
+        EmbedMediaHandoffDecision.REJECT
+    reported.navigationGeneration > active.navigationGeneration ->
+        EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP
+    reported.documentMediaId != active.documentMediaId ->
+        EmbedMediaHandoffDecision.REJECT
+    active.videoIdentity == null && reported.videoIdentity != null ->
+        EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP
+    active.videoIdentity != null && reported.videoIdentity == null ->
+        EmbedMediaHandoffDecision.REJECT
+    checkNotNull(reported.videoIdentity).generation <= checkNotNull(active.videoIdentity).generation ->
+        // Equal generations with different raw identities are inconsistent. Lower generations are
+        // queued callbacks from a video that the current document has already replaced.
+        EmbedMediaHandoffDecision.REJECT
+    else -> EmbedMediaHandoffDecision.ACTIVATE_AND_RESET_ANISKIP
+}
+
 /** Compose remember key for one logical playback plus its selected embed document. */
 internal data class EmbedNavigationIdentity(
     val playbackKey: EmbedPlaybackKey,
@@ -30,6 +186,7 @@ internal data class EmbedNavigationRequest(
     val documentUrl: String,
     val allowedMainFrameHost: String?,
     val resumePositionMs: Long,
+    val resumeDesiredPlaying: Boolean,
 )
 
 /**
@@ -56,14 +213,14 @@ internal class EmbedNavigationSession internal constructor(
  * generation explicitly. Cross-origin iframe access is intentionally outside this contract.
  */
 internal class EmbedNavigationGuard {
-    private var nextGeneration: Long = 0L
-
     @Volatile
     private var activeGeneration: Long = NO_GENERATION
 
     @Synchronized
     fun begin(request: EmbedNavigationRequest): EmbedNavigationSession {
-        val generation = ++nextGeneration
+        // Process-wide monotonicity lets the ViewModel order callbacks even if Compose recreates
+        // the WebView/guard while retaining the same logical playback key.
+        val generation = nextGlobalGeneration.incrementAndGet()
         activeGeneration = generation
         return EmbedNavigationSession(generation, request)
     }
@@ -170,6 +327,7 @@ internal class EmbedNavigationGuard {
 
     private companion object {
         const val NO_GENERATION = 0L
+        val nextGlobalGeneration = AtomicLong(NO_GENERATION)
     }
 }
 
@@ -248,6 +406,7 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
       ${embedContentVideoSelectorJs()}
       var observedVideo = null;
       var observedMediaKey = null;
+      var observedMediaGeneration = 0;
       var observedPlayingSamples = 0;
       var endedHandler = null;
       var endedReportedMediaKey = null;
@@ -264,7 +423,9 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
             navigationToken,
             video.currentTime,
             video.duration,
-            observedPlayingSamples
+            observedPlayingSamples,
+            key,
+            observedMediaGeneration
           );
         } catch (e) { /* bridge detached */ }
       }
@@ -280,6 +441,7 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
         }
         observedVideo = video;
         observedMediaKey = key;
+        observedMediaGeneration = __aniliBindMediaGeneration(video);
         observedPlayingSamples = 0;
         endedReportedMediaKey = null;
       }
@@ -303,7 +465,9 @@ internal fun progressPollJs(navigationGeneration: Long): String = """
               v.duration,
               !v.paused,
               v.muted,
-              v.volume
+              v.volume,
+              mediaKey(v),
+              observedMediaGeneration
             );
             if (v.ended) reportEnded(v);
           }

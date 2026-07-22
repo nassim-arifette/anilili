@@ -15,7 +15,9 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -24,11 +26,20 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ClosedCaption
+import androidx.compose.material.icons.filled.PictureInPictureAlt
+import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -41,7 +52,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -49,6 +63,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -59,6 +74,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.miruronative.playback.SubtitleDelay
@@ -81,13 +97,15 @@ internal data class PlayerQualityOption(
     val onSelect: () -> Unit,
 )
 
-private val SheetColor = Color(0xFF1B1B1F)
+private val SheetColor = Color(0xFF151417)
+private val SheetMuted = Color(0xFFAAA6AF)
 
 /**
- * The player's settings, as a bottom sheet styled to match the shared player chrome: volume,
- * playback speed, quality, and playback toggles. Every section is capability-gated — pass `null`
- * or an empty list and it isn't drawn — so the same sheet serves the native and embed players
- * without either showing a control it can't honor.
+ * Capability-aware settings for both native and embed playback.
+ *
+ * Phones first see five understandable groups and drill into one at a time. This keeps the first
+ * sheet calm while preserving every existing control. TV uses the same navigation inside its
+ * in-window panel, retaining D-pad focus instead of opening a separate dialog window.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -95,6 +113,7 @@ internal fun PlayerSettingsSheet(
     onDismiss: () -> Unit,
     autoplay: Boolean,
     onAutoplayChange: (Boolean) -> Unit,
+    canAutomatePlayback: Boolean = true,
     speed: Float? = null,
     onSpeedChange: (Float) -> Unit = {},
     qualityOptions: List<PlayerQualityOption> = emptyList(),
@@ -109,62 +128,267 @@ internal fun PlayerSettingsSheet(
     onSubtitleDelayChange: (Long) -> Unit = {},
     onEnterPip: (() -> Unit)? = null,
 ) {
-    val sections: @Composable () -> Unit = {
-        SheetSections(
-            autoplay = autoplay,
-            onAutoplayChange = onAutoplayChange,
-            speed = speed,
-            onSpeedChange = onSpeedChange,
-            qualityOptions = qualityOptions,
-            subtitleOptions = subtitleOptions,
-            audioOptions = audioOptions,
-            contentScale = contentScale,
-            onContentScaleChange = onContentScaleChange,
-            onCaptionAppearance = onCaptionAppearance,
-            autoSkip = autoSkip,
-            onAutoSkipChange = onAutoSkipChange,
-            subtitleDelayMs = subtitleDelayMs,
-            onSubtitleDelayChange = onSubtitleDelayChange,
-            onEnterPip = onEnterPip,
+    val isTv = LocalAppDeviceProfile.current.isTv
+    val headerFocusRequester = remember { FocusRequester() }
+    var selectedSection by remember { mutableStateOf<PlayerSettingsSection?>(null) }
+    val availability = PlayerSettingsAvailability(
+        hasPlaybackAutomation = canAutomatePlayback,
+        hasSpeed = speed != null,
+        hasQuality = qualityOptions.isNotEmpty(),
+        hasContentScale = contentScale != null,
+        hasAudioTracks = audioOptions.size > 1,
+        hasSubtitles = subtitleOptions.isNotEmpty(),
+        hasSubtitleDelay = subtitleDelayMs != null,
+        hasCaptionAppearance = onCaptionAppearance != null,
+        hasPictureInPicture = onEnterPip != null,
+    )
+    val sections = remember(availability) { availablePlayerSettingsSections(availability) }
+    val title = selectedSection?.title ?: "Player settings"
+    val navigateBack = { selectedSection = null }
+
+    val content: @Composable () -> Unit = {
+        // ModalBottomSheet lives in a ComponentDialog. Registering this outside its content makes
+        // the dialog consume Back first and dismiss the whole sheet. Inside the dialog, Back from
+        // a detail section returns to the section list; TV uses this same handler before its panel
+        // handler closes the landing page.
+        BackHandler(enabled = selectedSection != null, onBack = navigateBack)
+        SettingsHeader(
+            title = title,
+            canNavigateBack = selectedSection != null,
+            onBack = navigateBack,
+            onClose = onDismiss,
+            initialFocusRequester = headerFocusRequester.takeIf { isTv },
         )
+        Spacer(Modifier.height(8.dp))
+        if (selectedSection == null) {
+            SettingsLanding(
+                sections = sections,
+                autoplay = autoplay,
+                canAutomatePlayback = canAutomatePlayback,
+                speed = speed,
+                qualityOptions = qualityOptions,
+                audioOptions = audioOptions,
+                subtitleOptions = subtitleOptions,
+                contentScale = contentScale,
+                onOpen = { selectedSection = it },
+            )
+        } else {
+            SettingsSectionContent(
+                section = selectedSection!!,
+                autoplay = autoplay,
+                onAutoplayChange = onAutoplayChange,
+                canAutomatePlayback = canAutomatePlayback,
+                speed = speed,
+                onSpeedChange = onSpeedChange,
+                qualityOptions = qualityOptions,
+                subtitleOptions = subtitleOptions,
+                audioOptions = audioOptions,
+                contentScale = contentScale,
+                onContentScaleChange = onContentScaleChange,
+                onCaptionAppearance = onCaptionAppearance,
+                autoSkip = autoSkip,
+                onAutoSkipChange = onAutoSkipChange,
+                subtitleDelayMs = subtitleDelayMs,
+                onSubtitleDelayChange = onSubtitleDelayChange,
+                onEnterPip = onEnterPip,
+            )
+        }
     }
-    // A ModalBottomSheet opens a second window, which the TV D-pad and TalkBack focus never
-    // reliably enter — the remote keeps driving the player underneath. TV gets the same
-    // sections as an in-window side panel instead, where standard Compose focus applies.
-    if (LocalAppDeviceProfile.current.isTv) {
-        TvSettingsPanel(onDismiss, sections)
+
+    if (isTv) {
+        TvSettingsPanel(
+            title = title,
+            onBack = if (selectedSection == null) onDismiss else navigateBack,
+            initialFocusRequester = headerFocusRequester,
+            content = content,
+        )
         return
     }
+
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
         containerColor = SheetColor,
-        dragHandle = { BottomSheetDefaults.DragHandle() },
+        dragHandle = { BottomSheetDefaults.DragHandle(color = SheetMuted.copy(alpha = 0.7f)) },
     ) {
         Column(
             Modifier
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
-                .padding(start = 22.dp, end = 22.dp, bottom = 32.dp),
+                .padding(start = 20.dp, end = 20.dp, bottom = 32.dp),
         ) {
-            Text(
-                "Settings",
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.titleLarge,
-            )
-            Spacer(Modifier.height(12.dp))
-            sections()
+            content()
         }
     }
 }
 
+@Composable
+private fun SettingsHeader(
+    title: String,
+    canNavigateBack: Boolean,
+    onBack: () -> Unit,
+    onClose: () -> Unit,
+    initialFocusRequester: FocusRequester? = null,
+) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 56.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (canNavigateBack) {
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier
+                        .focusHighlight(RoundedCornerShape(24.dp))
+                        .then(initialFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
+                        .size(48.dp),
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                }
+            }
+            Text(
+                title,
+                color = Color(0xFFF3F0F5),
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleLarge,
+            )
+        }
+        IconButton(
+            onClick = onClose,
+            modifier = Modifier
+                .focusHighlight(RoundedCornerShape(24.dp))
+                .then(
+                    if (!canNavigateBack) {
+                        initialFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier
+                    } else {
+                        Modifier
+                    },
+                )
+                .size(48.dp),
+        ) {
+            Icon(Icons.Default.Close, contentDescription = "Close settings", tint = SheetMuted)
+        }
+    }
+}
+
+@Composable
+private fun SettingsLanding(
+    sections: List<PlayerSettingsSection>,
+    autoplay: Boolean,
+    canAutomatePlayback: Boolean,
+    speed: Float?,
+    qualityOptions: List<PlayerQualityOption>,
+    audioOptions: List<PlayerQualityOption>,
+    subtitleOptions: List<PlayerQualityOption>,
+    contentScale: PlayerContentScale?,
+    onOpen: (PlayerSettingsSection) -> Unit,
+) {
+    Text(
+        "Only controls supported by this source are shown.",
+        color = SheetMuted,
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.padding(bottom = 10.dp),
+    )
+    sections.forEachIndexed { index, section ->
+        SettingsLandingRow(
+            section = section,
+            summary = sectionSummary(
+                section = section,
+                autoplay = autoplay,
+                canAutomatePlayback = canAutomatePlayback,
+                speed = speed,
+                qualityOptions = qualityOptions,
+                audioOptions = audioOptions,
+                subtitleOptions = subtitleOptions,
+                contentScale = contentScale,
+            ),
+            onClick = { onOpen(section) },
+        )
+        if (index != sections.lastIndex) HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+    }
+}
+
+@Composable
+private fun SettingsLandingRow(
+    section: PlayerSettingsSection,
+    summary: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 68.dp)
+            .focusHighlight(RoundedCornerShape(10.dp))
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = section.icon(),
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(26.dp),
+        )
+        Column(Modifier.weight(1f).padding(start = 16.dp, end = 8.dp)) {
+            Text(section.title, color = Color.White, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                summary,
+                color = SheetMuted,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Icon(
+            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+            contentDescription = null,
+            tint = SheetMuted,
+        )
+    }
+}
+
+private fun PlayerSettingsSection.icon(): ImageVector = when (this) {
+    PlayerSettingsSection.PLAYBACK -> Icons.Default.PlayCircle
+    PlayerSettingsSection.VIDEO -> Icons.Default.AspectRatio
+    PlayerSettingsSection.AUDIO -> Icons.AutoMirrored.Filled.VolumeUp
+    PlayerSettingsSection.SUBTITLES -> Icons.Default.ClosedCaption
+    PlayerSettingsSection.ADVANCED -> Icons.Default.Tune
+}
+
+private fun sectionSummary(
+    section: PlayerSettingsSection,
+    autoplay: Boolean,
+    canAutomatePlayback: Boolean,
+    speed: Float?,
+    qualityOptions: List<PlayerQualityOption>,
+    audioOptions: List<PlayerQualityOption>,
+    subtitleOptions: List<PlayerQualityOption>,
+    contentScale: PlayerContentScale?,
+): String = when (section) {
+    PlayerSettingsSection.PLAYBACK -> buildList {
+        if (canAutomatePlayback) add(if (autoplay) "Auto next on" else "Auto next off")
+        speed?.let { add(it.formatPlaybackSpeed()) }
+    }.joinToString(" · ")
+    PlayerSettingsSection.VIDEO -> listOfNotNull(
+        qualityOptions.firstOrNull { it.selected }?.label,
+        contentScale?.label,
+    ).ifEmpty { listOf("Source defaults") }.joinToString(" · ")
+    PlayerSettingsSection.AUDIO ->
+        audioOptions.firstOrNull { it.selected }?.label ?: "Device volume"
+    PlayerSettingsSection.SUBTITLES ->
+        subtitleOptions.firstOrNull { it.selected }?.label ?: "Off or source defaults"
+    PlayerSettingsSection.ADVANCED -> "Picture-in-Picture"
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SheetSections(
+private fun SettingsSectionContent(
+    section: PlayerSettingsSection,
     autoplay: Boolean,
     onAutoplayChange: (Boolean) -> Unit,
+    canAutomatePlayback: Boolean,
     speed: Float?,
     onSpeedChange: (Float) -> Unit,
     qualityOptions: List<PlayerQualityOption>,
@@ -179,116 +403,113 @@ private fun SheetSections(
     onSubtitleDelayChange: (Long) -> Unit,
     onEnterPip: (() -> Unit)?,
 ) {
-    SectionLabel("Volume")
-    MediaVolumeSlider(modifier = Modifier.fillMaxWidth(), showPercentLabel = true)
-
-    speed?.let { current ->
-        SectionLabel("Playback Speed")
-        SpeedSlider(current, onSpeedChange)
-    }
-
-    if (qualityOptions.isNotEmpty()) {
-        SectionLabel("Quality")
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            qualityOptions.forEach { option ->
-                ChoiceChip(option.label, option.selected, option.onSelect)
+    when (section) {
+        PlayerSettingsSection.PLAYBACK -> {
+            if (canAutomatePlayback) {
+                ToggleRow("Auto-play next episode", autoplay, onAutoplayChange)
+                autoSkip?.let {
+                    ToggleRow(
+                        label = "Auto-skip standard intro/outro",
+                        checked = it,
+                        onCheckedChange = onAutoSkipChange,
+                        supportingText = "Mixed themes and recaps stay manual.",
+                    )
+                }
+            }
+            speed?.let { current ->
+                SectionLabel("Speed")
+                SpeedSlider(current, onSpeedChange)
+            }
+        }
+        PlayerSettingsSection.VIDEO -> {
+            if (qualityOptions.isNotEmpty()) {
+                SectionLabel("Quality")
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    qualityOptions.forEach { ChoiceChip(it.label, it.selected, it.onSelect) }
+                }
+            }
+            contentScale?.let { current ->
+                SectionLabel("Video fit")
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    PlayerContentScale.entries.forEach { scale ->
+                        ChoiceChip(scale.label, scale == current) { onContentScaleChange(scale) }
+                    }
+                }
+            }
+        }
+        PlayerSettingsSection.AUDIO -> {
+            SectionLabel("Volume")
+            MediaVolumeSlider(modifier = Modifier.fillMaxWidth(), showPercentLabel = true)
+            if (audioOptions.size > 1) {
+                SectionLabel("Track")
+                audioOptions.forEach { TrackRow(it.label, it.selected, it.onSelect) }
+            }
+        }
+        PlayerSettingsSection.SUBTITLES -> {
+            if (subtitleOptions.isNotEmpty()) {
+                SectionLabel("Track")
+                subtitleOptions.forEach { TrackRow(it.label, it.selected, it.onSelect) }
+            }
+            subtitleDelayMs?.let { current ->
+                SectionLabel("Timing")
+                SubtitleDelayRow(current, onSubtitleDelayChange)
+            }
+            onCaptionAppearance?.let { open ->
+                SectionLabel("Appearance")
+                ClickableRow("Caption style", open)
+            }
+        }
+        PlayerSettingsSection.ADVANCED -> {
+            onEnterPip?.let {
+                ClickableRow(
+                    label = "Picture-in-Picture",
+                    onClick = it,
+                    supportingText = "Keep watching over other apps.",
+                    icon = Icons.Default.PictureInPictureAlt,
+                )
             }
         }
     }
-
-    if (audioOptions.size > 1) {
-        SectionLabel("Audio")
-        audioOptions.forEach { option ->
-            TrackRow(option.label, option.selected, option.onSelect)
-        }
-    }
-
-    if (subtitleOptions.isNotEmpty()) {
-        SectionLabel("Subtitles")
-        subtitleOptions.forEach { option ->
-            TrackRow(option.label, option.selected, option.onSelect)
-        }
-    }
-
-    subtitleDelayMs?.let { current ->
-        SectionLabel("Subtitle Delay")
-        SubtitleDelayRow(current, onSubtitleDelayChange)
-    }
-
-    contentScale?.let { current ->
-        SectionLabel("Content Scale")
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PlayerContentScale.entries.forEach { scale ->
-                ChoiceChip(scale.label, scale == current) { onContentScaleChange(scale) }
-            }
-        }
-    }
-
-    onCaptionAppearance?.let { open ->
-        SectionLabel("Captions")
-        ClickableRow("Caption appearance…", open)
-    }
-
-    SectionLabel("Playback")
-    ToggleRow("Auto-play next episode", autoplay, onAutoplayChange)
-    autoSkip?.let { ToggleRow("Auto-skip intro/outro", it, onAutoSkipChange) }
-    onEnterPip?.let { ClickableRow("Picture-in-Picture", it) }
 }
 
-/**
- * TV presentation of the player settings: an in-window right-side panel. Being in the player's
- * own window (unlike a ModalBottomSheet) means the D-pad and TalkBack traverse it like any other
- * Compose content. Focus is trapped inside while it is open; Back or the close button dismiss.
- */
+/** TV presentation stays in the player window so D-pad and TalkBack focus cannot escape. */
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
-private fun TvSettingsPanel(onDismiss: () -> Unit, content: @Composable () -> Unit) {
-    BackHandler(onBack = onDismiss)
-    val initialFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) {
-        // Let the panel attach before grabbing focus from the player controls behind it.
+private fun TvSettingsPanel(
+    title: String,
+    onBack: () -> Unit,
+    initialFocusRequester: FocusRequester,
+    content: @Composable () -> Unit,
+) {
+    BackHandler(onBack = onBack)
+    LaunchedEffect(title) {
         delay(64)
-        runCatching { initialFocus.requestFocus() }
+        runCatching { initialFocusRequester.requestFocus() }
     }
     Box(
         Modifier
             .fillMaxSize()
             .zIndex(10f)
-            .background(Color.Black.copy(alpha = 0.55f)),
+            .background(Color.Black.copy(alpha = 0.58f)),
     ) {
         Column(
             Modifier
                 .align(Alignment.CenterEnd)
                 .fillMaxHeight()
-                .width(420.dp)
+                .width(440.dp)
                 .background(SheetColor)
-                // Keep the remote inside the panel; Back and the close button leave it.
                 .focusProperties { exit = { FocusRequester.Cancel } }
                 .focusGroup()
                 .verticalScroll(rememberScrollState())
                 .semantics { paneTitle = "Player settings" }
-                .padding(start = 22.dp, end = 22.dp, top = 16.dp, bottom = 32.dp),
+                .padding(start = 24.dp, end = 24.dp, top = 14.dp, bottom = 32.dp),
         ) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "Settings",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleLarge,
-                )
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier
-                        .focusRequester(initialFocus)
-                        .focusHighlight(RoundedCornerShape(24.dp)),
-                ) {
-                    Icon(Icons.Default.Close, contentDescription = "Close settings", tint = Color.White)
-                }
-            }
             content()
         }
     }
@@ -303,7 +524,7 @@ private fun SpeedSlider(speed: Float, onSpeedChange: (Float) -> Unit) {
             ?: speeds.indexOfFirst { it == 1f }.coerceAtLeast(0)
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(Icons.Default.Speed, contentDescription = null, tint = Color.White)
+        Icon(Icons.Default.Speed, contentDescription = null, tint = SheetMuted)
         Slider(
             value = index.toFloat(),
             onValueChange = { onSpeedChange(speeds[it.roundToInt().coerceIn(0, speeds.lastIndex)]) },
@@ -314,9 +535,6 @@ private fun SpeedSlider(speed: Float, onSpeedChange: (Float) -> Unit) {
                 .weight(1f)
                 .padding(horizontal = 10.dp)
                 .semantics { contentDescription = "Playback speed" }
-                // Material3's Slider ignores D-pad keys, so on TV the value could never be
-                // changed. Left/right step through the speed list; at the ends the event is
-                // released so focus can still escape.
                 .onPreviewKeyEvent { event ->
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     val next = when (event.key) {
@@ -336,7 +554,7 @@ private fun SpeedSlider(speed: Float, onSpeedChange: (Float) -> Unit) {
             speed.formatPlaybackSpeed(),
             color = Color.White,
             style = MaterialTheme.typography.labelLarge,
-            modifier = Modifier.widthIn(min = 40.dp),
+            modifier = Modifier.widthIn(min = 44.dp),
         )
     }
 }
@@ -344,9 +562,10 @@ private fun SpeedSlider(speed: Float, onSpeedChange: (Float) -> Unit) {
 @Composable
 private fun SectionLabel(text: String) {
     Text(
-        text,
+        text.uppercase(Locale.US),
         color = MaterialTheme.colorScheme.primary,
-        style = MaterialTheme.typography.labelMedium,
+        style = MaterialTheme.typography.labelSmall,
+        fontWeight = FontWeight.Bold,
         modifier = Modifier.padding(top = 18.dp, bottom = 8.dp),
     )
 }
@@ -355,14 +574,13 @@ private fun SectionLabel(text: String) {
 private fun ChoiceChip(label: String, selected: Boolean, onClick: () -> Unit) {
     Box(
         Modifier
+            .heightIn(min = 48.dp)
             .focusHighlight(RoundedCornerShape(8.dp))
             .clip(RoundedCornerShape(8.dp))
-            .background(
-                if (selected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.08f),
-            )
-            // Radio semantics so TalkBack announces "selected" and reads it as a choice.
+            .background(if (selected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.08f))
             .selectable(selected = selected, role = Role.RadioButton, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 9.dp),
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center,
     ) {
         Text(
             label,
@@ -377,10 +595,10 @@ private fun TrackRow(label: String, selected: Boolean, onSelect: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
+            .heightIn(min = 52.dp)
             .focusHighlight(RoundedCornerShape(8.dp))
-            // Radio semantics carry the selection state, so the check icon is decorative.
             .selectable(selected = selected, role = Role.RadioButton, onClick = onSelect)
-            .padding(vertical = 10.dp),
+            .padding(horizontal = 4.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -389,30 +607,33 @@ private fun TrackRow(label: String, selected: Boolean, onSelect: () -> Unit) {
             color = if (selected) MaterialTheme.colorScheme.primary else Color.White,
             style = MaterialTheme.typography.bodyLarge,
         )
-        if (selected) {
-            Icon(
-                Icons.Default.Check,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-            )
-        }
+        if (selected) Icon(Icons.Default.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
     }
 }
 
 @Composable
-private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+private fun ToggleRow(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    supportingText: String? = null,
+) {
     Row(
         Modifier
             .fillMaxWidth()
+            .heightIn(min = 60.dp)
             .focusHighlight(RoundedCornerShape(8.dp))
-            // One toggleable row (the inner Switch is display-only) so TalkBack reads
-            // "<label>, switch, on/off" as a single stop instead of two half-described ones.
             .toggleable(value = checked, role = Role.Switch, onValueChange = onCheckedChange)
-            .padding(vertical = 6.dp),
+            .padding(horizontal = 4.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label, color = Color.White, style = MaterialTheme.typography.bodyLarge)
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(label, color = Color.White, style = MaterialTheme.typography.bodyLarge)
+            supportingText?.let {
+                Text(it, color = SheetMuted, style = MaterialTheme.typography.bodySmall)
+            }
+        }
         Switch(
             checked = checked,
             onCheckedChange = null,
@@ -424,57 +645,68 @@ private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean
     }
 }
 
-/**
- * Nudges the subtitles against the picture in quarter-second steps. It sits under the track list
- * because that is where someone goes when the subtitles are wrong, and it takes effect while the
- * episode plays, so each press can be judged against the video behind the sheet.
- */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SubtitleDelayRow(delayMs: Long, onChange: (Long) -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         ChoiceChip("−0.25s", false) { onChange(delayMs - SubtitleDelay.STEP_MS) }
         Text(
             if (delayMs == 0L) "0.00 s" else String.format(Locale.US, "%+.2f s", delayMs / 1000.0),
             color = Color.White,
             style = MaterialTheme.typography.bodyLarge,
+            modifier = Modifier.padding(horizontal = 4.dp),
         )
         ChoiceChip("+0.25s", false) { onChange(delayMs + SubtitleDelay.STEP_MS) }
         if (delayMs != 0L) ChoiceChip("Reset", false) { onChange(0L) }
     }
     Text(
         when {
-            delayMs == 0L -> "Subtitles play as the provider timed them."
-            SubtitleDelay.isAutomatic ->
-                "Measured for this stream — its subtitles were cut for a different encode."
+            delayMs == 0L -> "Subtitles use the provider timing."
+            SubtitleDelay.isAutomatic -> "Measured for this stream's encode."
             delayMs > 0L -> "Subtitles are held back."
             else -> "Subtitles run ahead."
         },
-        color = Color.White.copy(alpha = 0.6f),
+        color = SheetMuted,
         style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.padding(top = 8.dp),
     )
 }
 
 @Composable
-private fun ClickableRow(label: String, onClick: () -> Unit) {
+private fun ClickableRow(
+    label: String,
+    onClick: () -> Unit,
+    supportingText: String? = null,
+    icon: ImageVector? = null,
+) {
     Row(
         Modifier
             .fillMaxWidth()
+            .heightIn(min = 56.dp)
             .focusHighlight(RoundedCornerShape(8.dp))
             .clickable(role = Role.Button, onClick = onClick)
-            .padding(vertical = 12.dp),
+            .padding(horizontal = 4.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label, color = Color.White, style = MaterialTheme.typography.bodyLarge)
+        icon?.let {
+            Icon(it, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(14.dp))
+        }
+        Column(Modifier.weight(1f)) {
+            Text(label, color = Color.White, style = MaterialTheme.typography.bodyLarge)
+            supportingText?.let { Text(it, color = SheetMuted, style = MaterialTheme.typography.bodySmall) }
+        }
+        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = SheetMuted)
     }
 }
 
 @Composable
 internal fun whiteSliderColors() = SliderDefaults.colors(
-    thumbColor = Color.White,
+    thumbColor = MaterialTheme.colorScheme.primary,
     activeTrackColor = Color.White,
-    inactiveTrackColor = Color.White.copy(alpha = 0.3f),
+    inactiveTrackColor = Color.White.copy(alpha = 0.24f),
 )

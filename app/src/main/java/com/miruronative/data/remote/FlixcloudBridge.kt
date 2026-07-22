@@ -1,7 +1,6 @@
 package com.miruronative.data.remote
 
 import android.annotation.SuppressLint
-import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -18,6 +17,7 @@ import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import java.net.URI
 import java.util.UUID
 import kotlinx.coroutines.CompletableDeferred
@@ -127,13 +127,19 @@ object FlixcloudBridge {
                 if (!request.isForMainFrame) return false
                 val host = target.host.orEmpty().lowercase()
                 val allowed = target.scheme == "https" && (host == "flixcloud.cc" || host.endsWith(".flixcloud.cc"))
-                if (!allowed) DiagnosticsLog.event("$TAG blocked nav host=$host")
+                if (!allowed) {
+                    DiagnosticsLog.event(
+                        "$TAG blocked nav ${privacySafeUrlDiagnosticLabel(target.toString())}",
+                    )
+                }
                 return !allowed
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 val request = active?.takeIf { it.ownsPage(url) } ?: return
-                DiagnosticsLog.event("$TAG page finished host=${url.hostOrNone()}")
+                DiagnosticsLog.event(
+                    "$TAG page finished ${privacySafeUrlDiagnosticLabel(url)}",
+                )
                 view?.evaluateJavascript(captureScript(request.id), null)
             }
 
@@ -161,7 +167,11 @@ object FlixcloudBridge {
                 error: android.webkit.WebResourceError?,
             ) {
                 if (request?.isForMainFrame == true) {
-                    DiagnosticsLog.event("$TAG main-frame error code=${error?.errorCode} description=${error?.description}")
+                    DiagnosticsLog.event(
+                        "$TAG main-frame error category=web-resource " +
+                            "code=${error?.errorCode ?: "unknown"} mainFrame=true " +
+                            privacySafeUrlDiagnosticLabel(request.url?.toString()),
+                    )
                 }
             }
 
@@ -217,7 +227,7 @@ object FlixcloudBridge {
             }
             val result = withTimeoutOrNull(timeoutMs) { request.deferred.await() }
             if (result == null && !request.deferred.isCompleted) {
-                DiagnosticsLog.event("$TAG timeout host=${target.hostOrNone()}")
+                DiagnosticsLog.event("$TAG timeout ${privacySafeUrlDiagnosticLabel(target)}")
             }
             result?.takeIf { isHlsUrl(it.url) }
         } finally {
@@ -244,7 +254,7 @@ object FlixcloudBridge {
                         finishOnMain(request, null, "document_start_unavailable")
                         return
                     }
-                    DiagnosticsLog.event("$TAG load host=${target.hostOrNone()}")
+                    DiagnosticsLog.event("$TAG load ${privacySafeUrlDiagnosticLabel(target)}")
                     wv.onResume()
                     wv.stopLoading()
                     wv.loadUrl(target, referer?.let { mapOf("Referer" to it) } ?: emptyMap())
@@ -288,7 +298,7 @@ object FlixcloudBridge {
         request.deferred.complete(result)
         if (result != null) {
             DiagnosticsLog.event(
-                "$TAG resolved source=$source host=${result.url.hostOrNone()} " +
+                "$TAG resolved source=$source ${privacySafeUrlDiagnosticLabel(result.url)} " +
                     "playlistKey=${result.playlistKey != null}",
             )
         } else {
@@ -437,8 +447,6 @@ object FlixcloudBridge {
     private fun isHlsUrl(url: String): Boolean =
         url.contains(".m3u8", ignoreCase = true)
 
-    private fun String?.hostOrNone(): String =
-        this?.let { runCatching { Uri.parse(it).host }.getOrNull() } ?: "none"
 }
 
 data class FlixcloudResolvedStream(val url: String, val playlistKey: String?)

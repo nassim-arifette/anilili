@@ -7,18 +7,15 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import androidx.annotation.OptIn
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -27,10 +24,8 @@ import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -54,7 +49,6 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -92,6 +86,7 @@ import com.miruronative.data.model.Category
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import com.miruronative.data.model.AniSkipPlaybackSegment
 import com.miruronative.data.model.SkipTimes
 import com.miruronative.data.model.StreamItem
 import com.miruronative.data.model.SubtitleItem
@@ -100,6 +95,8 @@ import com.miruronative.data.settings.CaptionStyle
 import com.miruronative.data.settings.DefaultQuality
 import com.miruronative.data.settings.SettingsStore
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.playerErrorDiagnosticCategory
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 import com.miruronative.playback.LocalPlaybackOwnerToken
 import com.miruronative.playback.CastSourceDecision
 import com.miruronative.playback.chooseCastSource
@@ -345,6 +342,8 @@ internal fun PlayerSurface(
     qualityStreams: List<StreamItem> = listOf(stream),
     subtitles: List<SubtitleItem>,
     skip: SkipTimes?,
+    aniSkipSegments: List<AniSkipPlaybackSegment>,
+    aniSkipLookupStatus: AniSkipLookupStatus,
     seriesTitle: String,
     episodeTitle: String,
     historyEpisodeTitle: String?,
@@ -601,7 +600,7 @@ internal fun PlayerSurface(
                     val accepted = runIfPlaybackOwnerActive {
                         DiagnosticsLog.event(
                             "PlayerSurface playbackState=${playbackState.stateName()} " +
-                                "mediaId=${activeController.currentMediaItem?.mediaId?.take(120) ?: "none"}",
+                                "media=${privacySafeUrlDiagnosticLabel(activeController.currentMediaItem?.mediaId)}",
                         )
                         // The default-quality effect waits for READY; re-trigger it when we get there.
                         if (playbackState == Player.STATE_READY) tracksRevision++
@@ -644,8 +643,17 @@ internal fun PlayerSurface(
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
+                    val diagnosticCategory = playerErrorDiagnosticCategory(error.errorCode)
+                    // Media3 may include a signed media URI in localizedMessage. It remains an
+                    // on-screen recovery message; only the controlled category/code are logged.
+                    val userFacingMessage = error.localizedMessage
+                        ?.takeIf(String::isNotBlank)
+                        ?: "Playback failed"
                     val accepted = runIfPlaybackOwnerActive {
-                        DiagnosticsLog.throwable("PlayerSurface player error code=${error.errorCodeName}", error)
+                        DiagnosticsLog.event(
+                            "PlayerSurface player error category=$diagnosticCategory " +
+                                "code=${error.errorCode}",
+                        )
                         val failedItem = activeController.currentMediaItem
                         val failedIdentity = failedItem?.playbackIdentityOrNull()
                         val failedMediaId = failedIdentity?.mediaId
@@ -680,7 +688,7 @@ internal fun PlayerSurface(
                                     if (replacement == null) {
                                         currentOnError(
                                             failedIdentity,
-                                            error.localizedMessage ?: "Playback failed",
+                                            userFacingMessage,
                                             failedMediaId,
                                             fallback.resumePositionMs,
                                             setOf(failedMediaId),
@@ -716,7 +724,7 @@ internal fun PlayerSurface(
                                 }
                                 is DecoderFallbackAction.Exhausted -> currentOnError(
                                     failedIdentity,
-                                    error.localizedMessage ?: "Playback failed",
+                                    userFacingMessage,
                                     failedMediaId,
                                     fallback.resumePositionMs,
                                     fallback.attemptedMediaIds.ifEmpty { setOf(failedMediaId) },
@@ -728,7 +736,7 @@ internal fun PlayerSurface(
                         } else {
                             currentOnError(
                                 failedIdentity,
-                                error.localizedMessage ?: "Playback failed",
+                                userFacingMessage,
                                 failedMediaId,
                                 activeController.currentPosition.coerceAtLeast(0L),
                                 setOf(failedMediaId),
@@ -1164,10 +1172,15 @@ internal fun PlayerSurface(
     var seekFlashTick by remember { mutableIntStateOf(0) }
     val autoSkipIntroOutro by SettingsStore.autoSkipIntroOutro.collectAsState()
     val autoplay by SettingsStore.autoplay.collectAsState()
-    val introStartMs = skip?.introStart?.times(1000)?.toLong() ?: 0L
-    val introEndMs = skip?.introEnd?.times(1000)?.toLong()
-    val outroStartMs = skip?.outroStart?.times(1000)?.toLong()
-    val outroEndMs = skip?.outroEnd?.times(1000)?.toLong()
+    val skipPlan = remember(skip, aniSkipSegments, aniSkipLookupStatus) {
+        buildPlaybackSkipPlan(skip, aniSkipSegments, aniSkipLookupStatus)
+    }
+    val automaticOpening = skipPlan.automaticOpening
+    val automaticEnding = skipPlan.automaticEnding
+    val introStartMs = automaticOpening?.startMs ?: 0L
+    val introEndMs = automaticOpening?.endMs
+    val outroStartMs = automaticEnding?.startMs
+    val outroEndMs = automaticEnding?.endMs
     var introAutoSkipped by remember(playbackSessionKey, introStartMs, introEndMs) { mutableStateOf(false) }
     var outroAutoHandled by remember(playbackSessionKey, outroStartMs, outroEndMs) { mutableStateOf(false) }
 
@@ -1227,6 +1240,18 @@ internal fun PlayerSurface(
                         outroAutoHandled = true
                         onNextEpisode()
                     }
+                }
+            }
+        }
+    }
+
+    val primaryAction = skipPlan.actionAt(positionMs, currentHasNext)?.let { planned ->
+        PlayerChromeAction(planned.label) {
+            runIfPlaybackOwnerActive {
+                if (planned.advanceToNextEpisode) {
+                    currentOnNextEpisode()
+                } else {
+                    planned.seekTargetMs?.let { controller?.seekTo(it) }
                 }
             }
         }
@@ -1370,14 +1395,21 @@ internal fun PlayerSurface(
             )
         }
 
-        // Phone controls, shown: the shared control bar (identical to the embed player) over a
-        // full-screen scrim that hides it again on a tap in empty space.
-        if (controller != null && !device.isTv && phoneControlsVisible) {
-            Box(
-                Modifier
-                    .matchParentSize()
-                    .pointerInput(Unit) { detectTapGestures { phoneControlsVisible = false } },
-            )
+        // Phone shared chrome: the full bar sits over a dismissible scrim while visible. After it
+        // auto-hides, only a contextual skip/next action remains mounted above GestureControls;
+        // taps elsewhere still reach the gesture layer and reveal the full chrome again.
+        if (
+            controller != null &&
+            !device.isTv &&
+            shouldComposePlayerChrome(phoneControlsVisible, primaryAction != null)
+        ) {
+            if (phoneControlsVisible) {
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .pointerInput(Unit) { detectTapGestures { phoneControlsVisible = false } },
+                )
+            }
             PlayerControlsScaffold(
                 isPlaying = playbackIsPlaying,
                 positionMs = positionMs,
@@ -1412,7 +1444,12 @@ internal fun PlayerSurface(
                         phoneControlsInteraction++
                     }
                 },
+                seriesTitle = seriesTitle,
+                episodeTitle = episodeTitle,
+                onExitFullscreen = if (isFullscreen) onToggleFullscreen else null,
                 onInteract = { phoneControlsInteraction++ },
+                showChrome = phoneControlsVisible,
+                primaryAction = primaryAction,
             ) {
                 PlayerControlIconButton(
                     "Subtitles",
@@ -1649,62 +1686,9 @@ internal fun PlayerSurface(
                     settingsExpanded = true
                 },
                 onFullscreen = onToggleFullscreen,
+                primaryAction = primaryAction,
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
-        }
-
-        val action: Pair<String, () -> Unit>? = when {
-            introEndMs != null && positionMs in introStartMs..introEndMs ->
-                "Skip Intro" to {
-                    runIfPlaybackOwnerActive { controller?.seekTo(introEndMs) }
-                    Unit
-                }
-            outroStartMs != null && outroEndMs != null && positionMs in outroStartMs..outroEndMs ->
-                if (hasNextEpisode) {
-                    "Next Episode" to {
-                        runIfPlaybackOwnerActive { onNextEpisode() }
-                        Unit
-                    }
-                } else {
-                    "Skip Outro" to {
-                        runIfPlaybackOwnerActive { controller?.seekTo(outroEndMs) }
-                        Unit
-                    }
-                }
-            else -> null
-        }
-        LaunchedEffect(action?.first, playerView, device.isTv, focusPlayerOnStart) {
-            if (device.isTv && focusPlayerOnStart) {
-                // Compose may focus a newly inserted skip/next action before PlayerView can
-                // reclaim focus. Return remote input to the player once this frame settles.
-                delay(32)
-                runCatching { tvPlayerFocus.requestFocus() }
-            }
-        }
-        action?.let { (label, onClick) ->
-            val controlsVisible = if (device.isTv) tvControlsVisible else phoneControlsVisible
-            val actionModifier = if (controlsVisible) {
-                Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 16.dp)
-            } else {
-                Modifier.align(Alignment.BottomStart).padding(start = 24.dp, bottom = 24.dp)
-            }
-            OutlinedButton(
-                onClick = onClick,
-                shape = RoundedCornerShape(3.dp),
-                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.55f)),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = Color.Black.copy(alpha = 0.5f),
-                    contentColor = Color.White,
-                ),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                modifier = actionModifier,
-            ) {
-                Text(
-                    label.uppercase(),
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
         }
     }
 }

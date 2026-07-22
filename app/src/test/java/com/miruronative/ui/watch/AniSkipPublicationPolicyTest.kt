@@ -3,92 +3,143 @@ package com.miruronative.ui.watch
 import com.miruronative.data.model.Category
 import com.miruronative.data.model.SkipTimes
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AniSkipPublicationPolicyTest {
     private val request = PlaybackRequestToken(sessionGeneration = 4, requestGeneration = 12)
-    private val current = AniSkipPublicationIdentity(
-        request = request,
-        animeId = 21,
-        episodeNumber = 7.0,
-        provider = "allanime",
-        category = Category.SUB,
-        sourceGeneration = 30,
-    )
 
     @Test
-    fun `late AniSkip fills only the provider range that is missing`() {
-        val provider = SkipTimes(8.0, 92.0, null, null)
-        val fallback = SkipTimes(12.0, 95.0, 1_320.0, 1_405.0)
+    fun `duration callbacks are grouped to stable one second buckets`() {
+        assertEquals(1_440_000L, aniSkipDurationBucketMs(1_439_501L))
+        assertEquals(1_440_000L, aniSkipDurationBucketMs(1_440_499L))
+        assertNull(aniSkipDurationBucketMs(1L))
+        assertNull(aniSkipDurationBucketMs(0L))
+        assertNull(aniSkipDurationBucketMs(Long.MAX_VALUE))
+    }
 
+    @Test
+    fun `typed marker publication is bound to request generation media and duration`() {
+        val expected = AniSkipLookupIdentity(
+            request = request,
+            animeId = 21,
+            episodeNumber = 7.5,
+            provider = "allanime",
+            category = Category.SUB,
+            sourceGeneration = 30,
+            mediaId = "https://cdn.example/episode-7-5.m3u8",
+            durationBucketMs = 1_440_000L,
+            mediaInstanceId = "embed:4:1",
+        )
+
+        assertEquals(true, canPublishAniSkipSegments(expected, expected))
+        assertEquals(false, canPublishAniSkipSegments(expected, expected.copy(episodeNumber = 8.0)))
         assertEquals(
-            SkipTimes(8.0, 92.0, 1_320.0, 1_405.0),
-            lateAniSkipUpdate(current, current, provider, fallback),
+            false,
+            canPublishAniSkipSegments(expected, expected.copy(mediaId = "https://cdn.example/other.m3u8")),
         )
-    }
-
-    @Test
-    fun `late AniSkip never overwrites complete provider markers`() {
-        val provider = SkipTimes(8.0, 92.0, 1_300.0, 1_390.0)
-        val fallback = SkipTimes(12.0, 95.0, 1_320.0, 1_405.0)
-
-        assertNull(lateAniSkipUpdate(current, current, provider, fallback))
-    }
-
-    @Test
-    fun `late publication rejects a superseded request`() {
-        val newerRequest = current.copy(
-            request = request.copy(requestGeneration = request.requestGeneration + 1),
+        assertEquals(
+            false,
+            canPublishAniSkipSegments(expected, expected.copy(durationBucketMs = 1_441_000L)),
         )
-
-        assertNull(lateAniSkipUpdate(current, newerRequest, null, usefulFallback()))
-    }
-
-    @Test
-    fun `late publication rejects a different episode or anime`() {
-        assertNull(
-            lateAniSkipUpdate(current, current.copy(episodeNumber = 8.0), null, usefulFallback()),
-        )
-        assertNull(
-            lateAniSkipUpdate(current, current.copy(animeId = 22), null, usefulFallback()),
-        )
-    }
-
-    @Test
-    fun `late publication rejects provider and category switches`() {
-        assertNull(
-            lateAniSkipUpdate(current, current.copy(provider = "hianime"), null, usefulFallback()),
-        )
-        assertNull(
-            lateAniSkipUpdate(current, current.copy(category = Category.DUB), null, usefulFallback()),
-        )
-    }
-
-    @Test
-    fun `late publication rejects a replacement source generation`() {
-        assertNull(
-            lateAniSkipUpdate(
-                current,
-                current.copy(sourceGeneration = current.sourceGeneration + 1),
-                null,
-                usefulFallback(),
+        assertEquals(
+            false,
+            canPublishAniSkipSegments(
+                expected,
+                expected.copy(mediaInstanceId = "embed:4:2"),
             ),
         )
+        assertEquals(
+            false,
+            canPublishAniSkipSegments(
+                expected,
+                expected.copy(request = request.copy(requestGeneration = 13)),
+            ),
+        )
+        assertFalse(expected.toString().contains("cdn.example"))
     }
 
     @Test
-    fun `empty or invalid late markers produce no update`() {
-        assertNull(lateAniSkipUpdate(current, current, null, null))
-        assertNull(
-            lateAniSkipUpdate(
-                current,
-                current,
-                null,
-                SkipTimes(90.0, 10.0, 1_400.0, 1_300.0),
-            ),
+    fun `zero duration tick during lookup retains publication and releases provider fallback`() {
+        val playbackIdentity = PlaybackIdentity(
+            animeId = 21,
+            episodeNumber = 7.5,
+            generation = 30,
+            mediaId = "https://cdn.example/episode-7-5.m3u8",
         )
+        val measuredDurationMs = 1_439_840L
+        var progress = progressSnapshotRetainingValidDuration(
+            previous = null,
+            identity = playbackIdentity,
+            positionMs = 12_000L,
+            durationMs = measuredDurationMs,
+        )
+        val expected = AniSkipLookupIdentity(
+            request = request,
+            animeId = playbackIdentity.animeId,
+            episodeNumber = playbackIdentity.episodeNumber,
+            provider = "allanime",
+            category = Category.SUB,
+            sourceGeneration = playbackIdentity.generation,
+            mediaId = playbackIdentity.mediaId,
+            durationBucketMs = checkNotNull(aniSkipDurationBucketMs(progress.durationMs)),
+        )
+        val providerSkip = SkipTimes(0.0, 90.0, null, null)
+
+        val loadingPlan = buildPlaybackSkipPlan(
+            providerSkip = providerSkip,
+            aniSkipSegments = emptyList(),
+            aniSkipLookupStatus = AniSkipLookupStatus.LOADING,
+        )
+        assertNull(loadingPlan.automaticOpening)
+        assertFalse(checkNotNull(loadingPlan.opening).autoSkipEligible)
+
+        // Exact regression interleaving: measured tick -> request starts -> duration=0 tick ->
+        // response publishes. The transient zero must not erase the request's duration evidence.
+        progress = progressSnapshotRetainingValidDuration(
+            previous = progress,
+            identity = playbackIdentity,
+            positionMs = 13_000L,
+            durationMs = 0L,
+        )
+        assertEquals(measuredDurationMs, progress.durationMs)
+        val current = expected.copy(
+            durationBucketMs = checkNotNull(aniSkipDurationBucketMs(progress.durationMs)),
+        )
+        assertTrue(canPublishAniSkipSegments(expected, current))
+
+        val completedPlan = buildPlaybackSkipPlan(
+            providerSkip = providerSkip,
+            aniSkipSegments = emptyList(),
+            aniSkipLookupStatus = AniSkipLookupStatus.COMPLETE,
+        )
+        assertEquals(PlaybackSkipOrigin.PROVIDER, completedPlan.automaticOpening?.origin)
+        assertTrue(checkNotNull(completedPlan.opening).autoSkipEligible)
     }
 
-    private fun usefulFallback() = SkipTimes(0.0, 90.0, 1_300.0, 1_390.0)
+    @Test
+    fun `unknown duration never inherits from another concrete media identity`() {
+        val previousIdentity = PlaybackIdentity(21, 7.5, 30, "https://cdn.example/first.m3u8")
+        val previous = PlaybackProgressSnapshot(previousIdentity, 12_000L, 1_439_840L)
+
+        val nextSource = progressSnapshotRetainingValidDuration(
+            previous = previous,
+            identity = previousIdentity.copy(mediaId = "https://cdn.example/second.m3u8"),
+            positionMs = 0L,
+            durationMs = 0L,
+        )
+        val nextGeneration = progressSnapshotRetainingValidDuration(
+            previous = previous,
+            identity = previousIdentity.copy(generation = 31),
+            positionMs = 0L,
+            durationMs = 0L,
+        )
+
+        assertEquals(0L, nextSource.durationMs)
+        assertEquals(0L, nextGeneration.durationMs)
+        assertNull(aniSkipDurationBucketMs(nextSource.durationMs))
+        assertNull(aniSkipDurationBucketMs(nextGeneration.durationMs))
+    }
 }

@@ -39,7 +39,7 @@ now fork-specific; refreshed device captures remain on the documentation backlog
 - Anime details, provider selection, sub/dub selection, ratings, and episode lists.
 - Multi-provider stream discovery across Miruro, AniKoto, ReAnime, AniZone, AnimeGG,
   AniNeko, and 2DHive.
-- Native HLS playback with subtitles, skip intro, and auto advance.
+- Native HLS playback with subtitles, typed AniSkip segments, and auto advance.
 - WebView playback for embed providers and fallback player routes.
 - AniList login with watching, planning, paused, and completed list views.
 - Watch history, continue-watching resume positions, local watchlist, and optional
@@ -54,6 +54,7 @@ now fork-specific; refreshed device captures remain on the documentation backlog
 | `app/src/main/java/com/miruronative/data/remote` | AniList, Miruro pipe, and provider clients |
 | `app/src/main/java/com/miruronative/ui` | Compose screens and player UI |
 | `docs/PIPE_PROTOCOL.md` | Notes about the Miruro pipe format |
+| `docs/PLAYER_API_EVALUATION.md` | AniSkip, Miruro API v3, and AnimeThemes integration decisions |
 | `docs/KNOWN_ISSUES.md` | Checklist of fixed and remaining issues from code review |
 | `docs/FEATURE_IDEAS.md` | Prioritized product and playback feature backlog |
 | `docs/RELEASING.md` | Signed GitHub Release and in-app update procedure |

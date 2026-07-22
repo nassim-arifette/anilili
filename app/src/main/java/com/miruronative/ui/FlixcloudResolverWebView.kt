@@ -17,6 +17,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.miruronative.data.remote.FlixcloudBridge
 import com.miruronative.diagnostics.CrashReporter
 import com.miruronative.diagnostics.DiagnosticsLog
+import com.miruronative.diagnostics.privacySafeUrlDiagnosticLabel
 
 /**
  * Hidden resolver WebView for flixcloud embeds. It is not a player surface; it only lets
@@ -57,9 +58,9 @@ fun FlixcloudResolverWebView() {
                 val releaseDetails = if (rendererGone) {
                     "renderer-gone"
                 } else {
-                    val url = runCatching { web.url }.getOrNull() ?: "none"
+                    val url = runCatching { web.url }.getOrNull()
                     val size = runCatching { "${web.width}x${web.height}" }.getOrDefault("unknown")
-                    "url=$url size=$size"
+                    "${privacySafeUrlDiagnosticLabel(url)} size=$size"
                 }
                 DiagnosticsLog.event(
                     "FlixcloudResolverWebView release rendererGone=$rendererGone " +

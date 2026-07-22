@@ -110,6 +110,28 @@ internal fun embedContentVideoSelectorJs(): String = """
       var duration = isFinite(video.duration) ? Math.round(video.duration * 1000) : 'unknown';
       return source + '|' + duration;
     }
+    function __aniliBindMediaGeneration(video) {
+      if (!video) return 0;
+      var identity = __aniliMediaIdentity(video);
+      if (!identity) return 0;
+      var state = window.__aniliObservedMediaState;
+      if (!state || state.video !== video || state.identity !== identity) {
+        var generation = Number(window.__aniliMediaGenerationCounter) || 0;
+        generation += 1;
+        window.__aniliMediaGenerationCounter = generation;
+        state = { video: video, identity: identity, generation: generation };
+        window.__aniliObservedMediaState = state;
+      }
+      return state.generation;
+    }
+    function __aniliMediaGeneration(video) {
+      if (!video) return 0;
+      var state = window.__aniliObservedMediaState;
+      var identity = __aniliMediaIdentity(video);
+      return state && state.video === video && state.identity === identity
+        ? Number(state.generation) || 0
+        : 0;
+    }
     function __aniliVideoScore(video) {
       var duration = Number(video.duration);
       var source = video.currentSrc || video.src || '';
