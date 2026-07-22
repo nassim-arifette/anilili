@@ -1295,7 +1295,7 @@ fun EmbedWebView(
                                         privacySafeUrlDiagnosticLabel(startedUrl),
                                 )
                             },
-                            onPageFinishedAccepted = { _, loadedUrl ->
+                            onPageFinishedAccepted = { finishedView, loadedUrl ->
                                 finishedUrl = loadedUrl
                                 DiagnosticsLog.event(
                                     "EmbedWebView page finished generation=${navigationSession.generation} " +
