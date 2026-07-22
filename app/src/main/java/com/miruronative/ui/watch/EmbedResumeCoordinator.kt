@@ -20,10 +20,12 @@ internal enum class EmbedResumeAttemptOutcome {
 /**
  * Coordinates saved-position restoration across concrete videos in one embed navigation.
  *
- * Completion is identity-bound. If the document replaces its selected video, the replacement gets
- * a fresh bounded attempt using the last position confirmed for the former video. An unresolved
- * former video keeps the original target, while a video already at or beyond that target is never
- * pulled backwards.
+ * Completion is identity-bound. A replacement may continue the original pending restore only when
+ * the former concrete video never completed. Once any concrete video has completed, later
+ * same-document replacements are deliberately left untouched: they may be a provider-controlled
+ * next episode or a SUB/DUB alternate. The attempt budget is navigation-wide, so video churn cannot
+ * multiply automatic seek/play attempts. A video already beyond the pending target is never pulled
+ * backwards.
  */
 internal class EmbedResumeCoordinator(
     initialTargetPositionMs: Long,
@@ -33,7 +35,7 @@ internal class EmbedResumeCoordinator(
     private var activeMediaIdentity: EmbedVideoIdentity? = null
     private var targetPositionMs = initialTargetPositionMs.coerceAtLeast(0L)
     private var lastObservedPositionMs = 0L
-    private var attemptsForActiveIdentity = 0
+    private var totalAttempts = 0
     private var activeIdentityCompleted = targetPositionMs == 0L
     private var inFlightAttempt: EmbedResumeAttempt? = null
 
@@ -47,37 +49,60 @@ internal class EmbedResumeCoordinator(
         if (!mediaIdentity.isValid) return
         val safePositionMs = positionMs.coerceAtLeast(0L)
         if (mediaIdentity != activeMediaIdentity) {
-            if (activeMediaIdentity != null && activeIdentityCompleted) {
-                targetPositionMs = lastObservedPositionMs
-            }
+            val formerIdentityCompleted = activeMediaIdentity != null && activeIdentityCompleted
             activeMediaIdentity = mediaIdentity
             lastObservedPositionMs = safePositionMs
-            attemptsForActiveIdentity = 0
             inFlightAttempt = null
-            activeIdentityCompleted = isTargetAlreadySatisfied(safePositionMs, isPlaying)
-            if (activeIdentityCompleted) targetPositionMs = safePositionMs
+            if (formerIdentityCompleted) {
+                // Never infer that an arbitrary replacement is the same episode. Quality changes
+                // initiated by the app create a fresh navigation/coordinator with their own target.
+                targetPositionMs = safePositionMs
+                activeIdentityCompleted = true
+            } else if (targetPositionMs <= 0L) {
+                targetPositionMs = safePositionMs
+                activeIdentityCompleted = true
+            } else {
+                val positionSatisfied = hasReachedTarget(safePositionMs)
+                if (positionSatisfied) bankForwardPosition(safePositionMs)
+                activeIdentityCompleted = positionSatisfied && isPlaying
+            }
             return
         }
 
         lastObservedPositionMs = safePositionMs
         if (activeIdentityCompleted) {
-            // Track deliberate seeks as well as ordinary progress so a later quality/video handoff
-            // resumes from what the viewer most recently confirmed, not the original saved value.
+            // Keep the latest confirmed position for diagnostics and explicit playback intent.
             targetPositionMs = safePositionMs
-        } else if (
-            attemptsForActiveIdentity == 0 &&
-            isTargetAlreadySatisfied(safePositionMs, isPlaying)
-        ) {
-            activeIdentityCompleted = true
-            inFlightAttempt = null
-            targetPositionMs = safePositionMs
-        } else if (isPlaying && hasReachedTarget(safePositionMs)) {
-            // An exact tick can prove the command's intended position is no longer current without
-            // proving its acknowledgement. Bank that newer point for a retry/replacement, but keep
-            // the latch open until the matching command acknowledgement arrives.
-            targetPositionMs = safePositionMs
+        } else if (hasReachedTarget(safePositionMs)) {
+            // Never pull a paused video backwards just to prove that it can play. Bank its current
+            // position for the pending start attempt, while still requiring a matching playing
+            // acknowledgement once an automatic command has already been issued.
+            bankForwardPosition(safePositionMs)
+            if (totalAttempts == 0 && isPlaying) {
+                activeIdentityCompleted = true
+                inFlightAttempt = null
+            }
         }
     }
+
+    /** An app/user playback mutation supersedes automatic restoration for this exact video. */
+    @Synchronized
+    fun supersedeWithPlaybackIntent(mediaIdentity: EmbedVideoIdentity, positionMs: Long): Boolean {
+        if (!mediaIdentity.isValid || mediaIdentity != activeMediaIdentity) return false
+        val safePositionMs = positionMs.coerceAtLeast(0L)
+        activeIdentityCompleted = true
+        inFlightAttempt = null
+        lastObservedPositionMs = safePositionMs
+        targetPositionMs = safePositionMs
+        return true
+    }
+
+    /** Returns a quality-navigation handoff target only for the currently selected exact video. */
+    @Synchronized
+    fun handoffTargetFor(mediaIdentity: EmbedVideoIdentity?): Long? =
+        targetPositionMs.takeIf {
+            mediaIdentity?.isValid == true && mediaIdentity == activeMediaIdentity
+        }
 
     @Synchronized
     fun nextAttempt(mediaIdentity: EmbedVideoIdentity): EmbedResumeAttempt? {
@@ -86,15 +111,15 @@ internal class EmbedResumeCoordinator(
             activeIdentityCompleted ||
             targetPositionMs <= 0L ||
             inFlightAttempt != null ||
-            attemptsForActiveIdentity >= maxAttempts
+            totalAttempts >= maxAttempts
         ) {
             return null
         }
-        attemptsForActiveIdentity += 1
+        totalAttempts += 1
         return EmbedResumeAttempt(
             mediaIdentity = mediaIdentity,
             targetPositionMs = targetPositionMs,
-            number = attemptsForActiveIdentity,
+            number = totalAttempts,
         ).also { inFlightAttempt = it }
     }
 
@@ -113,10 +138,12 @@ internal class EmbedResumeCoordinator(
     ): EmbedResumeAttemptOutcome {
         if (!shouldResolve(attempt)) return EmbedResumeAttemptOutcome.STALE
         inFlightAttempt = null
-        if (succeeded && isPlaying) {
+        val safePositionMs = positionMs.coerceAtLeast(0L)
+        lastObservedPositionMs = safePositionMs
+        if (hasReachedTarget(safePositionMs)) bankForwardPosition(safePositionMs)
+        if (succeeded && isPlaying && hasReachedTarget(safePositionMs)) {
             activeIdentityCompleted = true
-            lastObservedPositionMs = positionMs.coerceAtLeast(0L)
-            targetPositionMs = lastObservedPositionMs
+            targetPositionMs = safePositionMs
             return EmbedResumeAttemptOutcome.COMPLETED
         }
         return retryOrExhausted()
@@ -140,16 +167,16 @@ internal class EmbedResumeCoordinator(
         inFlightAttempt == attempt && activeMediaIdentity == attempt.mediaIdentity
 
     private fun retryOrExhausted(): EmbedResumeAttemptOutcome =
-        if (attemptsForActiveIdentity < maxAttempts) {
+        if (totalAttempts < maxAttempts) {
             EmbedResumeAttemptOutcome.RETRY
         } else {
             EmbedResumeAttemptOutcome.EXHAUSTED
         }
 
-    private fun isTargetAlreadySatisfied(positionMs: Long, isPlaying: Boolean): Boolean =
-        targetPositionMs <= 0L ||
-            (isPlaying && hasReachedTarget(positionMs))
-
     private fun hasReachedTarget(positionMs: Long): Boolean =
-        positionMs + positionToleranceMs >= targetPositionMs
+        positionMs >= (targetPositionMs - positionToleranceMs).coerceAtLeast(0L)
+
+    private fun bankForwardPosition(positionMs: Long) {
+        targetPositionMs = maxOf(targetPositionMs, positionMs)
+    }
 }

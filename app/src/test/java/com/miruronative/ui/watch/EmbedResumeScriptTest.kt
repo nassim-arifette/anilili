@@ -43,7 +43,64 @@ class EmbedResumeScriptTest {
         assertTrue(script.contains("video.play()"))
         assertTrue(script.contains("playResult.then"))
         assertTrue(script.contains("!video.paused && !video.ended"))
-        assertTrue(script.contains("success = success && matches(video) && playing"))
+        assertTrue(
+            script.contains(
+                "success = success && matches(video) && stillOwnsPlaybackMutation(video) && playing &&",
+            ),
+        )
+        assertTrue(script.contains("video.currentTime + 1.5 >= bounded"))
+        val finalPositionProof = script.indexOf("remainsAtOrBeyondTarget(video);", startIndex = 0)
+        val acknowledgement = script.indexOf("AniliProgress.onCommandResult(")
+        assertTrue(finalPositionProof >= 0)
+        assertTrue(acknowledgement > finalPositionProof)
         assertTrue(script.contains("setTimeout(function() { report(false, video); }, 1800)"))
+    }
+
+    @Test
+    fun `later playback mutation makes delayed resume callbacks inert`() {
+        val script = resumeVideoCommandJs(
+            targetSec = 42.0,
+            navigationGeneration = 19L,
+            capabilityToken = "capability",
+            commandId = 11L,
+            expectedMediaIdentity = "episode|1440000",
+            expectedMediaGeneration = 5L,
+        )
+
+        val claim = script.indexOf("playbackMutationEpoch = __aniliBeginPlaybackMutation(video, true)")
+        val delayedGuard = script.indexOf("!stillOwnsPlaybackMutation(video)")
+        val playMutation = script.indexOf("var playResult = video.play()")
+        assertTrue(script.contains("window.__aniliPlaybackMutationState"))
+        assertTrue(script.contains("current.epoch === epoch"))
+        assertTrue(claim >= 0)
+        assertTrue(delayedGuard >= 0)
+        assertTrue(playMutation > delayedGuard)
+        assertTrue(
+            script.contains(
+                "__aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch)",
+            ),
+        )
+        assertTrue(script.contains("playResult.then(settleResumePlay)"))
+        assertTrue(script.contains("__aniliReconcileStaleResumePlay(video, playbackMutationEpoch)"))
+    }
+
+    @Test
+    fun `stale play promise pauses replaced video unless newer exact intent wants playing`() {
+        val script = resumeVideoCommandJs(
+            targetSec = 42.0,
+            navigationGeneration = 20L,
+            capabilityToken = "capability",
+            commandId = 12L,
+            expectedMediaIdentity = "episode-a|1440000",
+            expectedMediaGeneration = 6L,
+        )
+
+        assertTrue(script.contains("var selected = findContentVideo()"))
+        assertTrue(script.contains("current.epoch > staleEpoch"))
+        assertTrue(script.contains("current.desiredPlaying === true"))
+        assertTrue(script.contains("current.mediaIdentity === __aniliMediaIdentity(video)"))
+        assertTrue(script.contains("current.mediaGeneration === __aniliMediaGeneration(video)"))
+        assertTrue(script.contains("if (selected === video && newerExactMutationWantsPlaying) return"))
+        assertTrue(script.contains("try { video.pause(); }"))
     }
 }

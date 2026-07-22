@@ -508,36 +508,55 @@ fun EmbedWebView(
         if (target == null || !managedControlsReady()) {
             onResult?.invoke(false)
             false
-        } else dispatchWebCommand(
-            webView = webView,
-            session = navigationSession,
-            guard = navigationGuard,
-            coordinator = commandCoordinator,
-            callbacks = pendingCommandCallbacks,
-            handler = mainHandler,
-            kind = EmbedCommandKind.SEEK,
-            mediaIdentity = webMediaIdentity,
-            script = { commandId ->
-                seekVideoCommandJs(
-                    targetSec = target / 1_000.0,
-                    navigationGeneration = navigationSession.generation,
-                    capabilityToken = progressBridgeToken,
-                    commandId = commandId,
-                    expectedMediaIdentity = webMediaIdentity?.mediaId,
-                    expectedMediaGeneration = webMediaIdentity?.generation,
+        } else {
+            val expectedMedia = webMediaIdentity?.takeIf { it.isValid }
+            if (expectedMedia == null) {
+                onResult?.invoke(false)
+                false
+            } else {
+                resumeCoordinator.supersedeWithPlaybackIntent(expectedMedia, target)
+                dispatchWebCommand(
+                    webView = webView,
+                    session = navigationSession,
+                    guard = navigationGuard,
+                    coordinator = commandCoordinator,
+                    callbacks = pendingCommandCallbacks,
+                    handler = mainHandler,
+                    kind = EmbedCommandKind.SEEK,
+                    mediaIdentity = expectedMedia,
+                    script = { commandId ->
+                        seekVideoCommandJs(
+                            targetSec = target / 1_000.0,
+                            navigationGeneration = navigationSession.generation,
+                            capabilityToken = progressBridgeToken,
+                            commandId = commandId,
+                            expectedMediaIdentity = expectedMedia.mediaId,
+                            expectedMediaGeneration = expectedMedia.generation,
+                        )
+                    },
+                    onResolved = { resolution ->
+                        val acknowledgement = (resolution as? EmbedCommandResolution.Confirmed)
+                            ?.acknowledgement
+                        val confirmed = acknowledgement?.succeeded == true
+                        if (confirmed) {
+                            positionMs = acknowledgement.positionMs
+                            resumeCoordinator.supersedeWithPlaybackIntent(
+                                expectedMedia,
+                                acknowledgement.positionMs,
+                            )
+                        }
+                        onResult?.invoke(confirmed)
+                    },
                 )
-            },
-            onResolved = { resolution ->
-                val acknowledgement = (resolution as? EmbedCommandResolution.Confirmed)
-                    ?.acknowledgement
-                val confirmed = acknowledgement?.succeeded == true
-                if (confirmed) positionMs = acknowledgement.positionMs
-                onResult?.invoke(confirmed)
-            },
-        )
+            }
+        }
     }
-    val requestTogglePlayback: () -> Boolean = {
-        if (!managedControlsReady()) false else dispatchWebCommand(
+    val requestUserSeek: (Long) -> Boolean = { target -> requestSeek(target, null) }
+    val requestTogglePlayback: () -> Boolean = requestToggle@{
+        if (!managedControlsReady()) return@requestToggle false
+        val expectedMedia = webMediaIdentity?.takeIf { it.isValid } ?: return@requestToggle false
+        resumeCoordinator.supersedeWithPlaybackIntent(expectedMedia, positionMs)
+        dispatchWebCommand(
             webView = webView,
             session = navigationSession,
             guard = navigationGuard,
@@ -545,14 +564,14 @@ fun EmbedWebView(
             callbacks = pendingCommandCallbacks,
             handler = mainHandler,
             kind = EmbedCommandKind.TOGGLE_PLAYBACK,
-            mediaIdentity = webMediaIdentity,
+            mediaIdentity = expectedMedia,
             script = { commandId ->
                 togglePlaybackCommandJs(
                     navigationGeneration = navigationSession.generation,
                     capabilityToken = progressBridgeToken,
                     commandId = commandId,
-                    expectedMediaIdentity = webMediaIdentity?.mediaId,
-                    expectedMediaGeneration = webMediaIdentity?.generation,
+                    expectedMediaIdentity = expectedMedia.mediaId,
+                    expectedMediaGeneration = expectedMedia.generation,
                 )
             },
             onResolved = { resolution ->
@@ -561,6 +580,10 @@ fun EmbedWebView(
                 if (acknowledgement?.succeeded == true) {
                     webIsPlaying = acknowledgement.isPlaying
                     positionMs = acknowledgement.positionMs
+                    resumeCoordinator.supersedeWithPlaybackIntent(
+                        expectedMedia,
+                        acknowledgement.positionMs,
+                    )
                 }
             },
         )
@@ -1082,7 +1105,7 @@ fun EmbedWebView(
                 if (planned.advanceToNextEpisode) {
                     currentOnNextEpisode?.invoke(playbackKey)
                 } else {
-                    planned.seekTargetMs?.let { requestSeek(it, null) }
+                    planned.seekTargetMs?.let { requestUserSeek(it) }
                 }
             }
         }
@@ -1528,10 +1551,10 @@ fun EmbedWebView(
             },
             onDoubleTap = { isRightHalf ->
                 if (isRightHalf) {
-                    requestSeek(positionMs + 10_000L, null)
+                    requestUserSeek(positionMs + 10_000L)
                 } else {
                     val target = (positionMs - 10_000L).coerceAtLeast(0L)
-                    requestSeek(target, null)
+                    requestUserSeek(target)
                 }
             },
             onHoldSpeed = { active ->
@@ -1580,7 +1603,7 @@ fun EmbedWebView(
                 hasNext = hasNextEpisode && currentOnNextEpisode != null,
                 onPrevious = { currentOnPreviousEpisode?.invoke(playbackKey) },
                 onRewind = {
-                    requestSeek((positionMs - 10_000L).coerceAtLeast(0L), null)
+                    requestUserSeek((positionMs - 10_000L).coerceAtLeast(0L))
                     touchControlsInteraction++
                 },
                 onPlayPause = {
@@ -1589,12 +1612,12 @@ fun EmbedWebView(
                     touchControlsInteraction++
                 },
                 onForward = {
-                    requestSeek(positionMs + 10_000L, null)
+                    requestUserSeek(positionMs + 10_000L)
                     touchControlsInteraction++
                 },
                 onNext = { currentOnNextEpisode?.invoke(playbackKey) },
                 onSeek = { targetMs ->
-                    requestSeek(targetMs, null)
+                    requestUserSeek(targetMs)
                     touchControlsInteraction++
                 },
                 onSettings = { settingsSheetVisible = true },
@@ -1623,10 +1646,13 @@ fun EmbedWebView(
                         selected = option.url == activeUrl,
                         onSelect = {
                             if (option.url != activeUrl) {
+                                val handoffPositionMs = resumeCoordinator
+                                    .handoffTargetFor(webMediaIdentity)
+                                    ?: pendingSeekMs
                                 // Revoke A synchronously in the click that requests B; the WebView
                                 // itself is replaced later by AndroidView.update.
                                 navigationGuard.invalidate(navigationSession)
-                                pendingSeekMs = positionMs
+                                pendingSeekMs = handoffPositionMs
                                 activeUrl = option.url
                             }
                         },
@@ -1718,14 +1744,14 @@ fun EmbedWebView(
                 playPauseFocusRequester = tvPlayPauseFocus,
                 onPrevious = { currentOnPreviousEpisode?.invoke(playbackKey) },
                 onRewind = {
-                    requestSeek((positionMs - 10_000L).coerceAtLeast(0L), null)
+                    requestUserSeek((positionMs - 10_000L).coerceAtLeast(0L))
                 },
                 onPlayPause = {
                     DiagnosticsLog.event("EmbedWebView TV control playPause")
                     requestTogglePlayback()
                 },
                 onForward = {
-                    requestSeek(positionMs + 10_000L, null)
+                    requestUserSeek(positionMs + 10_000L)
                 },
                 onNext = { currentOnNextEpisode?.invoke(playbackKey) },
                 onVolumeDown = {
@@ -2051,7 +2077,12 @@ private fun CaptionEdgeStyle.toCssTextShadow(): String = when (this) {
 }
 
 internal fun String.toJsStringLiteral(): String =
-    "'" + replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+    "'" + replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029") + "'"
 
 internal fun togglePlaybackCommandJs(
     navigationGeneration: Long,
@@ -2063,9 +2094,11 @@ internal fun togglePlaybackCommandJs(
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
       ${embedContentVideoSelectorJs()}
+      ${embedPlaybackMutationEpochJs()}
       var expectedMediaIdentity = ${expectedMediaIdentity?.toJsStringLiteral() ?: "null"};
       var expectedMediaGeneration = ${expectedMediaGeneration ?: "null"};
       var reported = false;
+      var playbackMutationEpoch = null;
       function report(success, video) {
         if (reported) return;
         reported = true;
@@ -2073,7 +2106,9 @@ internal fun togglePlaybackCommandJs(
         var playing = !!video && !video.paused && !video.ended;
         var mediaIdentity = __aniliMediaIdentity(video);
         var mediaGeneration = __aniliMediaGeneration(video);
-        success = success && !!video && findContentVideo() === video &&
+        success = success && !!video &&
+          __aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch) &&
+          findContentVideo() === video &&
           (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity) &&
           (expectedMediaGeneration === null || mediaGeneration === expectedMediaGeneration);
         try {
@@ -2091,7 +2126,9 @@ internal fun togglePlaybackCommandJs(
               __aniliMediaGeneration(video) !== expectedMediaGeneration)) {
           report(false, video); return;
         }
-        if (video.paused || video.ended) {
+        var shouldPlay = video.paused || video.ended;
+        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, shouldPlay);
+        if (shouldPlay) {
           __aniliPauseCompetingMedia(video);
           var playResult = video.play();
           if (playResult && typeof playResult.then === 'function') {
@@ -2120,9 +2157,11 @@ internal fun seekVideoCommandJs(
     (function() {
       ${embedNavigationJsGuard(navigationGeneration)}
       ${embedContentVideoSelectorJs()}
+      ${embedPlaybackMutationEpochJs()}
       var expectedMediaIdentity = ${expectedMediaIdentity?.toJsStringLiteral() ?: "null"};
       var expectedMediaGeneration = ${expectedMediaGeneration ?: "null"};
       var reported = false;
+      var playbackMutationEpoch = null;
       function report(success, video) {
         if (reported) return;
         reported = true;
@@ -2130,7 +2169,9 @@ internal fun seekVideoCommandJs(
         var playing = !!video && !video.paused && !video.ended;
         var mediaIdentity = __aniliMediaIdentity(video);
         var mediaGeneration = __aniliMediaGeneration(video);
-        success = success && !!video && findContentVideo() === video &&
+        success = success && !!video &&
+          __aniliPlaybackMutationIsCurrent(video, playbackMutationEpoch) &&
+          findContentVideo() === video &&
           (!expectedMediaIdentity || mediaIdentity === expectedMediaIdentity) &&
           (expectedMediaGeneration === null || mediaGeneration === expectedMediaGeneration);
         try {
@@ -2148,6 +2189,8 @@ internal fun seekVideoCommandJs(
               __aniliMediaGeneration(video) !== expectedMediaGeneration)) {
           report(false, video); return;
         }
+        var shouldRemainPlaying = !video.paused && !video.ended;
+        playbackMutationEpoch = __aniliBeginPlaybackMutation(video, shouldRemainPlaying);
         var target = $targetSec;
         var bounded = isFinite(video.duration) && video.duration > 0
           ? Math.min(Math.max(0, target), video.duration)
@@ -2375,6 +2418,16 @@ internal fun shouldResumeEmbedForLifecycleEvent(event: Lifecycle.Event): Boolean
 /** Reversible lifecycle pause: never changes mute or volume state. */
 internal fun pauseEmbedMediaForLifecycleJs(): String = """
     (function() {
+      function supersedePendingPlay() {
+        var previous = window.__aniliPlaybackMutationState;
+        var nextEpoch = previous && isFinite(previous.epoch) ? previous.epoch + 1 : 1;
+        window.__aniliPlaybackMutationState = {
+          epoch: nextEpoch,
+          mediaIdentity: previous ? previous.mediaIdentity : '',
+          mediaGeneration: previous ? previous.mediaGeneration : 0,
+          desiredPlaying: false
+        };
+      }
       function pauseMedia(root) {
         var media = root.querySelectorAll('video,audio');
         for (var i = 0; i < media.length; i++) {
@@ -2388,6 +2441,7 @@ internal fun pauseEmbedMediaForLifecycleJs(): String = """
           } catch (e) { /* cross-origin */ }
         }
       }
+      supersedePendingPlay();
       try { pauseMedia(document); } catch (e) { /* ignored */ }
     })();
 """.trimIndent()
@@ -2395,6 +2449,16 @@ internal fun pauseEmbedMediaForLifecycleJs(): String = """
 /** Terminal teardown: pause and silence every reachable media element before blanking. */
 internal fun silenceEmbedMediaForTeardownJs(): String = """
     (function() {
+      function supersedePendingPlay() {
+        var previous = window.__aniliPlaybackMutationState;
+        var nextEpoch = previous && isFinite(previous.epoch) ? previous.epoch + 1 : 1;
+        window.__aniliPlaybackMutationState = {
+          epoch: nextEpoch,
+          mediaIdentity: previous ? previous.mediaIdentity : '',
+          mediaGeneration: previous ? previous.mediaGeneration : 0,
+          desiredPlaying: false
+        };
+      }
       function silenceMedia(root) {
         var media = root.querySelectorAll('video,audio');
         for (var i = 0; i < media.length; i++) {
@@ -2413,6 +2477,7 @@ internal fun silenceEmbedMediaForTeardownJs(): String = """
           } catch (e) { /* cross-origin */ }
         }
       }
+      supersedePendingPlay();
       try { silenceMedia(document); } catch (e) { /* ignored */ }
     })();
 """.trimIndent()
