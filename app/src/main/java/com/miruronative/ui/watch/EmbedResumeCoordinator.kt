@@ -17,15 +17,20 @@ internal enum class EmbedResumeAttemptOutcome {
     EXHAUSTED,
 }
 
+internal enum class EmbedAutomatedSeekDecision {
+    DISPATCH,
+    DEFER_TO_PENDING_RESUME,
+    REJECT,
+}
+
 /**
  * Coordinates saved-position restoration across concrete videos in one embed navigation.
  *
- * Completion is identity-bound. A replacement may continue the original pending restore only when
- * the former concrete video never completed. Once any concrete video has completed, later
- * same-document replacements are deliberately left untouched: they may be a provider-controlled
- * next episode or a SUB/DUB alternate. The attempt budget is navigation-wide, so video churn cannot
- * multiply automatic seek/play attempts. A video already beyond the pending target is never pulled
- * backwards.
+ * Completion is identity-bound. Every same-document concrete-video replacement is deliberately
+ * left untouched, even when the initial restore is unresolved: it may be a provider-controlled next
+ * episode or a SUB/DUB alternate. Explicit app quality changes create a new navigation/coordinator
+ * with an identity-safe handoff target. The attempt budget is navigation-wide, and a video already
+ * beyond the pending target is never pulled backwards.
  */
 internal class EmbedResumeCoordinator(
     initialTargetPositionMs: Long,
@@ -37,6 +42,7 @@ internal class EmbedResumeCoordinator(
     private var lastObservedPositionMs = 0L
     private var totalAttempts = 0
     private var activeIdentityCompleted = targetPositionMs == 0L
+    private var restorationExhausted = false
     private var inFlightAttempt: EmbedResumeAttempt? = null
 
     init {
@@ -49,18 +55,20 @@ internal class EmbedResumeCoordinator(
         if (!mediaIdentity.isValid) return
         val safePositionMs = positionMs.coerceAtLeast(0L)
         if (mediaIdentity != activeMediaIdentity) {
-            val formerIdentityCompleted = activeMediaIdentity != null && activeIdentityCompleted
+            val replacesConcreteVideo = activeMediaIdentity != null
             activeMediaIdentity = mediaIdentity
             lastObservedPositionMs = safePositionMs
             inFlightAttempt = null
-            if (formerIdentityCompleted) {
+            if (replacesConcreteVideo) {
                 // Never infer that an arbitrary replacement is the same episode. Quality changes
                 // initiated by the app create a fresh navigation/coordinator with their own target.
                 targetPositionMs = safePositionMs
                 activeIdentityCompleted = true
+                restorationExhausted = false
             } else if (targetPositionMs <= 0L) {
                 targetPositionMs = safePositionMs
                 activeIdentityCompleted = true
+                restorationExhausted = false
             } else {
                 val positionSatisfied = hasReachedTarget(safePositionMs)
                 if (positionSatisfied) bankForwardPosition(safePositionMs)
@@ -91,10 +99,33 @@ internal class EmbedResumeCoordinator(
         if (!mediaIdentity.isValid || mediaIdentity != activeMediaIdentity) return false
         val safePositionMs = positionMs.coerceAtLeast(0L)
         activeIdentityCompleted = true
+        restorationExhausted = false
         inFlightAttempt = null
         lastObservedPositionMs = safePositionMs
         targetPositionMs = safePositionMs
         return true
+    }
+
+    /**
+     * Keeps automatic skips ordered behind restoration. While restore is pending, AniSkip may move
+     * its target forward but never dispatch a competing/backwards seek or cancel saved progress.
+     */
+    @Synchronized
+    fun planAutomatedSeek(
+        mediaIdentity: EmbedVideoIdentity,
+        positionMs: Long,
+    ): EmbedAutomatedSeekDecision {
+        if (!mediaIdentity.isValid || mediaIdentity != activeMediaIdentity) {
+            return EmbedAutomatedSeekDecision.REJECT
+        }
+        if (!activeIdentityCompleted && !restorationExhausted) {
+            bankForwardPosition(positionMs.coerceAtLeast(0L))
+            return EmbedAutomatedSeekDecision.DEFER_TO_PENDING_RESUME
+        }
+        if (positionMs.coerceAtLeast(0L) < lastObservedPositionMs) {
+            return EmbedAutomatedSeekDecision.REJECT
+        }
+        return EmbedAutomatedSeekDecision.DISPATCH
     }
 
     /** Returns a quality-navigation handoff target only for the currently selected exact video. */
@@ -109,6 +140,7 @@ internal class EmbedResumeCoordinator(
         if (
             mediaIdentity != activeMediaIdentity ||
             activeIdentityCompleted ||
+            restorationExhausted ||
             targetPositionMs <= 0L ||
             inFlightAttempt != null ||
             totalAttempts >= maxAttempts
@@ -143,6 +175,7 @@ internal class EmbedResumeCoordinator(
         if (hasReachedTarget(safePositionMs)) bankForwardPosition(safePositionMs)
         if (succeeded && isPlaying && hasReachedTarget(safePositionMs)) {
             activeIdentityCompleted = true
+            restorationExhausted = false
             targetPositionMs = safePositionMs
             return EmbedResumeAttemptOutcome.COMPLETED
         }
@@ -166,12 +199,12 @@ internal class EmbedResumeCoordinator(
     private fun shouldResolve(attempt: EmbedResumeAttempt): Boolean =
         inFlightAttempt == attempt && activeMediaIdentity == attempt.mediaIdentity
 
-    private fun retryOrExhausted(): EmbedResumeAttemptOutcome =
-        if (totalAttempts < maxAttempts) {
-            EmbedResumeAttemptOutcome.RETRY
-        } else {
-            EmbedResumeAttemptOutcome.EXHAUSTED
-        }
+    private fun retryOrExhausted(): EmbedResumeAttemptOutcome = if (totalAttempts < maxAttempts) {
+        EmbedResumeAttemptOutcome.RETRY
+    } else {
+        restorationExhausted = true
+        EmbedResumeAttemptOutcome.EXHAUSTED
+    }
 
     private fun hasReachedTarget(positionMs: Long): Boolean =
         positionMs >= (targetPositionMs - positionToleranceMs).coerceAtLeast(0L)
